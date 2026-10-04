@@ -89,6 +89,8 @@ cargo build --release -p ells   # 产物在 target/release/ells(.exe)
 cargo test                      # 单元测试（保险库加密、zmodem 检测、高亮规则…）
 ```
 
+Linux 源码构建需先安装系统依赖 `pkg-config libwayland-dev`（文件选择对话框 rfd 的 XDG 门户链路依赖 wayland）；预编译二进制/一行安装无需此步骤。
+
 本地集成测试依赖 `tests/fake_sshd.py`——一个基于 paramiko 的一次性 SSH/SFTP/ZMODEM 测试服务器（`pip install paramiko`）。
 
 ### 平台说明

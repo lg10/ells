@@ -25,7 +25,7 @@ jobs:
             artifact: ells-macos-x86_64
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            artifact: ells-windows-x86_64
+            artifact: ells-windows-x86_64.exe
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -36,7 +36,10 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # rfd 在 Linux 走 ashpd/XDG 门户（纯 Rust），无需系统 GTK
+      - name: Linux system deps (rfd→ashpd→wayland-sys 需要 libwayland-dev)
+        if: matrix.os == 'ubuntu-22.04'
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libwayland-dev
+
       - name: Build (debug)
         run: cargo build --locked --target ${{ matrix.target }}
 

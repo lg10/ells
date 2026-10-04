@@ -90,6 +90,8 @@ cargo build --release -p ells   # binary at target/release/ells(.exe)
 cargo test                      # unit tests (vault crypto, zmodem, highlight…)
 ```
 
+On Linux, install the system packages `pkg-config libwayland-dev` first (rfd's XDG-portal stack links against wayland). Prebuilt binaries / the one-line installer need none of this.
+
 Local integration testing uses `tests/fake_sshd.py`, a paramiko-based throwaway SSH/SFTP server (Python 3 + `pip install paramiko`).
 
 ### Platform notes
