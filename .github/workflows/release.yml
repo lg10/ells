@@ -63,21 +63,28 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: dist
-      - name: Checksums
+      # 注意：artifact 目录内的文件名 = 上传时的源文件名（Linux 是 `ells`、Windows 是 `ells.exe`），
+      # 不能假设与 artifact 同名，一律显式 find+cp 重命名。
+      - name: Normalize names + checksums
         run: |
-          cd dist
-          mv ells-linux-x86_64/ells-linux-x86_64 ./linux.tmp
-          mv ells-macos-universal/ells-macos-universal ./macos.tmp
-          mv ells-windows-x86_64.exe/ells-windows-x86_64.exe ./windows.tmp
-          printf '%s  %s\n' "$(sha256sum < linux.tmp)" ells-linux-x86_64 > SHA256SUMS.txt
-          printf '%s  %s\n' "$(sha256sum < macos.tmp)" ells-macos-universal >> SHA256SUMS.txt
-          printf '%s  %s\n' "$(sha256sum < windows.tmp)" ells-windows-x86_64.exe >> SHA256SUMS.txt
+          set -eu
+          mkdir -p out
+          linux_file=$(find dist/ells-linux-x86_64 -type f | head -n1)
+          macos_file=$(find dist/ells-macos-universal -type f | head -n1)
+          windows_file=$(find dist/ells-windows-x86_64.exe -type f | head -n1)
+          [ -n "$linux_file" ] && [ -n "$macos_file" ] && [ -n "$windows_file" ]
+          cp "$linux_file" out/ells-linux-x86_64
+          cp "$macos_file" out/ells-macos-universal
+          cp "$windows_file" out/ells-windows-x86_64.exe
+          ls -l out
+          cd out
+          sha256sum ells-linux-x86_64 ells-macos-universal ells-windows-x86_64.exe > SHA256SUMS.txt
           cat SHA256SUMS.txt
       - uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/ells-linux-x86_64/ells-linux-x86_64
-            dist/ells-macos-universal/ells-macos-universal
-            dist/ells-windows-x86_64.exe/ells-windows-x86_64.exe
-            dist/SHA256SUMS.txt
+            out/ells-linux-x86_64
+            out/ells-macos-universal
+            out/ells-windows-x86_64.exe
+            out/SHA256SUMS.txt
           fail_on_unmatched_files: true
