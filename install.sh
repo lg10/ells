@@ -81,12 +81,13 @@ if ! printf '%s' ":${PATH}:" | grep -qF ":$INSTALL_DIR:"; then
   info "已将 $INSTALL_DIR 写入 $added_to"
 fi
 
-# PowerShell 里 `s` 会被优先解析为命令/别名，补一个函数入口
+# PowerShell 里函数优先于 PATH 中的 exe，且 `s` 是内置别名（Set-Variable），在 profile 里注册函数入口
 PS_PROFILE="$HOME/.config/powershell/Microsoft.PowerShell_profile.ps1"
-if [ ! -s "$PS_PROFILE" ] && [ -n "$(command -v pwsh 2>/dev/null || true)" ]; then
-  mkdir -p "$(dirname "$PS_PROFILE")"
-  printf '\nfunction global:s { & "%s/s" $%s }\n' "$INSTALL_DIR" 'args' > "$PS_PROFILE"
-  info "已为 pwsh 写入 s 命令入口"
+PS_MARKER='# ells: short command s'
+if ! grep -qF "$PS_MARKER" "$PS_PROFILE" 2>/dev/null; then
+  mkdir -p "$(dirname "$PS_PROFILE")"; touch "$PS_PROFILE"
+  printf '\n%s\nif (Test-Path "%s/s") {\n    function global:s { & "%s/s" $%s }\n}\n' "$PS_MARKER" "$INSTALL_DIR" "$INSTALL_DIR" 'args' >> "$PS_PROFILE"
+  info "已为 PowerShell 注册 s 命令（$PS_PROFILE）"
 fi
 
 info "安装完成 $VERSION：重新打开终端后即可使用 ells 或 s"

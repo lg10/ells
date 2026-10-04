@@ -54,8 +54,26 @@ try {
     Info 'added install dir to user PATH (takes effect in new terminals)'
   }
 
+  # PowerShell resolves functions before PATH executables, and `s` is a built-in alias
+  # (Set-Variable) -- register a global function in the user profile so `s` works there too.
+  $sExe = Join-Path $InstallDir 's.exe'
+  $profilePath = $PROFILE.CurrentUserAllHosts
+  $profileDir = Split-Path $profilePath -Parent
+  if (-not (Test-Path $profileDir)) { New-Item -ItemType Directory -Force -Path $profileDir | Out-Null }
+  if (-not (Test-Path $profilePath)) { New-Item -ItemType File -Path $profilePath | Out-Null }
+  $marker = '# ells: short command s'
+  if (-not ((Get-Content $profilePath -Raw) -match [regex]::Escape($marker))) {
+    Add-Content $profilePath @"
+
+$marker
+if (Test-Path '$sExe') {
+    function global:s { & '$sExe' @args }
+}
+"@
+    Info "registered the 's' command in the PowerShell profile ($profilePath)"
+  }
+
   Info "done ($version). Reopen cmd / PowerShell, then run: ells   or   s"
-  Info 'note: in PowerShell, s conflicts with the built-in alias s (Set-Variable); use ells there'
 } finally {
   Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
 }

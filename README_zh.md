@@ -47,7 +47,7 @@ curl -fsSL https://raw.githubusercontent.com/lg10/ells/main/install.sh | sh
 irm https://raw.githubusercontent.com/lg10/ells/main/install.ps1 | iex
 ```
 
-安装完成后重新打开终端，`ells` 与短命令 `s` 均可直接运行。
+安装完成后**重新打开终端**，`ells` 与短命令 `s` 即可直接使用（脚本会自动配置 PATH；PowerShell 下会在配置文件里注册 `s` 函数，cmd 无需额外处理）。
 
 <details>
 <summary>从源码构建</summary>

@@ -47,7 +47,7 @@ curl -fsSL https://raw.githubusercontent.com/lg10/ells/main/install.sh | sh
 irm https://raw.githubusercontent.com/lg10/ells/main/install.ps1 | iex
 ```
 
-Reopen your terminal afterwards — both `ells` and the short command `s` will be available.
+Reopen your terminal afterwards, and both `ells` and the short command `s` are ready (the installer sets up PATH; on PowerShell it also registers an `s` function in your profile — cmd needs nothing extra).
 
 <details>
 <summary>Build from source</summary>
