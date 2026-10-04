@@ -33,13 +33,32 @@ ells 是一个纯 Rust 编写的一体化终端 SSH 客户端。它在高速 TUI
 - 🖱 **鼠标友好** — 拖选复制（OSC 52）、滚轮回看历史且保留颜色、各界面元素可点击；终端标签页标题随页面联动（连接后显示 `ells-别名`）。
 - 🌏 **全中文界面**、系统原生文件对话框、零遥测。
 
-## 快速开始
+## 安装
+
+**macOS / Linux**（bash / zsh）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/lg10/ells/main/install.sh | sh
+```
+
+**Windows**（PowerShell）：
+
+```powershell
+irm https://raw.githubusercontent.com/lg10/ells/main/install.ps1 | iex
+```
+
+安装完成后重新打开终端，`ells` 与短命令 `s` 均可直接运行。
+
+<details>
+<summary>从源码构建</summary>
 
 ```bash
 cargo build --release -p ells
 ./target/release/ells            # 主机列表
 ./target/release/ells myserver   # 按别名直接连接
 ```
+
+</details>
 
 首次运行会引导你设置主密码并创建保险库；按 `a` 添加主机，回车即可连接。
 

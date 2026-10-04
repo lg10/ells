@@ -1,0 +1,81 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked --target x86_64-unknown-linux-gnu
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ells-linux-x86_64
+          path: target/x86_64-unknown-linux-gnu/release/ells
+          if-no-files-found: error
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked --target x86_64-pc-windows-msvc
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ells-windows-x86_64.exe
+          path: target/x86_64-pc-windows-msvc/release/ells.exe
+          if-no-files-found: error
+
+  build-macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked --target aarch64-apple-darwin
+      - run: cargo build --release --locked --target x86_64-apple-darwin
+      - name: Universal binary
+        run: lipo -create -output ells-macos-universal target/aarch64-apple-darwin/release/ells target/x86_64-apple-darwin/release/ells
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ells-macos-universal
+          path: ells-macos-universal
+          if-no-files-found: error
+
+  release:
+    needs: [build-linux, build-windows, build-macos]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Checksums
+        run: |
+          cd dist
+          mv ells-linux-x86_64/ells-linux-x86_64 ./linux.tmp
+          mv ells-macos-universal/ells-macos-universal ./macos.tmp
+          mv ells-windows-x86_64.exe/ells-windows-x86_64.exe ./windows.tmp
+          printf '%s  %s\n' "$(sha256sum < linux.tmp)" ells-linux-x86_64 > SHA256SUMS.txt
+          printf '%s  %s\n' "$(sha256sum < macos.tmp)" ells-macos-universal >> SHA256SUMS.txt
+          printf '%s  %s\n' "$(sha256sum < windows.tmp)" ells-windows-x86_64.exe >> SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/ells-linux-x86_64/ells-linux-x86_64
+            dist/ells-macos-universal/ells-macos-universal
+            dist/ells-windows-x86_64.exe/ells-windows-x86_64.exe
+            dist/SHA256SUMS.txt
+          fail_on_unmatched_files: true

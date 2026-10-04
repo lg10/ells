@@ -33,13 +33,32 @@ ells is an all-in-one terminal SSH client written in pure Rust. It embeds a real
 - 🖱 **Mouse friendly** — drag-select to copy (OSC 52), wheel scrollback with preserved colors, click targets on every screen; the terminal tab title follows the current page (`ells-<alias>` while connected).
 - 🌏 **Chinese-first UI**, native OS file dialogs, zero telemetry.
 
-## Quick start
+## Install
+
+**macOS / Linux** (bash / zsh):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/lg10/ells/main/install.sh | sh
+```
+
+**Windows** (PowerShell):
+
+```powershell
+irm https://raw.githubusercontent.com/lg10/ells/main/install.ps1 | iex
+```
+
+Reopen your terminal afterwards — both `ells` and the short command `s` will be available.
+
+<details>
+<summary>Build from source</summary>
 
 ```bash
 cargo build --release -p ells
 ./target/release/ells            # host list
 ./target/release/ells myserver   # connect by alias directly
 ```
+
+</details>
 
 First run asks you to create a master password and a vault. Add a host with `a`, then press Enter to connect.
 
