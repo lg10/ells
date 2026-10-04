@@ -13,6 +13,14 @@ set -eu
 
 REPO="lg10/ells"
 BIN_NAME="ells"
+# 预绑定后续用到的所有变量（防个别老 shell 在赋值失败时产生 unbound）
+VERSION=""
+BASE_URL=""
+TMP=""
+ASSET=""
+OS=""
+INSTALL_DIR=""
+API_URL=""
 
 info() { printf '\033[36m[ells]\033[0m %s\n' "$1"; }
 fail() { printf '\033[31m[ells] 安装失败：\033[0m%s\n' "$1" >&2; exit 1; }
