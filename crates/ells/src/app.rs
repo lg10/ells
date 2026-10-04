@@ -1085,12 +1085,12 @@ impl App {
         let tx = self.event_tx.clone();
         tokio::spawn(async move {
             let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-            let chosen = rfd::AsyncFileDialog::new()
-                .set_title("选择要上传的文件")
-                .set_directory(home)
-                .pick_file()
-                .await;
-            let path = chosen.map(|h| h.path().to_string_lossy().into_owned());
+            let path = tokio::task::spawn_blocking(move || {
+                crate::dialog::pick_file("选择要上传的文件", home, Vec::new())
+            })
+            .await
+            .ok()
+            .flatten();
             let _ = tx.send(AppEvent::PickedUpload(path));
         });
     }
@@ -1204,13 +1204,13 @@ impl App {
             let dir = dirs::download_dir()
                 .or_else(dirs::home_dir)
                 .unwrap_or_else(|| PathBuf::from("."));
-            let chosen = rfd::AsyncFileDialog::new()
-                .set_title("保存下载文件")
-                .set_directory(dir)
-                .set_file_name(&entry.name)
-                .save_file()
-                .await;
-            let path = chosen.map(|h| h.path().to_string_lossy().into_owned());
+            let name = entry.name.clone();
+            let path = tokio::task::spawn_blocking(move || {
+                crate::dialog::save_file("保存下载文件", dir, &name)
+            })
+            .await
+            .ok()
+            .flatten();
             let _ = tx.send(AppEvent::PickedSave { entry, path });
         });
     }
@@ -1875,14 +1875,22 @@ impl App {
                 }
                 _ => home,
             };
-            let chosen = rfd::AsyncFileDialog::new()
-                .set_title("选择私钥文件")
-                .add_filter("私钥文件 (*.pem *.key *.ppk)", &["pem", "key", "ppk"])
-                .add_filter("所有文件", &["*"])
-                .set_directory(start)
-                .pick_file()
-                .await;
-            let path = chosen.map(|h| h.path().to_string_lossy().into_owned());
+            let path = tokio::task::spawn_blocking(move || {
+                crate::dialog::pick_file(
+                    "选择私钥文件",
+                    start,
+                    vec![
+                        (
+                            "私钥文件 (*.pem *.key *.ppk)".to_string(),
+                            vec!["pem".to_string(), "key".to_string(), "ppk".to_string()],
+                        ),
+                        ("所有文件".to_string(), vec!["*".to_string()]),
+                    ],
+                )
+            })
+            .await
+            .ok()
+            .flatten();
             let _ = tx.send(AppEvent::PickedFile { field, path });
         });
     }
