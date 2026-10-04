@@ -1,0 +1,12 @@
+# 构建产物
+/target/
+
+# 测试运行时产物（fake_sshd 日志 / SFTP 沙盒 / 遗留密钥文件）
+tests/fake_sshd.log
+tests/sftp_root/
+tests/test_host_key
+
+# 通用
+**/*.rs.bk
+*.log
+.DS_Store

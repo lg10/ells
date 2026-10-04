@@ -1,0 +1,303 @@
+use anyhow::{anyhow, bail, Context, Result};
+use argon2::{Algorithm, Argon2, Params, Version};
+use chacha20poly1305::aead::{Aead, KeyInit};
+use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
+use rand::RngCore;
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
+use crate::host::Host;
+
+const MAGIC: &[u8; 9] = b"ELLSVAULT";
+const FORMAT_VERSION: u8 = 1;
+const SALT_LEN: usize = 16;
+const NONCE_LEN: usize = 24;
+const KEY_LEN: usize = 32;
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct Vault {
+    #[serde(default)]
+    pub hosts: Vec<Host>,
+}
+
+impl Vault {
+    pub fn find(&self, alias: &str) -> Option<&Host> {
+        self.hosts.iter().find(|h| h.alias == alias)
+    }
+
+    pub fn upsert(&mut self, host: Host) {
+        if let Some(pos) = self.hosts.iter().position(|h| h.alias == host.alias) {
+            self.hosts[pos] = host;
+        } else {
+            self.hosts.push(host);
+        }
+    }
+
+    pub fn remove(&mut self, alias: &str) -> bool {
+        let before = self.hosts.len();
+        self.hosts.retain(|h| h.alias != alias);
+        self.hosts.len() != before
+    }
+}
+
+pub fn vault_path() -> Result<PathBuf> {
+    let home = dirs::home_dir().context("cannot resolve home directory")?;
+    Ok(home.join(".ells").join("vault.bin"))
+}
+
+pub fn vault_exists() -> bool {
+    vault_path().map(|p| p.exists()).unwrap_or(false)
+}
+
+fn derive_key(master: &str, salt: &[u8]) -> Result<[u8; KEY_LEN]> {
+    let params = Params::new(64 * 1024, 3, 1, Some(KEY_LEN))
+        .map_err(|err| anyhow!("argon2 params rejected: {err:?}"))?;
+    let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+    let mut out = [0u8; KEY_LEN];
+    argon
+        .hash_password_into(master.as_bytes(), salt, &mut out)
+        .map_err(|err| anyhow!("argon2 KDF failed: {err:?}"))?;
+    Ok(out)
+}
+
+/// Derived master key, cached in memory so saves don't re-run the slow KDF.
+/// Zeroized on drop.
+pub struct VaultKey {
+    salt: [u8; SALT_LEN],
+    key: [u8; KEY_LEN],
+}
+
+impl Drop for VaultKey {
+    fn drop(&mut self) {
+        self.key.zeroize_local();
+    }
+}
+
+/// Redacted: never let key material reach a log line.
+impl std::fmt::Debug for VaultKey {
+    fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fmt.debug_struct("VaultKey").finish_non_exhaustive()
+    }
+}
+
+fn check_header(bytes: &[u8]) -> Result<([u8; SALT_LEN], &[u8], &[u8])> {
+    let min_len = MAGIC.len() + 1 + SALT_LEN + NONCE_LEN + 16;
+    if bytes.len() < min_len {
+        bail!("保险库文件不完整或已损坏");
+    }
+    if &bytes[..MAGIC.len()] != MAGIC {
+        bail!("不是 ells 保险库文件");
+    }
+    if bytes[MAGIC.len()] != FORMAT_VERSION {
+        bail!("不支持的保险库格式版本");
+    }
+    let mut salt = [0u8; SALT_LEN];
+    salt.copy_from_slice(&bytes[MAGIC.len() + 1..MAGIC.len() + 1 + SALT_LEN]);
+    let nonce = &bytes[MAGIC.len() + 1 + SALT_LEN..MAGIC.len() + 1 + SALT_LEN + NONCE_LEN];
+    let ct = &bytes[MAGIC.len() + 1 + SALT_LEN + NONCE_LEN..];
+    Ok((salt, nonce, ct))
+}
+
+fn decode_with_key(all: &[u8], key: &[u8; KEY_LEN]) -> Result<Vault> {
+    let (_salt, nonce_bytes, ct) = check_header(all)?;
+    let cipher = XChaCha20Poly1305::new(Key::from_slice(key));
+    let nonce = XNonce::from_slice(nonce_bytes);
+    let plaintext = cipher
+        .decrypt(nonce, ct)
+        .map_err(|_| anyhow!("主密码错误或保险库已损坏"))?;
+    let text = String::from_utf8(plaintext).context("保险库内容不是有效文本")?;
+    let vault: Vault = toml::from_str(&text).context("保险库内容格式错误")?;
+    Ok(vault)
+}
+
+/// Derive a fresh key (random salt) for a brand-new vault.
+pub fn create_vault_key(master: &str) -> Result<VaultKey> {
+    if master.is_empty() {
+        bail!("主密码不能为空");
+    }
+    let mut salt = [0u8; SALT_LEN];
+    rand::rngs::OsRng.fill_bytes(&mut salt);
+    let key = derive_key(master, &salt)?;
+    Ok(VaultKey { salt, key })
+}
+
+/// Encrypt the vault under an already-derived key (reuses the key's salt).
+pub fn store_vault_key(vault: &Vault, path: &Path, vk: &VaultKey) -> Result<()> {
+    let plaintext = toml::to_string_pretty(vault).context("序列化保险库失败")?;
+    let mut nonce_bytes = [0u8; NONCE_LEN];
+    rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+    let cipher = XChaCha20Poly1305::new(Key::from_slice(&vk.key));
+    let nonce = XNonce::from_slice(&nonce_bytes);
+    let ct = cipher
+        .encrypt(nonce, plaintext.as_bytes())
+        .map_err(|e| anyhow!("保险库加密失败: {e}"))?;
+    let mut blob = Vec::with_capacity(MAGIC.len() + 1 + SALT_LEN + NONCE_LEN + ct.len());
+    blob.extend_from_slice(MAGIC);
+    blob.push(FORMAT_VERSION);
+    blob.extend_from_slice(&vk.salt);
+    blob.extend_from_slice(&nonce_bytes);
+    blob.extend_from_slice(&ct);
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).ok();
+    }
+    write_secret_file(path, &blob)
+}
+
+/// Save the open vault using the cached key (fast: no KDF).
+pub fn save_vault_key(vault: &Vault, vk: &VaultKey) -> Result<()> {
+    store_vault_key(vault, &vault_path()?, vk)
+}
+
+/// Unlock and return the vault together with its cached key.
+pub fn unlock_vault(master: &str) -> Result<(Vault, VaultKey)> {
+    let path = vault_path()?;
+    let bytes =
+        fs::read(&path).with_context(|| format!("无法读取保险库 {}", path.display()))?;
+    let (salt, _, _) = check_header(&bytes)?;
+    let key = derive_key(master, &salt)?;
+    let vault = decode_with_key(&bytes, &key)?;
+    Ok((vault, VaultKey { salt, key }))
+}
+
+pub fn create_vault(master: &str, vault: &Vault) -> Result<()> {
+    let path = vault_path()?;
+    if path.exists() {
+        bail!("保险库已存在于 {}", path.display());
+    }
+    let vk = create_vault_key(master)?;
+    store_vault_key(vault, &path, &vk)
+}
+
+pub fn open_vault(master: &str) -> Result<Vault> {
+    unlock_vault(master).map(|(v, _)| v)
+}
+
+/// Rotate the master password in place (re-encrypt).
+pub fn store_vault(master: &str, path: &Path, vault: &Vault) -> Result<()> {
+    let vk = create_vault_key(master)?;
+    store_vault_key(vault, path, &vk)
+}
+
+pub fn decode_vault(master: &str, bytes: &[u8]) -> Result<Vault> {
+    let (salt, _, _) = check_header(bytes)?;
+    let key = derive_key(master, &salt)?;
+    decode_with_key(bytes, &key)
+}
+
+fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(path).with_context(|| {
+        format!("cannot write vault to {}", path.display())
+    })?;
+    f.write_all(bytes)?;
+    f.sync_all().ok();
+    Ok(())
+}
+
+/// Zeroize helper on arrays (zeroize crate's impl covers common types).
+trait ZeroizeLocal {
+    fn zeroize_local(&mut self);
+}
+impl ZeroizeLocal for [u8; KEY_LEN] {
+    fn zeroize_local(&mut self) {
+        for b in self.iter_mut() {
+            *b = 0;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::host::Auth;
+
+    #[test]
+    fn vault_roundtrip() {
+        let mut v = Vault::default();
+        v.upsert(Host {
+            alias: "test".into(),
+            hostname: "example.com".into(),
+            port: 2222,
+            user: "root".into(),
+            auth: Auth::Password,
+            password: Some("s3cret".into()),
+            jump: None,
+            note: None,
+        });
+        let blob_master = "hunter2";
+        let tmp = std::env::temp_dir().join("ells-test-vault.bin");
+        let _ = fs::remove_file(&tmp);
+        store_vault(blob_master, &tmp, &v).unwrap();
+        let bytes = fs::read(&tmp).unwrap();
+        let back = decode_vault(blob_master, &bytes).unwrap();
+        assert_eq!(back.hosts.len(), 1);
+        assert_eq!(back.hosts[0].password.as_deref(), Some("s3cret"));
+        assert!(decode_vault("wrong", &bytes).is_err());
+        let _ = fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn dev_hosts_toml_parses() {
+        let text = r#"
+[[hosts]]
+alias = "smoke"
+hostname = "127.0.0.1"
+port = 2222
+user = "tester"
+auth = { type = "password" }
+password = "test123"
+"#;
+        let vault: Vault = toml::from_str(text).unwrap();
+        assert_eq!(vault.hosts.len(), 1);
+        assert_eq!(vault.hosts[0].port, 2222);
+        assert_eq!(vault.hosts[0].auth, Auth::Password);
+    }
+
+    #[test]
+    fn toml_roundtrip_key_and_jump() {
+        let mut v = Vault::default();
+        v.upsert(Host {
+            alias: "prod".into(),
+            hostname: "203.0.113.7".into(),
+            port: 22,
+            user: "root".into(),
+            auth: Auth::PrimaryKey {
+                path: "C:\\Users\\dev\\.ssh\\id_ed25519".into(),
+                passphrase: Some("pp".into()),
+            },
+            password: None,
+            jump: Some("bastion".into()),
+            note: None,
+        });
+        let text = toml::to_string_pretty(&v).unwrap();
+        let back: Vault = toml::from_str(&text).unwrap();
+        assert_eq!(back.hosts[0].auth, v.hosts[0].auth);
+        assert_eq!(back.hosts[0].jump.as_deref(), Some("bastion"));
+        assert_eq!(back.hosts[0].hostname, "203.0.113.7");
+    }
+}
+
+pub fn save(master: &str, vault: &Vault) -> Result<()> {
+    store_vault(master, &vault_path()?, vault)
+}
+
+/// Dev-only plaintext hosts file at `~/.ells/hosts.dev.toml`
+/// (`hosts = [ { alias = "...", hostname = "...", ... } ]`), used with
+/// `ells --dev` so iterating on UI does not require typing the master
+/// password each run.
+pub fn load_dev_vault() -> Result<Vault> {
+    let home = dirs::home_dir().context("cannot resolve home directory")?;
+    let path = home.join(".ells").join("hosts.dev.toml");
+    let text = fs::read_to_string(&path)
+        .with_context(|| format!("cannot read dev hosts at {}", path.display()))?;
+    let vault: Vault = toml::from_str(&text).context("malformed dev hosts file")?;
+    Ok(vault)
+}

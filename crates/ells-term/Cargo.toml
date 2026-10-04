@@ -1,0 +1,8 @@
+[package]
+name = "ells-term"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+crossterm.workspace = true
+vt100.workspace = true

@@ -1,0 +1,29 @@
+[package]
+name = "ells"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "ells"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+base64 = "0.22"
+clap.workspace = true
+dirs.workspace = true
+crossterm.workspace = true
+ells-core.workspace = true
+ells-term.workspace = true
+ells-transfer.workspace = true
+futures.workspace = true
+ratatui.workspace = true
+rfd = "0.15"
+russh.workspace = true
+russh-sftp.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+
+[build-dependencies]
+chrono = "0.4"
