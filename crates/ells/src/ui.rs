@@ -30,30 +30,29 @@ fn version_tag() -> String {
     )
 }
 
-pub const GITHUB_URL: &str = "https://github.com/lg10/ells";
+pub const HOMEPAGE_URL: &str = "https://ells.cn";
 
-/// 顶部第 1 行右端的 GitHub 徽章按钮（列表页与会话页共用）。
-/// Unicode 没有 Octocat 图形，emoji 宽度在不同终端也不稳定，
-/// 因此用白底黑字的 "GitHub" 文字徽章（GitHub 官方按钮同款样式）。
-pub fn github_rect(area: Rect) -> Rect {
+/// 顶部第 1 行右端的官网徽章按钮（列表页与会话页共用）。
+/// 显示宽 14："官网" 4 列 + "(ells.cn)" 10 列。
+pub fn homepage_rect(area: Rect) -> Rect {
     Rect {
-        x: area.x.saturating_add(area.width).saturating_sub(8),
+        x: area.x.saturating_add(area.width).saturating_sub(14),
         y: area.y,
-        width: 8,
+        width: 14,
         height: 1,
     }
 }
 
-fn draw_github_icon(f: &mut Frame, area: Rect) {
+fn draw_homepage_badge(f: &mut Frame, area: Rect) {
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "GitHub",
+            "官网(ells.cn)",
             Style::default()
                 .fg(Color::Black)
                 .bg(Color::White)
                 .add_modifier(Modifier::BOLD),
         ))),
-        github_rect(area),
+        homepage_rect(area),
     );
 }
 
@@ -199,8 +198,8 @@ fn draw_list(f: &mut Frame, app: &mut App) {
         chunks[2],
     );
 
-    // 顶部右端 GitHub 图标
-    draw_github_icon(f, f.area());
+    // 顶部右端官网徽章
+    draw_homepage_badge(f, f.area());
 
     // 删除二级确认弹窗最后渲染，盖住列表
     if let Some(alias) = app.delete_confirm.clone() {
@@ -642,8 +641,8 @@ fn draw_session(f: &mut Frame, app: &mut App) {
         height: 1,
     };
     f.render_widget(Paragraph::new(header).style(Style::default().bg(Color::DarkGray)), title_row);
-    // 第 1 行右端：GitHub 图标（点击在浏览器打开仓库）
-    draw_github_icon(f, f.area());
+    // 第 1 行右端：官网徽章（点击在浏览器打开 https://ells.cn）
+    draw_homepage_badge(f, f.area());
 
     // Second header row: 一次性状态提示（连接/拦截/完成/取消）；空闲时给操作指引。
     let note_row = Rect {

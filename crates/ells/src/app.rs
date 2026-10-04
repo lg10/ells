@@ -707,8 +707,8 @@ impl App {
         }
         match self.screen {
             ScreenKind::Session => {
-                if hit(ui::github_rect(self.last_area), column, row) {
-                    self.open_github();
+                if hit(ui::homepage_rect(self.last_area), column, row) {
+                    self.open_homepage();
                     return;
                 }
                 let [settings_r, upload_r, download_r, progress_r] =
@@ -761,8 +761,8 @@ impl App {
                 }
             }
             ScreenKind::List => {
-                if hit(ui::github_rect(self.last_area), column, row) {
-                    self.open_github();
+                if hit(ui::homepage_rect(self.last_area), column, row) {
+                    self.open_homepage();
                 } else if hit(ui::list_settings_rect(self.last_area), column, row) {
                     self.settings_open = true;
                     self.settings_focus = 0;
@@ -1603,9 +1603,9 @@ impl App {
         }
     }
 
-    fn open_github(&mut self) {
-        open_url(ui::GITHUB_URL);
-        self.status = Some("已在浏览器中打开仓库主页".to_string());
+    fn open_homepage(&mut self) {
+        open_url(ui::HOMEPAGE_URL);
+        self.status = Some("已在浏览器中打开官网 ells.cn".to_string());
     }
 
     /// 终端标签名随页面联动：ells-功能页名；会话页显示 ells-主机别名。
