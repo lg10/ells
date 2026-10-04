@@ -8,13 +8,13 @@
 
 `Rust` `TUI` `SSH` `SFTP` `ZMODEM`
 
-官网：[https://ells.cn](https://ells.cn) · 仓库：[Gitee](https://gitee.com/lg10/ells)
+官网：[https://ells.cn](https://ells.cn) · 仓库：[GitHub](https://github.com/lg10/ells)
 
-![license](https://img.shields.io/badge/license-MIT-green) ![rust](https://img.shields.io/badge/rust-edition%202024-orange) ![platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-blue)
+![CI](https://github.com/lg10/ells/actions/workflows/ci.yml/badge.svg) ![license](https://img.shields.io/badge/license-MIT-green) ![rust](https://img.shields.io/badge/rust-edition%202024-orange) ![platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-blue)
 
 </div>
 
-> ⚠️ **早期版本。** ells 处于活跃开发阶段（v0.1.x），可能存在 Bug、功能尚不完善。欢迎通过 [Issue](https://gitee.com/lg10/ells/issues) 反馈问题。
+> ⚠️ **早期版本。** ells 处于活跃开发阶段（v0.1.x），可能存在 Bug、功能尚不完善。欢迎通过 [Issue](https://github.com/lg10/ells/issues) 反馈问题。
 
 ## 什么是 ells
 

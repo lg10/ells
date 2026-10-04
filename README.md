@@ -8,13 +8,13 @@
 
 `Rust` `TUI` `SSH` `SFTP` `ZMODEM`
 
-Homepage: [https://ells.cn](https://ells.cn) · Repo: [Gitee](https://gitee.com/lg10/ells)
+Homepage: [https://ells.cn](https://ells.cn) · Repo: [GitHub](https://github.com/lg10/ells)
 
-![license](https://img.shields.io/badge/license-MIT-green) ![rust](https://img.shields.io/badge/rust-edition%202024-orange) ![platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-blue)
+![CI](https://github.com/lg10/ells/actions/workflows/ci.yml/badge.svg) ![license](https://img.shields.io/badge/license-MIT-green) ![rust](https://img.shields.io/badge/rust-edition%202024-orange) ![platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-blue)
 
 </div>
 
-> ⚠️ **Early access.** ells is in active development (v0.1.x). Expect bugs and rough edges; feedback via [Issues](https://gitee.com/lg10/ells/issues) is very welcome.
+> ⚠️ **Early access.** ells is in active development (v0.1.x). Expect bugs and rough edges; feedback via [Issues](https://github.com/lg10/ells/issues) is very welcome.
 
 ## What is ells
 
