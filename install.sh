@@ -2,15 +2,17 @@
 # ells 一键安装脚本（macOS / Linux）
 # 用法：curl -fsSL https://raw.githubusercontent.com/lg10/ells/main/install.sh | sh
 # 环境变量：
-#   ELLS_VERSION      指定版本（如 v0.1.0），默认取 GitHub 最新 Release
+#   ELLS_VERSION      指定版本（如 v0.1.1），默认取 GitHub 最新 Release
 #   ELLS_INSTALL_DIR  安装目录，默认 ~/.local/bin
 #   ELLS_API_URL      版本查询地址（内网/镜像可覆盖）
-#   ELLS_DOWNLOAD_URL Release 下载基址（内网/镜像可覆盖，需含 {version}）
+#   ELLS_DOWNLOAD_URL Release 下载基址（内网/镜像可覆盖）
+#
+# 兼容性约束：macOS /bin/sh 是 bash 3.2，对未定义变量在 set -u 下的展开可能误报
+# unbound variable，因此环境变量一律用 ${VAR+set} 探测（不展开值本身），再显式 if 赋值。
 set -eu
 
 REPO="lg10/ells"
 BIN_NAME="ells"
-INSTALL_DIR="${ELLS_INSTALL_DIR:-$HOME/.local/bin}"
 
 info() { printf '\033[36m[ells]\033[0m %s\n' "$1"; }
 fail() { printf '\033[31m[ells] 安装失败：\033[0m%s\n' "$1" >&2; exit 1; }
@@ -32,14 +34,32 @@ else
   esac
 fi
 
-VERSION="${ELLS_VERSION:-}"
-if [ -z "$VERSION" ]; then
-  VERSION=$(curl -fsSL "${ELLS_API_URL:-https://api.github.com/repos/$REPO/releases/latest}" \
-    | grep '"tag_name"' | head -n1 | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/')
+if [ "${ELLS_INSTALL_DIR+set}" = set ] && [ -n "$ELLS_INSTALL_DIR" ]; then
+  INSTALL_DIR="$ELLS_INSTALL_DIR"
+else
+  INSTALL_DIR="$HOME/.local/bin"
+fi
+
+if [ "${ELLS_API_URL+set}" = set ] && [ -n "$ELLS_API_URL" ]; then
+  API_URL="$ELLS_API_URL"
+else
+  API_URL="https://api.github.com/repos/$REPO/releases/latest"
+fi
+
+if [ "${ELLS_VERSION+set}" = set ] && [ -n "$ELLS_VERSION" ]; then
+  VERSION="$ELLS_VERSION"
+else
+  info "正在获取最新版本号..."
+  VERSION=$(curl -fsSL "$API_URL" | grep '"tag_name"' | head -n1 | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/') || VERSION=""
   [ -n "$VERSION" ] || fail "无法获取最新版本号，请设置 ELLS_VERSION=vX.Y.Z 后重试"
 fi
 
-BASE_URL="${ELLS_DOWNLOAD_URL:-https://github.com/$REPO/releases/download}/$VERSION"
+if [ "${ELLS_DOWNLOAD_URL+set}" = set ] && [ -n "$ELLS_DOWNLOAD_URL" ]; then
+  BASE_URL="$ELLS_DOWNLOAD_URL/$VERSION"
+else
+  BASE_URL="https://github.com/$REPO/releases/download/$VERSION"
+fi
+
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
@@ -70,12 +90,12 @@ info "已安装：$INSTALL_DIR/$BIN_NAME 与 $INSTALL_DIR/s"
 # 确保 PATH 生效（参考 rustup 的做法；写入实际安装目录，兼容自定义 ELLS_INSTALL_DIR）
 PATH_LINE="export PATH=\"$INSTALL_DIR:\$PATH\""
 added_to=""
-case "${SHELL:-}" in
+case "${SHELL-x}" in
   */zsh) added_to="$HOME/.zshrc" ;;
   */bash) added_to="$HOME/.bashrc" ;;
 esac
 [ -n "$added_to" ] || added_to="$HOME/.profile"
-if ! printf '%s' ":${PATH}:" | grep -qF ":$INSTALL_DIR:"; then
+if ! printf '%s' ":$PATH:" | grep -qF ":$INSTALL_DIR:"; then
   mkdir -p "$(dirname "$added_to")"; touch "$added_to"
   grep -qF "$PATH_LINE" "$added_to" || printf '\n%s\n' "$PATH_LINE" >> "$added_to"
   info "已将 $INSTALL_DIR 写入 $added_to"

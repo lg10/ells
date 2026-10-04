@@ -52,3 +52,24 @@ jobs:
           name: ${{ matrix.artifact }}
           path: target/${{ matrix.target }}/debug/ells${{ matrix.os == 'windows-latest' && '.exe' || '' }}
           if-no-files-found: error
+
+  # 用 macOS 自带 /bin/sh（bash 3.2 古董，set -u 下 ${VAR:-含$展开} 会误报 unbound）真跑一遍安装
+  install-smoke:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fake release server + install via /bin/sh
+        run: |
+          set -eu
+          mkdir -p fake/v0.0.0-test
+          printf 'fake-macos-binary' > fake/v0.0.0-test/ells-macos-universal
+          (cd fake/v0.0.0-test && echo "$(shasum -a 256 < ells-macos-universal)  ells-macos-universal" > SHA256SUMS.txt)
+          (cd fake && python3 -m http.server 18098 >/dev/null 2>&1 &)
+          sleep 1
+          mkdir -p "$RUNNER_TEMP/fakehome"
+          ELLS_VERSION=v0.0.0-test ELLS_DOWNLOAD_URL=http://127.0.0.1:18098 \
+            HOME="$RUNNER_TEMP/fakehome" ELLS_INSTALL_DIR="$RUNNER_TEMP/fakehome/.local/bin" \
+            /bin/sh install.sh
+          test -x "$RUNNER_TEMP/fakehome/.local/bin/ells"
+          test -L "$RUNNER_TEMP/fakehome/.local/bin/s"
+          echo "install.sh smoke OK"
