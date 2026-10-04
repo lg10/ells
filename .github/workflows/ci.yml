@@ -53,12 +53,15 @@ jobs:
           path: target/${{ matrix.target }}/debug/ells${{ matrix.os == 'windows-latest' && '.exe' || '' }}
           if-no-files-found: error
 
-  # 用 macOS 自带 /bin/sh（bash 3.2 古董，set -u 下 ${VAR:-含$展开} 会误报 unbound）真跑一遍安装
+  # 用 macOS 自带 /bin/sh（GNU bash 3.2）在 LC_ALL=C 下真跑一遍安装：
+  # C locale 会复现"展开后紧跟多字节字符被并入变量名"这类老 shell 崩溃
   install-smoke:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
-      - name: Fake release server + install via /bin/sh
+      - name: Lint shell expansions
+        run: node tools/check-shell-expansions.js install.sh diagnose.sh
+      - name: Fake release server + install via /bin/sh (C locale)
         run: |
           set -eu
           mkdir -p fake/v0.0.0-test
@@ -67,6 +70,7 @@ jobs:
           (cd fake && python3 -m http.server 18098 >/dev/null 2>&1 &)
           sleep 1
           mkdir -p "$RUNNER_TEMP/fakehome"
+          LC_ALL=C LANG=C \
           ELLS_VERSION=v0.0.0-test ELLS_DOWNLOAD_URL=http://127.0.0.1:18098 \
             HOME="$RUNNER_TEMP/fakehome" ELLS_INSTALL_DIR="$RUNNER_TEMP/fakehome/.local/bin" \
             /bin/sh install.sh
