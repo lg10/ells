@@ -60,14 +60,14 @@ Reopen your terminal afterwards, and both `ells` and the short command `s` are r
 macOS / Linux:
 
 ```bash
-ELLS_VERSION=v0.1.6 curl -fsSL https://raw.githubusercontent.com/lg10/ells/main/install.sh | sh
+ELLS_VERSION=v0.1.7 curl -fsSL https://raw.githubusercontent.com/lg10/ells/main/install.sh | sh
 ELLS_INSTALL_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/lg10/ells/main/install.sh | sh
 ```
 
 Windows PowerShell:
 
 ```powershell
-$env:ELLS_VERSION="v0.1.6"; irm https://raw.githubusercontent.com/lg10/ells/main/install.ps1 | iex
+$env:ELLS_VERSION="v0.1.7"; irm https://raw.githubusercontent.com/lg10/ells/main/install.ps1 | iex
 $env:ELLS_INSTALL_DIR="$env:USERPROFILE\bin"; irm https://raw.githubusercontent.com/lg10/ells/main/install.ps1 | iex
 ```
 
