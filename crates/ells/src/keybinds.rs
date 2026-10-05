@@ -159,6 +159,7 @@ pub enum Action {
     NextTab,
     PrevTab,
     CloseTab,
+    HostList,
     Browser,
     Passthrough,
     Redraw,
@@ -166,11 +167,12 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Action; 8] = [
+    pub const ALL: [Action; 9] = [
         Action::NewTab,
         Action::NextTab,
         Action::PrevTab,
         Action::CloseTab,
+        Action::HostList,
         Action::Browser,
         Action::Passthrough,
         Action::Redraw,
@@ -182,7 +184,8 @@ impl Action {
             Action::NewTab => "新建标签页",
             Action::NextTab => "下一个标签",
             Action::PrevTab => "上一个标签",
-            Action::CloseTab => "关闭标签 / 返回",
+            Action::CloseTab => "关闭标签 / 断开",
+            Action::HostList => "返回主机列表",
             Action::Browser => "文件浏览器",
             Action::Passthrough => "内嵌 / 直通切换",
             Action::Redraw => "整屏重绘",
@@ -197,6 +200,7 @@ impl Action {
             Action::NextTab => "key_next_tab",
             Action::PrevTab => "key_prev_tab",
             Action::CloseTab => "key_close_tab",
+            Action::HostList => "key_host_list",
             Action::Browser => "key_browser",
             Action::Passthrough => "key_passthrough",
             Action::Redraw => "key_redraw",
@@ -218,6 +222,7 @@ impl Action {
             Action::NextTab => Chord::function(5),
             Action::PrevTab => Chord::function(6),
             Action::CloseTab => Chord::ctrl(']'),
+            Action::HostList => Chord::ctrl('g'),
             Action::Browser => Chord::ctrl('s'),
             Action::Passthrough => Chord::ctrl('q'),
             Action::Redraw => Chord::ctrl('l'),
@@ -226,10 +231,10 @@ impl Action {
     }
 }
 
-/// 八个动作的当前绑定。`Copy`：派发路径每帧都要读，且只有一个实例。
+/// 动作数量固定为 `Action::ALL.len()`，数组长度跟着它走，加动作不用改这里。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KeyBinds {
-    items: [Chord; 8],
+    items: [Chord; Action::ALL.len()],
 }
 
 impl Default for KeyBinds {
@@ -296,10 +301,21 @@ mod tests {
         assert_eq!(b.display(Action::NextTab), "F5");
         assert_eq!(b.display(Action::PrevTab), "F6");
         assert_eq!(b.display(Action::CloseTab), "Ctrl-]");
+        assert_eq!(b.display(Action::HostList), "Ctrl-G");
         assert_eq!(b.display(Action::Browser), "Ctrl-S");
         assert_eq!(b.display(Action::Passthrough), "Ctrl-Q");
         assert_eq!(b.display(Action::Redraw), "Ctrl-L");
         assert_eq!(b.display(Action::Search), "F3");
+    }
+
+    #[test]
+    fn defaults_do_not_collide() {
+        let b = KeyBinds::default();
+        for (idx, a) in Action::ALL.iter().enumerate() {
+            for other in Action::ALL.iter().skip(idx + 1) {
+                assert_ne!(b.get(*a), b.get(*other), "{} 与 {} 默认撞键", a.ini_key(), other.ini_key());
+            }
+        }
     }
 
     #[test]

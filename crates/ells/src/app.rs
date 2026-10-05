@@ -944,10 +944,21 @@ impl App {
             self.cycle_tab(false);
             return;
         }
-        if binds.matches(Action::CloseTab, &key) && self.screen == ScreenKind::Browser {
-            self.slots[self.work].sz_pick_mode = false;
-            self.detach_or_close_tab();
+        if binds.matches(Action::HostList, &key) {
+            self.toggle_host_list();
             return;
+        }
+        if binds.matches(Action::CloseTab, &key) {
+            if self.screen == ScreenKind::Browser {
+                self.slots[self.work].sz_pick_mode = false;
+                self.detach_or_close_tab();
+                return;
+            }
+            // 从会话页 Ctrl-G 来到列表后，这一格只有在这里能断开；
+            // 还在拨号的标签不碰，那会儿 take() 掉不了正在跑的连接任务
+            if self.screen == ScreenKind::List && self.slots[self.active].session.is_some() {
+                self.detach_or_close_tab();
+            }
         }
         match self.screen {
             ScreenKind::Session => self.handle_session_key(&key).await,
@@ -1158,12 +1169,17 @@ impl App {
 
     /// 切到某个标签：页面跟着它自己走，全局弹窗与状态行一律清掉。
     fn focus_tab(&mut self, idx: usize) {
-        if idx >= self.slots.len() || idx == self.active || self.tabs_locked() {
+        if idx >= self.slots.len() || self.tabs_locked() {
+            return;
+        }
+        // 点"自己那一格"= 从主机列表回到它当时的页面，所以只有真的换页才算一次切换
+        let view = self.slot_view(idx);
+        if idx == self.active && view == self.screen {
             return;
         }
         self.active = idx;
         self.work = idx;
-        self.screen = self.slot_view(idx);
+        self.screen = view;
         self.settings_open = false;
         self.transfer_popup = false;
         self.status = None;
@@ -1176,6 +1192,76 @@ impl App {
         {
             let path = slot.browser.path.clone();
             self.start_listing(path);
+        }
+    }
+
+    /// 保持连接回到主机列表（默认 Ctrl-G，可改键）。再按一次回到那一格标签当时的页面：
+    /// 只换 `App.screen`，`slots[active].view` 不动，所以会话画面/浏览器目录都还在原地。
+    fn toggle_host_list(&mut self) {
+        if self.tabs_locked() {
+            return;
+        }
+        if self.screen == ScreenKind::List {
+            // 已经在列表页：这一格有活着的会话就切回去，还在拨号就报一声，别让按键像失灵
+            if self.slots[self.active].session.is_some() {
+                self.focus_tab(self.active);
+                return;
+            }
+            if self.slots[self.active].connecting {
+                let alias = self.slots[self.active]
+                    .host
+                    .as_ref()
+                    .map(|h| h.alias.clone())
+                    .unwrap_or_default();
+                self.status = Some(format!("「{alias}」正在连接…"));
+            }
+            return;
+        }
+        if self.slots[self.active]
+            .session
+            .as_ref()
+            .is_some_and(|s| s.mode == TermMode::Passthrough)
+        {
+            // 直通模式由远端独占屏幕，此刻 ells 自己的界面画了也没人看得见
+            self.status = Some(format!(
+                "直通模式下远端独占屏幕 · 先按 {} 回内嵌再看列表",
+                self.settings.keybinds.display(Action::Passthrough)
+            ));
+            return;
+        }
+        self.screen = ScreenKind::List;
+        self.settings_open = false;
+        self.transfer_popup = false;
+        let live = self.slots.iter().filter(|s| s.session.is_some()).count();
+        self.status = if live > 0 {
+            Some(format!(
+                "{live} 路会话仍在后台运行 · 点击标签或选中该机按 Enter 切回去 · {} 新建标签",
+                self.settings.keybinds.display(Action::NewTab)
+            ))
+        } else {
+            None
+        };
+    }
+
+    /// Enter 选中主机：这台已经连着（或正在连）就切回它那一格标签，绝不重复拨号。
+    fn open_host(&mut self, host: Host) {
+        let alive = self.slots.iter().position(|s| {
+            s.host.as_ref().is_some_and(|h| h.alias == host.alias)
+                && (s.session.is_some() || s.connecting)
+        });
+        match alive {
+            Some(idx) => {
+                // 还在拨号的那一格切过去也看不到会话画面（此刻它仍停在列表），
+                // 说成"正在连接"比"已切到"更贴合用户看到的东西
+                let dialing = self.slots[idx].session.is_none();
+                self.focus_tab(idx);
+                self.status = Some(if dialing {
+                    format!("标签 {}「{}」正在连接…", idx + 1, host.alias)
+                } else {
+                    format!("已切到标签 {}「{}」", idx + 1, host.alias)
+                });
+            }
+            None => self.start_connect(host, None),
         }
     }
 
@@ -1243,7 +1329,10 @@ impl App {
         let id = self.slots[self.active].id;
         if busy && self.close_tab_confirm != Some(id) {
             self.close_tab_confirm = Some(id);
-            self.status = Some("该标签还在传输，再按一次 Ctrl-] 确认断开".to_string());
+            self.status = Some(format!(
+                "该标签还在传输，再按一次 {} 确认断开",
+                self.settings.keybinds.display(Action::CloseTab)
+            ));
             return;
         }
         self.close_tab_confirm = None;
@@ -1269,6 +1358,24 @@ impl App {
         } else {
             self.slots[self.work].view = ScreenKind::Session;
         }
+    }
+
+    /// 标签条命中测试：列表页/会话页/浏览器页共用第 1 行的同一份几何。
+    /// 返回 true 表示这一下已被标签条吃掉，页面自己的命中测试不用再跑。
+    fn hit_tab_bar(&mut self, column: u16, row: u16) -> bool {
+        let count = self.slots.len();
+        if hit(ui::tab_new_rect(self.last_area, count), column, row) {
+            self.new_tab();
+            return true;
+        }
+        if let Some((idx, _)) = ui::tab_rects(self.last_area, count)
+            .into_iter()
+            .find(|(_, r)| hit(*r, column, row))
+        {
+            self.focus_tab(idx);
+            return true;
+        }
+        false
     }
 
     /// 顶部按钮行/弹窗的鼠标命中测试。
@@ -1368,19 +1475,10 @@ impl App {
                     return;
                 }
                 // 标签条：点标签切过去，点末尾的 + 新建一个
-                let count = self.slots.len();
-                if hit(ui::tab_new_rect(self.last_area, count), column, row) {
-                    self.new_tab();
+                if self.hit_tab_bar(column, row) {
                     return;
                 }
-                if let Some((idx, _)) = ui::tab_rects(self.last_area, count)
-                    .into_iter()
-                    .find(|(_, r)| hit(*r, column, row))
-                {
-                    self.focus_tab(idx);
-                    return;
-                }
-                let [settings_r, upload_r, download_r, progress_r] =
+                let [settings_r, upload_r, download_r, list_r, progress_r] =
                     ui::header_button_rects(self.last_area);
                 if hit(settings_r, column, row) {
                     self.open_settings();
@@ -1388,6 +1486,8 @@ impl App {
                     self.trigger_upload();
                 } else if hit(download_r, column, row) {
                     self.trigger_download();
+                } else if hit(list_r, column, row) {
+                    self.toggle_host_list();
                 } else if hit(progress_r, column, row) && !self.slots[self.work].browser.transfers.is_empty() {
                     self.transfer_popup = true;
                 } else if hit(ui::session_emu_rect(self.last_area), column, row) {
@@ -1398,7 +1498,10 @@ impl App {
                 }
             }
             ScreenKind::Browser => {
-                let list = ui::browser_layout(self.last_area)[1];
+                if self.hit_tab_bar(column, row) {
+                    return;
+                }
+                let list = ui::browser_layout(self.last_area)[2];
                 if row >= list.y && row < list.y.saturating_add(list.height) {
                     let idx = (row - list.y) as usize + self.slots[self.work].browser.scroll;
                     if idx < self.slots[self.work].browser.entries.len() {
@@ -1429,6 +1532,9 @@ impl App {
                 }
             }
             ScreenKind::List => {
+                if self.hit_tab_bar(column, row) {
+                    return;
+                }
                 if hit(ui::homepage_rect(self.last_area), column, row) {
                     self.open_homepage();
                 } else if hit(ui::list_settings_rect(self.last_area), column, row) {
@@ -1479,7 +1585,7 @@ impl App {
                 if self.slots[self.work].browser.entries.is_empty() {
                     return;
                 }
-                let height = ui::browser_layout(self.last_area)[1].height.max(1) as usize;
+                let height = ui::browser_layout(self.last_area)[2].height.max(1) as usize;
                 let len = self.slots[self.work].browser.entries.len();
                 if delta > 0 {
                     self.slots[self.work].browser.selected = (self.slots[self.work].browser.selected + 1).min(len - 1);
@@ -2646,7 +2752,7 @@ impl App {
             KeyCode::Char('?') | KeyCode::F(1) => self.help_open = true,
             KeyCode::Enter => {
                 if let Some(host) = self.vault.hosts.get(self.list.selected).cloned() {
-                    self.start_connect(host, None);
+                    self.open_host(host);
                 }
             }
             _ => {}

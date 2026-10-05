@@ -162,22 +162,71 @@ fn draw_unlock(f: &mut Frame, app: &mut App) {
     );
 }
 
-fn draw_list(f: &mut Frame, app: &mut App) {
-    let chunks = Layout::default()
+/// 主机列表页几何：品牌行 / 标签条 / 主机面板 / 键位行 / 状态行。
+/// 标签条在列表页也要能点（那是回到"已经连着的会话"的入口），所以绘制与命中测试共用它。
+pub fn list_layout(area: Rect) -> std::rc::Rc<[Rect]> {
+    Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(1), Constraint::Length(2)])
-        .split(f.area());
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+            Constraint::Length(2),
+        ])
+        .split(area)
+}
+
+/// 主机的会话状态标记：● 已连着 / ○ 正在连 / · 空闲。
+/// 一台主机可能有多路会话，取第一个命中的活动标签。
+fn live_mark(app: &App, alias: &str) -> (char, Color) {
+    for slot in &app.slots {
+        if slot.host.as_ref().map(|h| h.alias.as_str()) != Some(alias) {
+            continue;
+        }
+        if slot.session.is_some() {
+            return ('●', Color::Green);
+        }
+        if slot.connecting {
+            return ('○', Color::Yellow);
+        }
+    }
+    ('·', Color::DarkGray)
+}
+
+fn draw_list(f: &mut Frame, app: &mut App) {
+    let chunks = list_layout(f.area());
+    let area = f.area();
+
+    // 第 0 行：品牌行（右端官网徽章单独画，避免被本段文字盖住）
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                " ells ",
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("主机列表 · {}", version_tag()), Style::default().fg(Color::DarkGray)),
+        ]))
+        .style(Style::default().bg(Color::Black)),
+        chunks[0],
+    );
+    // 第 1 行：标签条（与会话页同一份几何）
+    let titles: Vec<String> = app.slots.iter().map(Slot::title).collect();
+    draw_tab_bar(f, area, &titles, app.active, &app.settings.keybinds);
 
     let block = Block::default()
         .borders(Borders::ALL)
         .title(format!(
-            " ells · 主机  {}{}",
-            version_tag(),
-            tab_counter(app)
+            " 主机{} ",
+            if app.vault.hosts.is_empty() {
+                String::new()
+            } else {
+                format!("({} 台)", app.vault.hosts.len())
+            }
         ))
         .title_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
-    let inner = block.inner(chunks[0]);
-    f.render_widget(block, chunks[0]);
+    let inner = block.inner(chunks[2]);
+    f.render_widget(block, chunks[2]);
 
     if app.vault.hosts.is_empty() {
         f.render_widget(
@@ -193,7 +242,12 @@ fn draw_list(f: &mut Frame, app: &mut App) {
             .hosts
             .iter()
             .map(|h| {
+                let (mark, mark_color) = live_mark(app, &h.alias);
                 let mut spans = vec![
+                    Span::styled(
+                        format!("{mark} "),
+                        Style::default().fg(mark_color).add_modifier(Modifier::BOLD),
+                    ),
                     Span::styled(
                         format!("{:<14}", h.alias),
                         Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
@@ -227,12 +281,14 @@ fn draw_list(f: &mut Frame, app: &mut App) {
     }
 
     let keys = format!(
-        " ↑↓ 选择 · Enter 连接 · a 新增 · e 编辑 · d 删除 · i 导入 · s 设置 · {} 新标签 · ? 帮助 · q 退出 ",
-        app.settings.keybinds.display(crate::keybinds::Action::NewTab)
+        " ↑↓ 选择 · Enter 连接/切回 · a 新增 · e 编辑 · d 删除 · i 导入 · s 设置 · {}/{}/{} 切标签 · ? 帮助 · q 退出 ",
+        app.settings.keybinds.display(crate::keybinds::Action::NewTab),
+        app.settings.keybinds.display(crate::keybinds::Action::NextTab),
+        app.settings.keybinds.display(crate::keybinds::Action::PrevTab),
     );
     f.render_widget(
         Paragraph::new(keys).style(Style::default().fg(Color::DarkGray)),
-        chunks[1],
+        chunks[3],
     );
     // 键位行右端：【设置】按钮（实心青底，与会话页按钮同风格）
     f.render_widget(
@@ -245,11 +301,26 @@ fn draw_list(f: &mut Frame, app: &mut App) {
         ))),
         list_settings_rect(f.area()),
     );
-    let status = app.status.clone().unwrap_or_default();
-    f.render_widget(
-        Paragraph::new(status).style(Style::default().fg(Color::Green)),
-        chunks[2],
-    );
+    match &app.status {
+        Some(status) => f.render_widget(
+            Paragraph::new(status.clone()).style(Style::default().fg(Color::Green)),
+            chunks[4],
+        ),
+        // 空闲时用状态行讲清标记的含义，省得用户以为 ● 是装饰
+        None => {
+            let legend = format!(
+                " ● 已连接（Enter 或点顶部标签切回那一格）· ○ 正在连接 · 断开用 {}（只断这一格） ",
+                app.settings.keybinds.display(crate::keybinds::Action::CloseTab)
+            );
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    legend,
+                    Style::default().fg(Color::DarkGray),
+                ))),
+                chunks[4],
+            );
+        }
+    }
 
     // 顶部右端官网徽章
     draw_homepage_badge(f, f.area());
@@ -356,23 +427,26 @@ fn draw_help(f: &mut Frame, area: Rect, binds: &crate::keybinds::KeyBinds) {
         panel,
     );
     use crate::keybinds::Action;
+    let list_body = "↑↓/jk 选择 · Enter 连接（这台已经连着就切回它那一格标签）· a 新增 · e 编辑 · d 删除（二次确认）· s 设置 · i 导入 ~/.ssh/config · ?/F1 帮助 · q/Ctrl-C 退出；行首 ● 已连接 / ○ 正在连接，顶部标签条可以直接点".to_string();
     let tab_body = format!(
-        "{} 新建标签 · {} 下一个 · {} 上一个 · 鼠标点顶部标签条切换、点末尾 + 新建 · {} 关闭当前标签（只剩一个时退回主机列表）· 每个标签是一路独立 SSH，后台标签的输出与传输继续跑",
+        "{} 新建标签 · {} 下一个 · {} 上一个 · 鼠标点顶部标签条切换、点末尾 + 新建 · {} 关闭当前标签（只断这一格）· {} 回主机列表（连接保持不断，再按一次回到原来的页面）· 列表页与会话页、浏览器页顶部都有标签条",
         binds.display(Action::NewTab),
         binds.display(Action::NextTab),
         binds.display(Action::PrevTab),
         binds.display(Action::CloseTab),
+        binds.display(Action::HostList),
     );
     let term_body = format!(
-        "直接打字即发往远端 · {} 文件浏览器 · {} 内嵌/直通 · {} 关闭标签 · {} 整屏重绘 · 滚轮回看 · 拖选复制（OSC 52）· {} 搜索历史输出（回看时按 / 同样可用，n/N 上下条）· F1 帮助",
+        "直接打字即发往远端 · {} 文件浏览器 · {} 内嵌/直通 · {} 关闭标签 · {} 整屏重绘 · 滚轮回看 · 拖选复制（OSC 52）· {} 搜索历史输出（回看时按 / 同样可用，n/N 上下条）· {} 回主机列表 · F1 帮助",
         binds.display(Action::Browser),
         binds.display(Action::Passthrough),
         binds.display(Action::CloseTab),
         binds.display(Action::Redraw),
         binds.display(Action::Search),
+        binds.display(Action::HostList),
     );
     let sections: [(&str, std::borrow::Cow<str>); 9] = [
-        ("主机列表", std::borrow::Cow::Borrowed("↑↓/jk 选择 · Enter 连接 · a 新增 · e 编辑 · d 删除（二次确认）· s 设置 · i 导入 ~/.ssh/config · ?/F1 帮助 · q/Ctrl-C 退出")),
+        ("主机列表", std::borrow::Cow::Owned(list_body)),
         ("多标签会话", std::borrow::Cow::Owned(tab_body)),
         ("会话终端", std::borrow::Cow::Owned(term_body)),
         ("改键", std::borrow::Cow::Borrowed("会话与标签页按键可在「设置 → 快捷键设置」里自定义（列表页按 s、会话页按顶部【设置】）：Enter 选中某项后按下新按键即可绑定，只接受 F2–F12 或 Ctrl/Alt 组合键（F1 留给帮助页），改完即时写入 ~/.ells/settings.ini；撞到已占用的键会自动互换，【恢复默认】一键还原。")),
@@ -767,6 +841,7 @@ pub fn browser_layout(area: Rect) -> std::rc::Rc<[Rect]> {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
+            Constraint::Length(1),
             Constraint::Min(3),
             Constraint::Length(1),
         ])
@@ -774,9 +849,13 @@ pub fn browser_layout(area: Rect) -> std::rc::Rc<[Rect]> {
 }
 
 fn draw_browser(f: &mut Frame, app: &mut App) {
-    let chunks = browser_layout(f.area());
-    let height = chunks[1].height.max(1) as usize;
-    let tabs = tab_counter(app);
+    let area = f.area();
+    let chunks = browser_layout(area);
+    // 标签条要读绑定表，而下面 `b` 已经可变借用了 app.slots —— 先拷一份（KeyBinds 是 Copy）
+    let binds = app.settings.keybinds;
+    let active = app.active;
+    let titles: Vec<String> = app.slots.iter().map(Slot::title).collect();
+    let height = chunks[2].height.max(1) as usize;
     let b = &mut app.slots[app.active].browser;
     // 键盘移动选择后，滚动窗口在绘制时统一夹住（滚轮/点击路径已自行维护）
     if b.selected >= b.scroll + height {
@@ -788,7 +867,7 @@ fn draw_browser(f: &mut Frame, app: &mut App) {
 
     let path_line = Line::from(vec![
         Span::styled(
-            format!(" 远端文件 · {tabs}{} ", b.path),
+            format!(" 远端文件 {} ", b.path),
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         ),
         if b.loading {
@@ -804,6 +883,8 @@ fn draw_browser(f: &mut Frame, app: &mut App) {
         Paragraph::new(path_line).style(Style::default().bg(Color::DarkGray)),
         chunks[0],
     );
+    // 第 1 行：标签条（列表页/会话页/浏览器页同一套几何，点标签就切过去）
+    draw_tab_bar(f, area, &titles, active, &binds);
 
     let items: Vec<ListItem> = b
         .entries
@@ -833,20 +914,20 @@ fn draw_browser(f: &mut Frame, app: &mut App) {
     } else {
         Some(b.selected.min(b.entries.len() - 1))
     });
-    f.render_stateful_widget(list, chunks[1], &mut ls);
+    f.render_stateful_widget(list, chunks[2], &mut ls);
 
     // 传输进度不再占用浏览器界面：统一在会话顶部的聚合条/详情弹窗查看
     if let Some(err) = &b.error {
         f.render_widget(
             Paragraph::new(format!(" {err}")).style(Style::default().fg(Color::Red)),
-            chunks[2],
+            chunks[3],
         );
     } else {
         let keys =
             " ↑↓/滚轮 选择 · Enter 进入/下载 · u 上传文件 · U 上传目录 · d 下载 · m 新建目录 · n 重命名 · D 删除 · Ctrl-C 取消传输 · r 刷新 · Esc 返回终端 ";
         f.render_widget(
             Paragraph::new(keys).style(Style::default().fg(Color::DarkGray)),
-            chunks[2],
+            chunks[3],
         );
     }
 }
@@ -898,7 +979,7 @@ fn draw_session(f: &mut Frame, app: &mut App) {
     let binds = app.settings.keybinds;
     use crate::keybinds::Action;
     let key_hint = format!(
-        "{} 切模式 · {} 文件 · {} 重绘 · {} 搜索 · {} 新标签 · {}/{} 切换 · {} 关闭标签",
+        "{} 切模式 · {} 文件 · {} 重绘 · {} 搜索 · {} 新标签 · {}/{} 切换 · {} 关闭标签 · {} 列表",
         binds.display(Action::Passthrough),
         binds.display(Action::Browser),
         binds.display(Action::Redraw),
@@ -907,6 +988,7 @@ fn draw_session(f: &mut Frame, app: &mut App) {
         binds.display(Action::NextTab),
         binds.display(Action::PrevTab),
         binds.display(Action::CloseTab),
+        binds.display(Action::HostList),
     );
     let header = Line::from(vec![
         Span::styled(" ells ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
@@ -1099,27 +1181,31 @@ fn draw_session(f: &mut Frame, app: &mut App) {
     }
 }
 
-/// 会话顶部第 3 行的可点击区域：【设置】【上传】【下载】 + 聚合进度条。
+/// 会话顶部第 3 行的可点击区域：【设置】【上传】【下载】【列表】 + 聚合进度条。
 /// 鼠标事件用它做命中测试，绘制用它摆位置，两者必须一致。
-pub fn header_button_rects(area: Rect) -> [Rect; 4] {
+pub fn header_button_rects(area: Rect) -> [Rect; 5] {
     let y = area.y + 3;
     let btn = |x: u16| Rect { x: area.x + x, y, width: 8, height: 1 };
     let settings = btn(1);
     let upload = btn(10);
     let download = btn(19);
-    let w = (area.width.saturating_sub(30)).clamp(0, 44).max(1);
+    let host_list = btn(28);
+    // 四个按钮占到第 36 列，进度条只能从它右边开始算（窄屏也不能盖住【列表】）
+    let w = (area.width.saturating_sub(40)).clamp(0, 44).max(1);
     let progress = Rect {
-        x: area.x.saturating_add(area.width).saturating_sub(w + 2),
+        x: (area.x + area.width)
+            .saturating_sub(w + 2)
+            .max(area.x.saturating_add(37)),
         y,
         width: w,
         height: 1,
     };
-    [settings, upload, download, progress]
+    [settings, upload, download, host_list, progress]
 }
 
 fn draw_header_buttons(f: &mut Frame, app: &App) {
     let area = f.area();
-    let [settings, upload, download, progress] = header_button_rects(area);
+    let [settings, upload, download, host_list, progress] = header_button_rects(area);
     // 整行黑底，和上方提示行连成一块"标题栏"
     f.render_widget(
         Paragraph::new(Line::from("")).style(Style::default().bg(Color::Black)),
@@ -1130,7 +1216,7 @@ fn draw_header_buttons(f: &mut Frame, app: &App) {
         .fg(Color::Black)
         .bg(Color::Cyan)
         .add_modifier(Modifier::BOLD);
-    for (rect, label) in [(settings, "设置"), (upload, "上传"), (download, "下载")] {
+    for (rect, label) in [(settings, "设置"), (upload, "上传"), (download, "下载"), (host_list, "列表")] {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(format!("【{label}】"), btn_style))),
             rect,
@@ -1234,15 +1320,7 @@ pub fn tab_new_rect(area: Rect, count: usize) -> Rect {
     }
 }
 
-/// 没有标签条的页面（主机列表 / 文件浏览器）用一行小字提示当前在第几个标签。
-fn tab_counter(app: &App) -> String {
-    if app.slots.len() < 2 {
-        return String::new();
-    }
-    format!(" · 标签 {}/{} ", app.active + 1, app.slots.len())
-}
-
-/// 标签条：当前标签实心高亮，后台标签灰底，超出宽度的标签不画（F5/F6 仍能循环）。
+/// 标签条：当前标签实心高亮，后台标签灰底，超出宽度的标签不画（改后的功能键仍能循环）。
 fn draw_tab_bar(
     f: &mut Frame,
     area: Rect,
@@ -1332,19 +1410,25 @@ pub fn settings_hit_rects(area: Rect) -> [Rect; 7] {
     ]
 }
 
-/// 快捷键面板的 10 个可点击行：8 个动作 + 恢复默认 + 返回设置。
-/// 必须与 draw_keybinds_overlay 的几何完全一致。
-pub fn keybinds_hit_rects(area: Rect) -> [Rect; 10] {
-    let p = centered(60, 15, area);
+/// 快捷键面板的可点击行：每个动作一行 + 恢复默认 + 返回设置。
+/// 必须与 draw_keybinds_overlay 的几何完全一致（行数是 Action::ALL 推出来的）。
+pub fn keybinds_hit_rects(area: Rect) -> [Rect; crate::keybinds::Action::ALL.len() + 2] {
+    use crate::keybinds::Action;
+    // 数组长度必须是常量表达式，所以这里写 Action::ALL.len()，运行时索引用 n
+    const N: usize = Action::ALL.len();
+    let n = N;
+    let p = centered(60, n as u16 + 6, area);
     let ix = p.x + 1;
     let iy = p.y + 1;
     let iw = p.width.saturating_sub(2);
-    let mut rects = [Rect::ZERO; 10];
-    for (idx, slot) in rects.iter_mut().enumerate().take(8) {
+    let mut rects = [Rect::ZERO; N + 2];
+    for (idx, slot) in rects.iter_mut().enumerate().take(n) {
         *slot = Rect { x: ix, y: iy + idx as u16, width: iw, height: 1 };
     }
-    rects[8] = Rect { x: ix, y: iy + 10, width: 14, height: 1 };
-    rects[9] = Rect { x: ix.saturating_add(iw).saturating_sub(14), y: iy + 10, width: 14, height: 1 };
+    // 行 n=提示、n+1=结果行，n+2 才是两个按钮
+    rects[n] = Rect { x: ix, y: iy + n as u16 + 2, width: 14, height: 1 };
+    rects[n + 1] =
+        Rect { x: ix.saturating_add(iw).saturating_sub(14), y: iy + n as u16 + 2, width: 14, height: 1 };
     rects
 }
 
@@ -1491,8 +1575,9 @@ fn draw_settings_overlay(f: &mut Frame, app: &App) {
 }
 
 fn draw_keybinds_overlay(f: &mut Frame, app: &App) {
+    let n = crate::keybinds::Action::ALL.len();
     let rects = keybinds_hit_rects(f.area());
-    let panel = centered(60, 15, f.area());
+    let panel = centered(60, n as u16 + 6, f.area());
     f.buffer_mut().set_style(panel, Style::default().bg(Color::Black));
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1535,7 +1620,7 @@ fn draw_keybinds_overlay(f: &mut Frame, app: &App) {
             " ↑↓ 选择 · Enter/点击 改键 · 只能绑 F2–F12 或 Ctrl/Alt 组合键",
             Style::default().fg(Color::DarkGray).bg(Color::Black),
         ))),
-        Rect { x: rects[0].x, y: rects[0].y + 8, width: rects[0].width, height: 1 },
+        Rect { x: rects[0].x, y: rects[0].y + n as u16, width: rects[0].width, height: 1 },
     );
     let msg = match &app.keybinds_msg {
         Some(text) => text.clone(),
@@ -1548,7 +1633,7 @@ fn draw_keybinds_overlay(f: &mut Frame, app: &App) {
                 .fg(if app.keybinds_msg.is_some() { Color::Green } else { Color::DarkGray })
                 .bg(Color::Black),
         ))),
-        Rect { x: rects[0].x, y: rects[0].y + 9, width: rects[0].width, height: 1 },
+        Rect { x: rects[0].x, y: rects[0].y + n as u16 + 1, width: rects[0].width, height: 1 },
     );
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -1556,9 +1641,9 @@ fn draw_keybinds_overlay(f: &mut Frame, app: &App) {
             Style::default()
                 .fg(Color::White)
                 .bg(Color::DarkGray)
-                .add_modifier(if app.keybinds_focus == 8 { Modifier::BOLD } else { Modifier::empty() }),
+                .add_modifier(if app.keybinds_focus == n { Modifier::BOLD } else { Modifier::empty() }),
         ))),
-        rects[8],
+        rects[n],
     );
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -1566,7 +1651,7 @@ fn draw_keybinds_overlay(f: &mut Frame, app: &App) {
             Style::default()
                 .fg(Color::Black)
                 .bg(Color::Cyan)
-                .add_modifier(if app.keybinds_focus == 9 { Modifier::BOLD } else { Modifier::empty() }),
+                .add_modifier(if app.keybinds_focus == n + 1 { Modifier::BOLD } else { Modifier::empty() }),
         ))),
         rects[9],
     );

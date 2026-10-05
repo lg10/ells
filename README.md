@@ -32,7 +32,7 @@ ells is an all-in-one terminal SSH client written in pure Rust. It embeds a real
 - 🔌 **Keepalive** — configurable SSH keepalive interval (15–300 s) survives NAT idle-timeout on cloud providers.
 - 🖱 **Mouse friendly** — drag-select to copy (OSC 52), wheel scrollback with preserved colors, click targets on every screen; the terminal tab title follows the current page (`ells-<alias>` while connected).
 - 🔑 **Host-key TOFU** — the first connection is confirmed and recorded in `~/.ells/known_hosts` (OpenSSH-compatible; existing `~/.ssh/known_hosts` entries are honoured too), and a later key change blocks the session with a warning. `-y` / `ELLS_YES=1` auto-accepts first-seen keys for scripting, while key *changes* are still refused.
-- 🪟 **Multi-session tabs** — one process, several servers: `F2` new tab, `F5`/`F6` or a mouse click to switch, `Ctrl-]` to close. Background tabs keep their own output, transfers and state.
+- 🪟 **Multi-session tabs** — one process, several servers: `F2` new tab, `F5`/`F6` or a mouse click to switch, `Ctrl-]` to close. Background tabs keep their own output, transfers and state. The host list shows which machines are already connected (`●`), and `Ctrl-G` drops you back to that list without touching the connection — Enter or a click on the tab returns.
 - 🔍 **Scrollback search** — `F3` searches the history buffer, `n`/`N` jump between hits.
 - 🛠 **Remote file operations** — `m` mkdir, `n` rename, `D` delete (confirmed twice) inside the browser, `Ctrl-C` cancels in-flight transfers, and a dropped connection can be re-established straight from the vault.
 - 📥 **`~/.ssh/config` import** — press `i` in the host list to pull in your existing OpenSSH hosts.
@@ -122,16 +122,16 @@ Config lives in ~/.ells/: vault.bin (credentials), settings.ini, known_hosts.
 
 | Screen   | Keys |
 |----------|------|
-| Host list | `↑↓/j k` select · `Enter` connect · `a` add · `e` edit · `d` delete (with confirm) · `s` settings · `i` import `~/.ssh/config` · `?`/`F1` help · `q`/`Ctrl-C` quit |
-| Tabs      | `F2` new tab · `F5` next · `F6` previous · click the tab bar to switch, `+` to create · `Ctrl-]` close current tab (back to the list when it is the only one; press twice while a transfer runs) |
-| Session   | any key → remote · `Ctrl-Q` embedded/passthrough · `Ctrl-S` SFTP browser · `Ctrl-L` redraw · `Ctrl-]` close tab · wheel = scrollback · drag = select & copy (OSC 52) · `F3` search scrollback (`/` works while scrolled, `n`/`N` step through hits) · `F1` help |
-| Browser   | `Enter` open/download · `u` upload file · `U` upload a whole directory · `d` download · `m` mkdir · `n` rename · `D` delete (recursive, confirmed) · `Ctrl-C` cancel all transfers · `r` refresh · `Backspace` up · `Esc` back |
+| Host list | `↑↓/j k` select · `Enter` connect (a host already connected just switches back to its tab) · `a` add · `e` edit · `d` delete (with confirm) · `s` settings · `i` import `~/.ssh/config` · `?`/`F1` help · `q`/`Ctrl-C` quit; rows are prefixed `●` connected / `○` dialing, and the tab bar on top clicks you back into a session |
+| Tabs      | `F2` new tab · `F5` next · `F6` previous · click the tab bar to switch, `+` to create · `Ctrl-]` close current tab (back to the list when it is the only one; press twice while a transfer runs) · `Ctrl-G` hop to the host list without dropping the connection, press again to return |
+| Session   | any key → remote · `Ctrl-Q` embedded/passthrough · `Ctrl-S` SFTP browser · `Ctrl-L` redraw · `Ctrl-]` close tab · `Ctrl-G` host list (stays connected) · wheel = scrollback · drag = select & copy (OSC 52) · `F3` search scrollback (`/` works while scrolled, `n`/`N` step through hits) · `F1` help |
+| Browser   | `Enter` open/download · `u` upload file · `U` upload a whole directory · `d` download · `m` mkdir · `n` rename · `D` delete (recursive, confirmed) · `Ctrl-C` cancel all transfers · `r` refresh · `Backspace` up · `Esc` back · the tab bar up top works here too |
 | Form      | `Tab/↑↓` move · `←→` switch auth method · `Ctrl-F` pick private key · `Ctrl-J` pick bastion host · `Enter` on those two fields opens the picker directly · save via the **Save** button or Enter when focused |
 | Dialogs   | `←→/Tab` switch option · `Enter` confirm · `Esc` cancel |
 
 `?` (list / browser) and `F1` (session) open the full in-app help page.
 
-The tab and session chords above (`F2`/`F5`/`F6`/`Ctrl-]`/`Ctrl-S`/`Ctrl-Q`/`Ctrl-L`/`F3`) are defaults
+The tab and session chords above (`F2`/`F5`/`F6`/`Ctrl-]`/`Ctrl-G`/`Ctrl-S`/`Ctrl-Q`/`Ctrl-L`/`F3`) are defaults
 only. Remap them from the host list via `s` → settings → 「快捷键设置」 (keybindings): focus a row, press
 Enter, then hit the new key. F2–F12 and Ctrl/Alt combinations are accepted — `F1` stays on the help page.
 A chord already taken by another action swaps the two, and every change is written to
