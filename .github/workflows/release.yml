@@ -60,6 +60,7 @@ jobs:
     needs: [build-linux, build-windows, build-macos]
     runs-on: ubuntu-22.04
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: dist
@@ -80,8 +81,41 @@ jobs:
           cd out
           sha256sum ells-linux-x86_64 ells-macos-universal ells-windows-x86_64.exe > SHA256SUMS.txt
           cat SHA256SUMS.txt
+      # Release 说明直接取自 CHANGELOG.md 对应版本小节：发版前把 [未发布] 改名成
+      # [x.y.z] 即可，避免手写说明和 CHANGELOG 两处对不上。小节缺失时退化成
+      # 只有一键安装的说明，不出空发布。
+      - name: Build release notes from CHANGELOG
+        run: |
+          set -eu
+          TAG="${GITHUB_REF_NAME}"
+          VER="${TAG#v}"
+          awk -v ver="$VER" '
+            { if (index($0, "## [" ver "]") == 1) insec = 1; else if (index($0, "## ") == 1) insec = 0 }
+            insec { print }
+          ' CHANGELOG.md > out/notes_body.md
+          {
+            printf '# ells %s\n\n' "$TAG"
+            printf '### 一键安装 / Install\n\n'
+            printf 'macOS / Linux：\n\n'
+            printf '```bash\nELLS_VERSION=%s curl -fsSL https://raw.githubusercontent.com/lg10/ells/main/install.sh | sh\n```\n\n' "$TAG"
+            printf 'Windows PowerShell：\n\n'
+            printf '```powershell\n$env:ELLS_VERSION="%s"; irm https://raw.githubusercontent.com/lg10/ells/main/install.ps1 | iex\n```\n\n' "$TAG"
+            printf '安装脚本会强制校验 `SHA256SUMS.txt`。产物：`ells-linux-x86_64` · `ells-macos-universal`（x86_64 + Apple Silicon 合一）· `ells-windows-x86_64.exe` · `SHA256SUMS.txt`\n\n'
+            printf -- '---\n\n'
+            if [ -s out/notes_body.md ]; then
+              cat out/notes_body.md
+            else
+              printf '（CHANGELOG.md 里没找到 %s 小节，完整变更请看仓库 main 分支的 CHANGELOG.md。）\n' "$VER"
+              echo "::warning::CHANGELOG 缺少 [$VER] 小节，发布说明已退化"
+            fi
+            printf '\n完整历史：[CHANGELOG.md](https://github.com/lg10/ells/blob/main/CHANGELOG.md) · 安全策略：[SECURITY.md](https://github.com/lg10/ells/blob/main/SECURITY.md) · 安装选项与卸载：[README](https://github.com/lg10/ells)\n'
+          } > out/RELEASE_NOTES.md
+          cat out/RELEASE_NOTES.md
       - uses: softprops/action-gh-release@v2
         with:
+          name: ells ${{ github.ref_name }}
+          body_path: out/RELEASE_NOTES.md
+          fail_on_unmatched_files: true
           files: |
             out/ells-linux-x86_64
             out/ells-macos-universal

@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 报告安全漏洞 / Report a security vulnerability
+    url: https://github.com/lg10/ells/security/advisories/new
+    about: 请走私密安全通告，不要开公开 issue；贴日志时不要带主密码、私钥或保险库文件。
+  - name: 项目主页 / Homepage
+    url: https://ells.cn
+    about: 安装脚本、下载与文档。

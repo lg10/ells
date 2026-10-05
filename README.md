@@ -8,9 +8,9 @@
 
 `Rust` `TUI` `SSH` `SFTP` `ZMODEM`
 
-Homepage: [https://ells.cn](https://ells.cn) · Repo: [GitHub](https://github.com/lg10/ells)
+Homepage: [https://ells.cn](https://ells.cn) · Repo: [GitHub](https://github.com/lg10/ells) · [中文 README](README_zh.md) · [CHANGELOG](CHANGELOG.md) · [SECURITY](SECURITY.md)
 
-![CI](https://github.com/lg10/ells/actions/workflows/ci.yml/badge.svg) ![license](https://img.shields.io/badge/license-MIT-green) ![rust](https://img.shields.io/badge/rust-edition%202024-orange) ![platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-blue)
+![CI](https://github.com/lg10/ells/actions/workflows/ci.yml/badge.svg) ![license](https://img.shields.io/badge/license-MIT-green) ![rust](https://img.shields.io/badge/rust-1.85%2B-orange) ![platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-blue) [![release](https://img.shields.io/github/v/release/lg10/ells?label=release&color=blue)](https://github.com/lg10/ells/releases) ![downloads](https://img.shields.io/github/downloads/lg10/ells/total?label=downloads) [![changelog](https://img.shields.io/badge/changelog-keep%20a%20changelog-informational)](CHANGELOG.md) [![security](https://img.shields.io/badge/security-policy-red)](SECURITY.md)
 
 </div>
 
@@ -31,6 +31,11 @@ ells is an all-in-one terminal SSH client written in pure Rust. It embeds a real
 - 🎨 **Output highlighting** — `docker ps`, `kubectl`, log levels (ERROR/WARN/INFO/...), HTTP methods, IPv4 addresses and percentages are colorized on the fly — without overriding programs' own ANSI colors.
 - 🔌 **Keepalive** — configurable SSH keepalive interval (15–300 s) survives NAT idle-timeout on cloud providers.
 - 🖱 **Mouse friendly** — drag-select to copy (OSC 52), wheel scrollback with preserved colors, click targets on every screen; the terminal tab title follows the current page (`ells-<alias>` while connected).
+- 🔑 **Host-key TOFU** — the first connection is confirmed and recorded in `~/.ells/known_hosts` (OpenSSH-compatible; existing `~/.ssh/known_hosts` entries are honoured too), and a later key change blocks the session with a warning. `-y` / `ELLS_YES=1` auto-accepts first-seen keys for scripting, while key *changes* are still refused.
+- 🪟 **Multi-session tabs** — one process, several servers: `F2` new tab, `F5`/`F6` or a mouse click to switch, `Ctrl-]` to close. Background tabs keep their own output, transfers and state.
+- 🔍 **Scrollback search** — `F3` searches the history buffer, `n`/`N` jump between hits.
+- 🛠 **Remote file operations** — `m` mkdir, `n` rename, `D` delete (confirmed twice) inside the browser, `Ctrl-C` cancels in-flight transfers, and a dropped connection can be re-established straight from the vault.
+- 📥 **`~/.ssh/config` import** — press `i` in the host list to pull in your existing OpenSSH hosts.
 - 🌏 **Chinese-first UI**, native OS file dialogs, zero telemetry.
 
 ## Install
@@ -47,7 +52,40 @@ curl -fsSL https://raw.githubusercontent.com/lg10/ells/main/install.sh | sh
 irm https://raw.githubusercontent.com/lg10/ells/main/install.ps1 | iex
 ```
 
-Reopen your terminal afterwards, and both `ells` and the short command `s` are ready (the installer sets up PATH; on PowerShell it also registers an `s` function in your profile — cmd needs nothing extra).
+Reopen your terminal afterwards, and both `ells` and the short command `s` are ready (the installer sets up PATH; on PowerShell it also registers an `s` function in your profile — cmd needs nothing extra). Both installers verify `SHA256SUMS.txt` and refuse to run on a mismatch.
+
+### Pin a version / custom dir / mirror
+
+macOS / Linux:
+
+```bash
+ELLS_VERSION=v0.1.3 curl -fsSL https://raw.githubusercontent.com/lg10/ells/main/install.sh | sh
+ELLS_INSTALL_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/lg10/ells/main/install.sh | sh
+```
+
+Windows PowerShell:
+
+```powershell
+$env:ELLS_VERSION="v0.1.3"; irm https://raw.githubusercontent.com/lg10/ells/main/install.ps1 | iex
+$env:ELLS_INSTALL_DIR="$env:USERPROFILE\bin"; irm https://raw.githubusercontent.com/lg10/ells/main/install.ps1 | iex
+```
+
+`ELLS_API_URL` / `ELLS_DOWNLOAD_URL` point the release lookup and download at a mirror or an intranet. If installation misbehaves, run `sh diagnose.sh` — it prints the shell, curl, architecture and proxy decisions the installer is about to make.
+
+### Uninstall
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/lg10/ells/main/uninstall.sh | sh
+# also delete ~/.ells (irreversible):
+curl -fsSL https://raw.githubusercontent.com/lg10/ells/main/uninstall.sh | sh -s -- --purge
+```
+
+```powershell
+irm https://raw.githubusercontent.com/lg10/ells/main/uninstall.ps1 | iex
+$env:ELLS_PURGE="1"; irm https://raw.githubusercontent.com/lg10/ells/main/uninstall.ps1 | iex
+```
+
+Uninstalling removes the binaries, the PATH entry and the PowerShell `s` function, but **keeps `~/.ells`** (vault, `known_hosts`, settings) — removing a binary must not destroy credentials. ells writes no registry keys and installs no services, so removing the `ells` / `s` binaries by hand is just as clean. Use `--purge` / `ELLS_PURGE=1` only once you are sure: a master password can never be recovered.
 
 <details>
 <summary>Build from source</summary>
@@ -65,21 +103,33 @@ First run asks you to create a master password and a vault. Add a host with `a`,
 ### Usage
 
 ```
-ells [ALIAS] [--dev]
+ells [ALIAS] [--dev] [-y]
 
-  ALIAS   connect to this host alias right after unlock
-  --dev   load plaintext hosts from ~/.ells/hosts.dev.toml (development only,
-          nothing is persisted)
+  ALIAS      connect to this host alias right after unlock
+             (the installed short command `s <alias>` does the same)
+  --dev      load plaintext hosts from ~/.ells/hosts.dev.toml (development only,
+             nothing is persisted)
+  -y, --yes  auto-accept and record a first-seen host key; key *changes* are
+             still refused
+
+Environment: ELLS_LOG=1 logs to stderr; ELLS_ZMODEM_LOG=1 additionally writes
+sz/rz interception diagnostics to ~/.ells/zmodem.log; ELLS_YES=1 == -y.
+
+Config lives in ~/.ells/: vault.bin (credentials), settings.ini, known_hosts.
 ```
 
 ### Key bindings (essentials)
 
 | Screen   | Keys |
 |----------|------|
-| Host list | `↑↓/j k` select · `Enter` connect · `a` add · `e` edit · `d` delete (with confirm) · `s` settings · `q` quit |
-| Session   | any key → remote · `Ctrl-Q` embedded/passthrough · `Ctrl-S` SFTP browser · `Ctrl-L` redraw · `Ctrl-]` detach back to list · wheel = scrollback · drag = select & copy |
-| Browser   | `Enter` open/download · `u` upload · `d` download · `Backspace` up · `r` refresh · `Esc` back |
-| Form      | `Tab/↑↓` move · `Ctrl-F` pick private key · `Ctrl-J` pick bastion host · save only via the **Save** button (Enter or click) |
+| Host list | `↑↓/j k` select · `Enter` connect · `a` add · `e` edit · `d` delete (with confirm) · `s` settings · `i` import `~/.ssh/config` · `?`/`F1` help · `q`/`Ctrl-C` quit |
+| Tabs      | `F2` new tab · `F5` next · `F6` previous · click the tab bar to switch, `+` to create · `Ctrl-]` close current tab (back to the list when it is the only one; press twice while a transfer runs) |
+| Session   | any key → remote · `Ctrl-Q` embedded/passthrough · `Ctrl-S` SFTP browser · `Ctrl-L` redraw · `Ctrl-]` close tab · wheel = scrollback · drag = select & copy (OSC 52) · `F3` search scrollback (`/` works while scrolled, `n`/`N` step through hits) · `F1` help |
+| Browser   | `Enter` open/download · `u` upload file · `U` upload a whole directory · `d` download · `m` mkdir · `n` rename · `D` delete (recursive, confirmed) · `Ctrl-C` cancel all transfers · `r` refresh · `Backspace` up · `Esc` back |
+| Form      | `Tab/↑↓` move · `←→` switch auth method · `Ctrl-F` pick private key · `Ctrl-J` pick bastion host · `Enter` on those two fields opens the picker directly · save via the **Save** button or Enter when focused |
+| Dialogs   | `←→/Tab` switch option · `Enter` confirm · `Esc` cancel |
+
+`?` (list / browser) and `F1` (session) open the full in-app help page.
 
 ## Building from source
 
@@ -99,10 +149,10 @@ Local integration testing uses `tests/fake_sshd.py`, a paramiko-based throwaway 
 | Platform | Status | Notes |
 |----------|--------|-------|
 | Windows 10/11 (x86_64) | ✅ primary dev target | Use **Windows Terminal**: legacy conhost has poor mouse / OSC 52 support |
-| macOS (x86_64 / Apple Silicon) | ✅ supported in code | Build on the Mac. Prefer **iTerm2** — Terminal.app ignores OSC 52 clipboard |
-| Linux (x86_64 / aarch64) | ✅ supported in code | Native file dialogs need a desktop session (X11/Wayland); headless TTY can't open pickers |
+| macOS (x86_64 / Apple Silicon) | ✅ prebuilt universal binary | The one-line installer picks the right build. Prefer **iTerm2** — Terminal.app ignores OSC 52 clipboard |
+| Linux (x86_64 / aarch64) | ✅ prebuilt x86_64 binary | Native file dialogs need a desktop session (X11/Wayland); headless TTY can't open pickers |
 
-Cross-target builds (ARM / Mac) are on the roadmap; nothing in the codebase is platform-specific by design (`ring` crypto backend, pure-Rust terminal stack).
+Nothing in the codebase is platform-specific by design (`ring` crypto backend, pure-Rust terminal stack), so CI cross-builds all four targets — Linux x86_64, Windows x86_64, and macOS both aarch64 and x86_64, lipo'd into one universal binary.
 
 ## Project layout
 
@@ -113,14 +163,32 @@ crates/
   ells-transfer    SFTP upload/download engine with throttled progress
   ells             the TUI application (ratatui + crossterm): UI, zmodem
                    interception, settings, keybindings
+install.sh / install.ps1      one-line install: latest release, SHA256 verify,
+                              PATH setup, `s` registration
+uninstall.sh / uninstall.ps1  removal; keeps ~/.ells unless --purge / ELLS_PURGE=1
+diagnose.sh        one-shot install-environment report (shell, curl, arch, proxy)
+scripts/smoke.*    build the debug binary, seed hosts.dev.toml, launch the UI
+tools/             repo self-checks (e.g. the bash-3.2 expansion-adjacency lint)
 tests/fake_sshd.py headless SSH+SFTP+ZMODEM test server
+.github/workflows/ ci.yml (3-platform build + test + install smoke),
+                   release.yml (tag → cross-platform artifacts + notes from CHANGELOG)
 ```
 
 ## Roadmap
 
-- ssh-agent authentication
-- TOFU host-key verification prompts
-- prebuilt binaries for Windows / macOS (x86_64 + arm64) / Linux
+- ssh-agent authentication (password and private-key auth, incl. key passphrases,
+  already work)
+
+Host-key TOFU, prebuilt packages for all three platforms and multi-session tabs
+have landed; per-release details live in [CHANGELOG.md](CHANGELOG.md).
+
+## Contributing & security
+
+- Bugs and feature requests use the repo's [issue templates](.github/ISSUE_TEMPLATE) —
+  please update to the latest release first, and scrub hostnames, paths and usernames
+  from any log you attach.
+- **Security vulnerabilities go through a private report**, never a public issue:
+  see [SECURITY.md](SECURITY.md).
 
 ## License
 
