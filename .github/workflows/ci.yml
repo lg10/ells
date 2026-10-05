@@ -53,15 +53,15 @@ jobs:
           path: target/${{ matrix.target }}/debug/ells${{ matrix.os == 'windows-latest' && '.exe' || '' }}
           if-no-files-found: error
 
-  # 用 macOS 自带 /bin/sh（GNU bash 3.2）在 LC_ALL=C 下真跑一遍安装：
+  # 用 macOS 自带 /bin/sh（GNU bash 3.2）在 LC_ALL=C 下真跑一遍安装 + 卸载：
   # C locale 会复现"展开后紧跟多字节字符被并入变量名"这类老 shell 崩溃
   install-smoke:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
       - name: Lint shell expansions
-        run: node tools/check-shell-expansions.js install.sh diagnose.sh
-      - name: Fake release server + install via /bin/sh (C locale)
+        run: node tools/check-shell-expansions.js install.sh uninstall.sh diagnose.sh
+      - name: Fake release server + install/uninstall via /bin/sh (C locale)
         run: |
           set -eu
           mkdir -p fake/v0.0.0-test
@@ -69,11 +69,33 @@ jobs:
           (cd fake/v0.0.0-test && echo "$(shasum -a 256 < ells-macos-universal)  ells-macos-universal" > SHA256SUMS.txt)
           (cd fake && python3 -m http.server 18098 >/dev/null 2>&1 &)
           sleep 1
-          mkdir -p "$RUNNER_TEMP/fakehome"
+          FAKE_HOME="$RUNNER_TEMP/fakehome"
+          FAKE_BIN="$FAKE_HOME/.local/bin"
+          PS_PROFILE="$FAKE_HOME/.config/powershell/Microsoft.PowerShell_profile.ps1"
+          PATH_LINE="export PATH=\"$FAKE_BIN:\$PATH\""
+          # 保险库替身：卸载默认必须把它留在原地
+          mkdir -p "$FAKE_HOME/.ells"
+          printf 'fake-vault' > "$FAKE_HOME/.ells/vault.bin"
           LC_ALL=C LANG=C \
           ELLS_VERSION=v0.0.0-test ELLS_DOWNLOAD_URL=http://127.0.0.1:18098 \
-            HOME="$RUNNER_TEMP/fakehome" ELLS_INSTALL_DIR="$RUNNER_TEMP/fakehome/.local/bin" \
+            HOME="$FAKE_HOME" ELLS_INSTALL_DIR="$FAKE_BIN" \
             /bin/sh install.sh
-          test -x "$RUNNER_TEMP/fakehome/.local/bin/ells"
-          test -L "$RUNNER_TEMP/fakehome/.local/bin/s"
+          test -x "$FAKE_BIN/ells"
+          test -L "$FAKE_BIN/s"
+          grep -qF '# ells: short command s' "$PS_PROFILE"
           echo "install.sh smoke OK"
+          LC_ALL=C LANG=C HOME="$FAKE_HOME" ELLS_INSTALL_DIR="$FAKE_BIN" /bin/sh uninstall.sh
+          test ! -e "$FAKE_BIN/ells"
+          test ! -L "$FAKE_BIN/s"
+          # set -e 下 "! cmd" 不会让步骤失败，断言一律写成显式 if
+          if grep -qF "$PATH_LINE" "$FAKE_HOME/.zshrc" "$FAKE_HOME/.bashrc" "$FAKE_HOME/.profile" 2>/dev/null; then
+            echo "PATH 配置没清干净" >&2; exit 1
+          fi
+          if grep -qF '# ells: short command s' "$PS_PROFILE"; then
+            echo "PowerShell 里的 s 函数没清干净" >&2; exit 1
+          fi
+          test -f "$FAKE_HOME/.ells/vault.bin"
+          echo "uninstall.sh smoke OK (vault kept)"
+          LC_ALL=C LANG=C HOME="$FAKE_HOME" ELLS_INSTALL_DIR="$FAKE_BIN" /bin/sh uninstall.sh --purge
+          test ! -e "$FAKE_HOME/.ells"
+          echo "uninstall.sh --purge smoke OK"

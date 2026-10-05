@@ -1,0 +1,4 @@
+# 安装/卸载脚本是给 macOS 自带的 /bin/sh（GNU bash 3.2）执行的，一旦检出成
+# CRLF，`set -eu` 会读到带 \r 的行而直接崩掉。即使提交者本机 core.autocrlf=true，
+# 也必须保持 LF。
+*.sh text eol=lf
