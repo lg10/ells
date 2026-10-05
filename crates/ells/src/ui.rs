@@ -79,7 +79,10 @@ pub fn list_settings_rect(area: Rect) -> Rect {
 }
 
 fn draw_unlock(f: &mut Frame, app: &mut App) {
-    let area = centered(50, 9, f.area());
+    let creating = app.unlock.stage != UnlockStage::Open;
+    // 首次设主密码要多几行"不可找回"警示：框子跟着长高、边框换黄色，
+    // 让用户一眼看出这是"正在定规矩"而不是"输入密码"。
+    let area = centered(if creating { 56 } else { 50 }, if creating { 11 } else { 9 }, f.area());
     f.buffer_mut().set_style(area, Style::default().bg(Color::Black));
     let u = &app.unlock;
     let stage_name = match u.stage {
@@ -88,18 +91,45 @@ fn draw_unlock(f: &mut Frame, app: &mut App) {
         UnlockStage::CreateConfirm => "确认主密码",
     };
     let title = format!(" ells · {stage_name} · {} ", version_tag());
+    let accent = if creating { Color::Yellow } else { Color::White };
     let block = Block::default()
         .borders(Borders::ALL)
         .title(title)
+        .border_style(Style::default().fg(accent))
+        .title_style(Style::default().fg(accent).add_modifier(Modifier::BOLD))
         .style(Style::default().fg(Color::White));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
     let masked: String = u.input.chars().map(|_| '•').collect();
+    // 两种阶段共用同一套 5 行切分：解锁页把第一行留空，省掉两套下标
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(2), Constraint::Length(1), Constraint::Length(1)])
+        .constraints([
+            Constraint::Length(if creating { 3 } else { 0 }),
+            Constraint::Length(2),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
         .split(inner);
+    if creating {
+        let warn = Paragraph::new(vec![
+            Line::from(Span::styled(
+                " ! 主密码忘记后无法找回，ells 不做任何找回。",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                "   只能重置保险库重来：主机与凭据都要重填。",
+                Style::default().fg(Color::Red),
+            )),
+            Line::from(Span::styled(
+                "   主密码只加密本机保险库，不会发往任何服务器。",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ]);
+        f.render_widget(warn, chunks[0]);
+    }
     let first_line = if u.busy {
         Span::styled(
             "正在解密/创建保险库，请稍候（约 1 秒）…",
@@ -108,22 +138,26 @@ fn draw_unlock(f: &mut Frame, app: &mut App) {
     } else {
         Span::styled(format!("主密码：{masked}"), Style::default().fg(Color::Cyan))
     };
-    f.render_widget(Paragraph::new(Line::from(first_line)), chunks[0]);
+    f.render_widget(Paragraph::new(Line::from(first_line)), chunks[1]);
     if let Some(err) = &u.error {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 err.clone(),
                 Style::default().fg(Color::Red),
             ))),
-            chunks[1],
+            chunks[2],
         );
     }
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "Enter 提交 · Esc 退出",
+            if creating {
+                "Enter 下一步 · Esc 退出 · 请务必记牢"
+            } else {
+                "Enter 提交 · Esc 退出"
+            },
             Style::default().add_modifier(Modifier::DIM),
         ))),
-        chunks[2],
+        chunks[3],
     );
 }
 
