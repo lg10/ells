@@ -876,17 +876,18 @@ impl App {
         }
         // Some terminals deliver Ctrl+<letter> as a bare ASCII control char
         // (\x03 for Ctrl-C) without the CONTROL modifier; a bare control
-        // char must never reach text inputs.
+        // char must never reach text inputs. 0x1C–0x1F 同理，它们是 Ctrl-
+        // \ ] ^ _ 的字节值（mac/Linux 终端经 crossterm 会变成 Ctrl-4…7）。
         let key = match key.code {
             KeyCode::Char(c)
                 if !key.modifiers.contains(KeyModifiers::CONTROL) && c.is_control() =>
             {
-                match char::from_u32(c as u32 + 0x60) {
-                    Some(letter) if c as u32 >= 0x01 && (c as u32) <= 0x1a => {
-                        KeyEvent::new(KeyCode::Char(letter), KeyModifiers::CONTROL)
-                    }
+                let code = match c as u32 {
+                    0x01..=0x1a => KeyCode::Char((c as u32 + 0x60) as u8 as char),
+                    0x1c..=0x1f => KeyCode::Char((c as u32 + 0x40) as u8 as char),
                     _ => return,
-                }
+                };
+                KeyEvent::new(code, KeyModifiers::CONTROL)
             }
             _ => key,
         };
@@ -1828,7 +1829,7 @@ impl App {
     fn apply_binding(&mut self, action: Action, key: &KeyEvent) {
         self.keybinds_recording = None;
         let Some(chord) = Chord::from_event(key) else {
-            self.keybinds_msg = Some("请按功能键（F2–F12）或 Ctrl/Alt 组合键".to_string());
+            self.keybinds_msg = Some("请按功能键（F2–F9）或 Ctrl/Alt 组合键".to_string());
             return;
         };
         if let Some(reason) = chord.rejection() {

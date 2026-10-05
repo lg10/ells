@@ -449,7 +449,10 @@ fn draw_help(f: &mut Frame, area: Rect, binds: &crate::keybinds::KeyBinds) {
         ("主机列表", std::borrow::Cow::Owned(list_body)),
         ("多标签会话", std::borrow::Cow::Owned(tab_body)),
         ("会话终端", std::borrow::Cow::Owned(term_body)),
-        ("改键", std::borrow::Cow::Borrowed("会话与标签页按键可在「设置 → 快捷键设置」里自定义（列表页按 s、会话页按顶部【设置】）：Enter 选中某项后按下新按键即可绑定，只接受 F2–F12 或 Ctrl/Alt 组合键（F1 留给帮助页），改完即时写入 ~/.ells/settings.ini；撞到已占用的键会自动互换，【恢复默认】一键还原。")),
+        ("改键", std::borrow::Cow::Owned(format!(
+            "会话与标签页按键可在「设置 → 快捷键设置」里自定义（列表页按 s、会话页按顶部【设置】）：Enter 选中某项后按下新按键即可绑定，只接受 F2–F9 或带 Ctrl/Alt 的组合键（F1 留给帮助页，F10–F12 常被终端或系统吃掉），改完即时写入 ~/.ells/settings.ini；撞到已占用的键会自动互换，【恢复默认】一键还原。跨平台：mac/Linux 终端把 Ctrl-] 这类组合发成与 Ctrl-5 同一个字节，已自动归一，默认键在三个平台都能触发；本机注意点——{}",
+            crate::keybinds::platform_note(),
+        ))),
         ("文件浏览器", std::borrow::Cow::Borrowed("↑↓/滚轮 选择 · Enter 进入目录或下载 · u 上传文件 · U 上传整个目录 · d 下载 · m 新建目录 · n 重命名 · D 删除（递归，先确认）· Ctrl-C 取消全部在途传输 · r 刷新 · Backspace 上级 · Esc 返回终端")),
         ("主机表单", std::borrow::Cow::Borrowed("Tab/↓ 下一个字段 · ↑ 上一个 · ←→ 切换认证方式 · Ctrl-F 选私钥 · Ctrl-J 选跳板机 · Ctrl-C 清空当前字段 · Enter 在\"私钥路径/跳板机\"上直接打开选择器，保存要点【保 存】或聚焦后回车")),
         ("解锁保险库", std::borrow::Cow::Borrowed("输入主密码后回车；首次使用会要求输入两遍。主密码不可找回，忘记只能删除 ~/.ells/vault.bin 重来。")),
@@ -1417,7 +1420,7 @@ pub fn keybinds_hit_rects(area: Rect) -> [Rect; crate::keybinds::Action::ALL.len
     // 数组长度必须是常量表达式，所以这里写 Action::ALL.len()，运行时索引用 n
     const N: usize = Action::ALL.len();
     let n = N;
-    let p = centered(60, n as u16 + 6, area);
+    let p = centered(60, n as u16 + 7, area);
     let ix = p.x + 1;
     let iy = p.y + 1;
     let iw = p.width.saturating_sub(2);
@@ -1425,10 +1428,10 @@ pub fn keybinds_hit_rects(area: Rect) -> [Rect; crate::keybinds::Action::ALL.len
     for (idx, slot) in rects.iter_mut().enumerate().take(n) {
         *slot = Rect { x: ix, y: iy + idx as u16, width: iw, height: 1 };
     }
-    // 行 n=提示、n+1=结果行，n+2 才是两个按钮
-    rects[n] = Rect { x: ix, y: iy + n as u16 + 2, width: 14, height: 1 };
+    // 行 n=操作提示、n+1=本机提示、n+2=结果行，n+3 才是两个按钮
+    rects[n] = Rect { x: ix, y: iy + n as u16 + 3, width: 14, height: 1 };
     rects[n + 1] =
-        Rect { x: ix.saturating_add(iw).saturating_sub(14), y: iy + n as u16 + 2, width: 14, height: 1 };
+        Rect { x: ix.saturating_add(iw).saturating_sub(14), y: iy + n as u16 + 3, width: 14, height: 1 };
     rects
 }
 
@@ -1577,7 +1580,7 @@ fn draw_settings_overlay(f: &mut Frame, app: &App) {
 fn draw_keybinds_overlay(f: &mut Frame, app: &App) {
     let n = crate::keybinds::Action::ALL.len();
     let rects = keybinds_hit_rects(f.area());
-    let panel = centered(60, n as u16 + 6, f.area());
+    let panel = centered(60, n as u16 + 7, f.area());
     f.buffer_mut().set_style(panel, Style::default().bg(Color::Black));
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1614,13 +1617,20 @@ fn draw_keybinds_overlay(f: &mut Frame, app: &App) {
             rects[idx],
         );
     }
-    // 提示行 + 一次性结果行
+    // 操作提示 + 本机注意点 + 一次性结果行
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            " ↑↓ 选择 · Enter/点击 改键 · 只能绑 F2–F12 或 Ctrl/Alt 组合键",
+            " ↑↓ 选择 · Enter/点击 改键 · 只能绑 F2–F9 或 Ctrl/Alt 组合键",
             Style::default().fg(Color::DarkGray).bg(Color::Black),
         ))),
         Rect { x: rects[0].x, y: rects[0].y + n as u16, width: rects[0].width, height: 1 },
+    );
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!(" {}", clip_display(crate::keybinds::platform_note(), rects[0].width as usize - 2)),
+            Style::default().fg(Color::Yellow).bg(Color::Black),
+        ))),
+        Rect { x: rects[0].x, y: rects[0].y + n as u16 + 1, width: rects[0].width, height: 1 },
     );
     let msg = match &app.keybinds_msg {
         Some(text) => text.clone(),
@@ -1633,7 +1643,7 @@ fn draw_keybinds_overlay(f: &mut Frame, app: &App) {
                 .fg(if app.keybinds_msg.is_some() { Color::Green } else { Color::DarkGray })
                 .bg(Color::Black),
         ))),
-        Rect { x: rects[0].x, y: rects[0].y + n as u16 + 1, width: rects[0].width, height: 1 },
+        Rect { x: rects[0].x, y: rects[0].y + n as u16 + 2, width: rects[0].width, height: 1 },
     );
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -1653,7 +1663,7 @@ fn draw_keybinds_overlay(f: &mut Frame, app: &App) {
                 .bg(Color::Cyan)
                 .add_modifier(if app.keybinds_focus == n + 1 { Modifier::BOLD } else { Modifier::empty() }),
         ))),
-        rects[9],
+        rects[n + 1],
     );
 }
 

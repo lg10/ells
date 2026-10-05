@@ -133,9 +133,15 @@ Config lives in ~/.ells/: vault.bin (credentials), settings.ini, known_hosts.
 
 The tab and session chords above (`F2`/`F5`/`F6`/`Ctrl-]`/`Ctrl-G`/`Ctrl-S`/`Ctrl-Q`/`Ctrl-L`/`F3`) are defaults
 only. Remap them from the host list via `s` → settings → 「快捷键设置」 (keybindings): focus a row, press
-Enter, then hit the new key. F2–F12 and Ctrl/Alt combinations are accepted — `F1` stays on the help page.
+Enter, then hit the new key. F2–F9 and Ctrl/Alt combinations are accepted — `F1` stays on the help page.
 A chord already taken by another action swaps the two, and every change is written to
 `~/.ells/settings.ini` right away.
+
+Chords are normalized to the same byte on all three platforms: terminals on macOS and Linux send `Ctrl-]` as
+the control byte crossterm reports as `Ctrl-5`, so ells treats the two as one binding and the defaults now fire
+on Windows, macOS and Linux alike. `Ctrl+digits`, `Ctrl+Space` and `Ctrl-/` are rejected because they collide
+with other bytes or with Windows Terminal's own shortcuts, and the panel footer prints the caveats for the
+platform you are running on.
 
 ## Building from source
 

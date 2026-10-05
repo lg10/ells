@@ -22,8 +22,16 @@ CI 的 release 作业会按 tag 从本文件截取对应小节，作为 GitHub R
   `Ctrl-]` 关闭标签、`Ctrl-G` 回主机列表、`Ctrl-S` 文件浏览器、`Ctrl-Q` 直通模式、
   `Ctrl-L` 重绘、`F3` 搜索这 9 项都可以改成自己的组合键。进入后选中一项按 Enter 开始录制，
   按新键即时生效并写入 `~/.ells/settings.ini`；撞上已占用的键时两个动作自动互换，
-  也可一键「恢复默认」。只接受 F2–F12 或带 Ctrl/Alt 的组合（F1 留给帮助页），避免把普通输入吞掉；
+  也可一键「恢复默认」。可绑范围收窄为 F2–F9 或带 Ctrl/Alt 的组合（F1 留给帮助页，
+  F10–F12 常被终端菜单/全屏/媒体键吃掉），避免把普通输入吞掉；
   终端里同码的 `Ctrl-H`/`Ctrl-I`/`Ctrl-M`/`Ctrl-[`/`Ctrl-C` 会被明确拒绝并说明原因。
+- **组合键跨平台归一**：mac/Linux 终端把 `Ctrl-]` 这类组合发成裸字节 `0x1C–0x1F`，
+  crossterm 解出来是 `Ctrl-5`，所以在 mac/Linux 上默认 `Ctrl-]` 曾经根本触发不了。
+  现在在输入入口按字节归一（`Ctrl-5` ⇄ `Ctrl-]`、`Ctrl-4` ⇄ `Ctrl-\` 等），录制、保存、
+  派发用同一种写法，默认键在 Windows/macOS/Linux 上都能命中；`Ctrl+数字`/`Ctrl+空格`/`Ctrl-/`
+  因为与别的组合同码或被 Windows Terminal 占用，改为拒绝并说明。快捷键面板与帮助页会按
+  当前平台显示对应的注意点（Windows Terminal 的 `Ctrl+1–8`/`F11`、mac 的功能键需按 `fn`
+  或把 Option 设为 Meta、Linux 的 `F10` 菜单/`F11` 全屏）。
 
 ### 修复
 - 发布流水线：`release.yml` 里重复的 `fail_on_unmatched_files` 键让整个 workflow 被

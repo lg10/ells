@@ -1,8 +1,12 @@
 //! 可自定义的 ells 界面按键，存进 `~/.ells/settings.ini` 的 `key_*=…` 条目。
 //!
-//! 只收录"不会与远端输入冲突"的两类键：F2–F12 功能键（F1 是帮助键），以及带 Ctrl/Alt
-//! 的组合键。裸字符必须留给远端 shell，无修饰的结构性键（Esc/Tab/Enter/Backspace/方向键）
-//! 也是界面自身的输入手段，所以都不允许绑定。
+//! 只收录"三平台都能可靠送达"的两类键：F2–F9 功能键（F1 是帮助键，F10–F12 常被
+//! 终端或系统吃掉），以及带 Ctrl/Alt 的组合键。裸字符必须留给远端 shell，无修饰的
+//! 结构性键（Esc/Tab/Enter/Backspace/方向键）也是界面自身的输入手段，所以都不允许绑定。
+//!
+//! 平台差异在 `Chord::from_event` 里归一：mac/Linux 终端把 Ctrl-] 这类组合发成裸字节
+//! 0x1C–0x1F，crossterm 解出来是 Ctrl-4…Ctrl-7，而 Windows 直接给 Ctrl-]。两者是同一个
+//! 字节，无法区分，统一按 punct 写法记，绑定与匹配全平台一致。
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -42,11 +46,26 @@ impl Chord {
 
     /// 录制态：把一次按键事件转成候选绑定；结构性按键（Esc/Enter/Tab/方向键…）不可绑定。
     pub fn from_event(key: &KeyEvent) -> Option<Self> {
-        Self::from_keycode(
-            key.code,
-            key.modifiers.contains(KeyModifiers::CONTROL),
-            key.modifiers.contains(KeyModifiers::ALT),
-        )
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let code = Self::shared_byte(key.code, ctrl, alt);
+        Self::from_keycode(code, ctrl, alt)
+    }
+
+    /// Ctrl+4…7 与 Ctrl-`\ / ] / ^ / _` 是同一个字节（0x1C–0x1F）：mac/Linux 终端只发来数字那一套，
+    /// Windows 发来 punct 那一套。物理上无法区分，就统一记成 punct，绑定与匹配三平台一致。
+    /// 带 Alt（ESC+数字）是另一种序列，不做归一。
+    fn shared_byte(code: KeyCode, ctrl: bool, alt: bool) -> KeyCode {
+        if !ctrl || alt {
+            return code;
+        }
+        match code {
+            KeyCode::Char('4') => KeyCode::Char('\\'),
+            KeyCode::Char('5') => KeyCode::Char(']'),
+            KeyCode::Char('6') => KeyCode::Char('^'),
+            KeyCode::Char('7') => KeyCode::Char('_'),
+            other => other,
+        }
     }
 
     /// 从 settings.ini 的取值解析，非法或不可绑定一律 None。
@@ -82,7 +101,7 @@ impl Chord {
             }
             KeyCode::Char(c)
         };
-        let chord = Self::from_keycode(code, ctrl, alt)?;
+        let chord = Self::from_keycode(Self::shared_byte(code, ctrl, alt), ctrl, alt)?;
         chord.rejection().is_none().then_some(chord)
     }
 
@@ -102,14 +121,18 @@ impl Chord {
         out
     }
 
-    /// 不可绑定时给出中文原因。
+    /// 不可绑定时给出中文原因。判据只有一条：这个组合在 Windows / macOS / Linux 的
+    /// 主流终端里都能可靠送达，并且不与界面自身的输入手段打架。
     pub fn rejection(&self) -> Option<&'static str> {
         match self.key {
             ChordKey::Function(n) => match n {
                 // 会话页的帮助只有 F1（`?` 要留给远端），占用后就再也打不开帮助页
                 1 => Some("F1 是帮助键，占用后会无法查看键位说明"),
-                2..=12 => None,
-                _ => Some("功能键只支持 F2–F12"),
+                2..=9 => None,
+                // 这三枚在别的软件里从来不属于程序本身：Linux 终端 F10 开菜单、F11 全屏，
+                // macOS F11/F12 是 Mission Control（要按 fn），Windows Terminal F11 全屏。
+                10..=12 => Some("F10–F12 常被终端或系统吃掉（菜单/全屏/媒体键），三平台不可靠"),
+                _ => Some("功能键只支持 F2–F9"),
             },
             ChordKey::Char(c) => {
                 if !self.ctrl && !self.alt {
@@ -123,6 +146,12 @@ impl Chord {
                         'i' => return Some("Ctrl-I 与 Tab 同码"),
                         'm' => return Some("Ctrl-M 与 Enter 同码"),
                         '[' => return Some("Ctrl-[ 与 Esc 同码"),
+                        // 数字已经被 shared_byte 归一成 punct，这里只拦手工写进 ini 的数字
+                        '0'..='9' => {
+                            return Some("Ctrl+数字被 Windows Terminal 用来切标签，mac/Linux 又与其它组合同码");
+                        }
+                        ' ' => return Some("Ctrl+空格与 Ctrl-2 同码，三平台送达不一致"),
+                        '/' => return Some("Ctrl-/ 与 Ctrl-_ 同码，mac/Linux 会当成后者"),
                         _ => {}
                     }
                 }
@@ -131,24 +160,10 @@ impl Chord {
         }
     }
 
-    /// 事件是否命中这条绑定。
+    /// 事件是否命中这条绑定。走 `from_event` 是为了让上面那套同码归一也作用到派发路径，
+    /// 否则 mac/Linux 上按 Ctrl-] 会以"Ctrl-5"的形式到不了默认绑定。
     pub fn matches(&self, key: &KeyEvent) -> bool {
-        if self.ctrl != key.modifiers.contains(KeyModifiers::CONTROL)
-            || self.alt != key.modifiers.contains(KeyModifiers::ALT)
-        {
-            return false;
-        }
-        match (self.key, key.code) {
-            (ChordKey::Function(n), KeyCode::F(m)) => n == m,
-            (ChordKey::Char(a), KeyCode::Char(b)) => {
-                if a.is_ascii_alphabetic() && b.is_ascii_alphabetic() {
-                    a.to_ascii_lowercase() == b.to_ascii_lowercase()
-                } else {
-                    a == b
-                }
-            }
-            _ => false,
-        }
+        Chord::from_event(key) == Some(*self)
     }
 }
 
@@ -279,6 +294,17 @@ impl KeyBinds {
     }
 }
 
+/// 本机改键前该知道的一件事（终端/系统会自己吃掉哪些键）。
+pub fn platform_note() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "本机：Mac 键盘的 F 键默认是媒体键，F2/F3/F5/F6 要先按 fn（系统设置→键盘→把 F1、F2 等作为标准功能键）；Alt 组合要终端把 Option 设为 Esc+/Meta（iTerm2 默认如此，Terminal.app 需自行打开）"
+    } else if cfg!(windows) {
+        "本机：Windows Terminal 自己占用了 Ctrl+1–8（切标签）与 F11（全屏），传统控制台里 Alt+字母会唤起窗口菜单——推荐 F2–F9 与 Ctrl+字母"
+    } else {
+        "本机：GNOME/KDE 等终端把 F10 用作菜单、F11 用作全屏，部分窗口管理器还占用 F1/F12——推荐 F2–F9 与 Ctrl+字母"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -336,13 +362,42 @@ mod tests {
             assert_eq!(Chord::parse(&text), Some(chord), "{text} 应当能解析回自身");
         }
         assert_eq!(Chord::parse("ctrl-t"), Some(Chord::ctrl('t')));
-        assert_eq!(Chord::parse("F12"), Some(Chord::function(12)));
+        assert_eq!(Chord::parse("F9"), Some(Chord::function(9)));
         assert_eq!(Chord::parse("Ctrl-Alt-k"), Chord::parse("Alt-Ctrl-k"));
         // 修饰前缀后的 "2" 是数字键，不是 F2
         assert_eq!(
             Chord::parse("ALT-2"),
             Some(Chord { key: ChordKey::Char('2'), ctrl: false, alt: true })
         );
+    }
+
+    #[test]
+    fn shared_control_bytes_resolve_to_one_chord() {
+        // mac/Linux 终端把 Ctrl-] 发成 0x1D，crossterm 解成 Ctrl+5；Windows 直接给 Ctrl-]。
+        // 两者必须是同一条绑定，否则默认键在非 Windows 上永远按不出来。
+        assert_eq!(
+            Chord::from_event(&event(KeyCode::Char('5'), true, false)),
+            Some(Chord::ctrl(']'))
+        );
+        assert_eq!(
+            Chord::from_event(&event(KeyCode::Char('4'), true, false)),
+            Some(Chord::ctrl('\\'))
+        );
+        assert_eq!(
+            Chord::from_event(&event(KeyCode::Char('6'), true, false)),
+            Some(Chord::ctrl('^'))
+        );
+        assert_eq!(
+            Chord::from_event(&event(KeyCode::Char('7'), true, false)),
+            Some(Chord::ctrl('_'))
+        );
+        let b = KeyBinds::default();
+        assert!(b.matches(Action::CloseTab, &event(KeyCode::Char(']'), true, false)));
+        assert!(b.matches(Action::CloseTab, &event(KeyCode::Char('5'), true, false)));
+        // 带 Alt 的 ESC+数字 是另一回事，不能被当成 Ctrl-]
+        assert!(!b.matches(Action::CloseTab, &event(KeyCode::Char('5'), true, true)));
+        // 数字写法也归一，ini 里手写的 ctrl-5 与 ctrl-] 是同一条
+        assert_eq!(Chord::parse("ctrl-5"), Some(Chord::ctrl(']')));
     }
 
     #[test]
@@ -353,12 +408,23 @@ mod tests {
         // F1 是会话页唯一的帮助键
         assert!(Chord::function(1).rejection().is_some());
         assert_eq!(Chord::parse("F1"), None);
+        // F10–F12 在主流终端/系统里被菜单、全屏、媒体键占用，送达没有保证
+        for n in [10, 11, 12] {
+            assert!(Chord::function(n).rejection().is_some(), "F{n} 必须被拒绝");
+        }
+        assert_eq!(Chord::parse("F12"), None);
+        assert_eq!(Chord::function(9).rejection(), None);
         // 终端里同码的组合
         for c in ['c', 'h', 'i', 'm', '['] {
             assert!(Chord::ctrl(c).rejection().is_some(), "Ctrl-{c} 必须被拒绝");
         }
+        // Ctrl+数字被 Windows Terminal 拿去切标签；Ctrl-空格/Ctrl-/ 也各有同码对
+        for c in ['0', '1', '5', '8', ' ', '/'] {
+            assert!(Chord::ctrl(c).rejection().is_some(), "Ctrl-{c} 必须被拒绝");
+        }
         assert_eq!(Chord::parse("x"), None);
         assert_eq!(Chord::parse("Ctrl-c"), None);
+        assert_eq!(Chord::parse("Ctrl-1"), None);
         assert_eq!(Chord::parse("F13"), None);
         assert_eq!(Chord::parse("Enter"), None);
         assert_eq!(Chord::parse(""), None);
