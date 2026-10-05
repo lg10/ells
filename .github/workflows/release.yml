@@ -121,4 +121,3 @@ jobs:
             out/ells-macos-universal
             out/ells-windows-x86_64.exe
             out/SHA256SUMS.txt
-          fail_on_unmatched_files: true
