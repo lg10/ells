@@ -9,7 +9,7 @@ English summary lives in each GitHub Release note; this file is the full history
 发版流程：把下面的 `[未发布 / Unreleased]` 小节改名为 `[x.y.z] - 日期`，再打 tag。
 CI 的 release 作业会按 tag 从本文件截取对应小节，作为 GitHub Release 说明。
 
-## [未发布 / Unreleased]
+## [0.1.5] - 2026-10-06
 
 ### 新增
 - **"已连接"可见可回**：主机列表现在能看见并回到正在连的会话。列表顶部加入
