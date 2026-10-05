@@ -2,6 +2,7 @@ mod app;
 mod dialog;
 mod events;
 mod highlight;
+mod keybinds;
 mod session;
 mod settings;
 mod term;

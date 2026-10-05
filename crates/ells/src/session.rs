@@ -1,10 +1,11 @@
 use std::io::Write;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{KeyEvent, KeyEventKind};
 use ells_core::ssh::RemoteSession;
 use ells_term::{key_to_bytes, Emulator};
 use ratatui::layout::Rect;
 
+use crate::keybinds::{Action, KeyBinds};
 use crate::zmodem::{Watcher, ZmodemEvent};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,22 +62,21 @@ impl SessionState {
         }
     }
 
-    pub fn handle_key(&mut self, key: &KeyEvent) -> SessionAction {
+    pub fn handle_key(&mut self, key: &KeyEvent, binds: &KeyBinds) -> SessionAction {
         if key.kind == KeyEventKind::Release {
             return SessionAction::Keep;
         }
         // 任何按键都回到实时底部并取消选择高亮（与常见终端一致）
         self.scroll = 0;
         self.selection = None;
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        if ctrl && matches!(key.code, KeyCode::Char('q')) {
+        if binds.matches(Action::Passthrough, key) {
             self.toggle_mode();
             return SessionAction::Keep;
         }
-        if ctrl && matches!(key.code, KeyCode::Char(']')) {
+        if binds.matches(Action::CloseTab, key) {
             return SessionAction::Detach;
         }
-        if ctrl && matches!(key.code, KeyCode::Char('l')) {
+        if binds.matches(Action::Redraw, key) {
             self.request_full_redraw();
             return SessionAction::Keep;
         }

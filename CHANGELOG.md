@@ -11,9 +11,17 @@ CI 的 release 作业会按 tag 从本文件截取对应小节，作为 GitHub R
 
 ## [未发布 / Unreleased]
 
+### 新增
+- **快捷键自定义**：设置页新增「快捷键设置」，`F2` 新建标签、`F5`/`F6` 切换、
+  `Ctrl-]` 关闭标签、`Ctrl-S` 文件浏览器、`Ctrl-Q` 直通模式、`Ctrl-L` 重绘、
+  `F3` 搜索这 8 项都可以改成自己的组合键。进入后选中一项按 Enter 开始录制，
+  按新键即时生效并写入 `~/.ells/settings.ini`；撞上已占用的键时两个动作自动互换，
+  也可一键「恢复默认」。只接受 F2–F12 或带 Ctrl/Alt 的组合（F1 留给帮助页），避免把普通输入吞掉；
+  终端里同码的 `Ctrl-H`/`Ctrl-I`/`Ctrl-M`/`Ctrl-[`/`Ctrl-C` 会被明确拒绝并说明原因。
+
 ### 修复
-- 发布流水线：`release.yml` 里重复的 `fail_on_unmatched_files` 键让 GitHub 判定整个
-  workflow 无效，v0.1.4 第一次打 tag 时零作业直接失败、没有产出任何产物。
+- 发布流水线：`release.yml` 里重复的 `fail_on_unmatched_files` 键让整个 workflow 被
+  GitHub 判定无效，v0.1.4 第一次打 tag 时零作业直接失败、没有产出任何产物。
 
 ### 内部
 - CI 新增 `workflows-lint` 作业（`tools/check-workflow-keys.py`）：用会拒绝重复映射键

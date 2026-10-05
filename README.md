@@ -131,6 +131,12 @@ Config lives in ~/.ells/: vault.bin (credentials), settings.ini, known_hosts.
 
 `?` (list / browser) and `F1` (session) open the full in-app help page.
 
+The tab and session chords above (`F2`/`F5`/`F6`/`Ctrl-]`/`Ctrl-S`/`Ctrl-Q`/`Ctrl-L`/`F3`) are defaults
+only. Remap them from the host list via `s` → settings → 「快捷键设置」 (keybindings): focus a row, press
+Enter, then hit the new key. F2–F12 and Ctrl/Alt combinations are accepted — `F1` stays on the help page.
+A chord already taken by another action swaps the two, and every change is written to
+`~/.ells/settings.ini` right away.
+
 ## Building from source
 
 Requires **Rust 1.85+** (edition 2024).

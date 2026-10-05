@@ -28,7 +28,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
     // 帮助页在最上层：它由任意页面唤起，且期间不响应其它键位
     if app.help_open {
-        draw_help(f, app.last_area);
+        let area = app.last_area;
+        draw_help(f, area, &app.settings.keybinds);
     }
 }
 
@@ -225,7 +226,10 @@ fn draw_list(f: &mut Frame, app: &mut App) {
         );
     }
 
-    let keys = " ↑↓ 选择 · Enter 连接 · a 新增 · e 编辑 · d 删除 · i 导入 · s 设置 · F2 新标签 · ? 帮助 · q 退出 ";
+    let keys = format!(
+        " ↑↓ 选择 · Enter 连接 · a 新增 · e 编辑 · d 删除 · i 导入 · s 设置 · {} 新标签 · ? 帮助 · q 退出 ",
+        app.settings.keybinds.display(crate::keybinds::Action::NewTab)
+    );
     f.render_widget(
         Paragraph::new(keys).style(Style::default().fg(Color::DarkGray)),
         chunks[1],
@@ -255,7 +259,7 @@ fn draw_list(f: &mut Frame, app: &mut App) {
         draw_delete_confirm(f, app.confirm_index, &alias);
     }
     if app.settings_open {
-        draw_settings_overlay(f, app);
+        draw_settings_stack(f, app);
     }
 }
 
@@ -337,7 +341,7 @@ fn draw_delete_confirm(f: &mut Frame, confirm_index: usize, alias: &str) {
 }
 
 /// 帮助页：分区块列出全部键位。内容是编译期常量，宽度不够时自动换行。
-fn draw_help(f: &mut Frame, area: Rect) {
+fn draw_help(f: &mut Frame, area: Rect, binds: &crate::keybinds::KeyBinds) {
     let panel = centered(area.width.saturating_sub(2), area.height.saturating_sub(2), area);
     f.render_widget(Clear, panel);
     f.render_widget(
@@ -351,15 +355,32 @@ fn draw_help(f: &mut Frame, area: Rect) {
             ),
         panel,
     );
-    let sections: [(&str, &str); 8] = [
-        ("主机列表", "↑↓/jk 选择 · Enter 连接 · a 新增 · e 编辑 · d 删除（二次确认）· s 设置 · i 导入 ~/.ssh/config · ?/F1 帮助 · q/Ctrl-C 退出"),
-        ("多标签会话", "F2 新建标签 · F5 下一个 · F6 上一个 · 鼠标点顶部标签条切换、点末尾 + 新建 · Ctrl-] 关闭当前标签（只剩一个时退回主机列表）· 每个标签是一路独立 SSH，后台标签的输出与传输继续跑"),
-        ("会话终端", "直接打字即发往远端 · Ctrl-S 文件浏览器 · Ctrl-Q 内嵌/直通 · Ctrl-] 关闭标签 · Ctrl-L 整屏重绘 · 滚轮回看 · 拖选复制（OSC 52）· F3 搜索历史输出（回看时按 / 同样可用，n/N 上下条）· F1 帮助"),
-        ("文件浏览器", "↑↓/滚轮 选择 · Enter 进入目录或下载 · u 上传文件 · U 上传整个目录 · d 下载 · m 新建目录 · n 重命名 · D 删除（递归，先确认）· Ctrl-C 取消全部在途传输 · r 刷新 · Backspace 上级 · Esc 返回终端"),
-        ("主机表单", "Tab/↓ 下一个字段 · ↑ 上一个 · ←→ 切换认证方式 · Ctrl-F 选私钥 · Ctrl-J 选跳板机 · Ctrl-C 清空当前字段 · Enter 在\"私钥路径/跳板机\"上直接打开选择器，保存要点【保 存】或聚焦后回车"),
-        ("解锁保险库", "输入主密码后回车；首次使用会要求输入两遍。主密码不可找回，忘记只能删除 ~/.ells/vault.bin 重来。"),
-        ("确认弹窗", "←→/Tab 切换选项 · Enter 确认 · Esc 取消。传输冲突默认停在\"改名保留双方\"；主机密钥变更默认停在\"拒绝\"。"),
-        ("命令行", "ells 打开列表；ells <别名> 直连；ells --dev 读 ~/.ells/hosts.dev.toml；ells -y 首次主机密钥自动接受（密钥变更仍然拒绝）。配置在 ~/.ells/。"),
+    use crate::keybinds::Action;
+    let tab_body = format!(
+        "{} 新建标签 · {} 下一个 · {} 上一个 · 鼠标点顶部标签条切换、点末尾 + 新建 · {} 关闭当前标签（只剩一个时退回主机列表）· 每个标签是一路独立 SSH，后台标签的输出与传输继续跑",
+        binds.display(Action::NewTab),
+        binds.display(Action::NextTab),
+        binds.display(Action::PrevTab),
+        binds.display(Action::CloseTab),
+    );
+    let term_body = format!(
+        "直接打字即发往远端 · {} 文件浏览器 · {} 内嵌/直通 · {} 关闭标签 · {} 整屏重绘 · 滚轮回看 · 拖选复制（OSC 52）· {} 搜索历史输出（回看时按 / 同样可用，n/N 上下条）· F1 帮助",
+        binds.display(Action::Browser),
+        binds.display(Action::Passthrough),
+        binds.display(Action::CloseTab),
+        binds.display(Action::Redraw),
+        binds.display(Action::Search),
+    );
+    let sections: [(&str, std::borrow::Cow<str>); 9] = [
+        ("主机列表", std::borrow::Cow::Borrowed("↑↓/jk 选择 · Enter 连接 · a 新增 · e 编辑 · d 删除（二次确认）· s 设置 · i 导入 ~/.ssh/config · ?/F1 帮助 · q/Ctrl-C 退出")),
+        ("多标签会话", std::borrow::Cow::Owned(tab_body)),
+        ("会话终端", std::borrow::Cow::Owned(term_body)),
+        ("改键", std::borrow::Cow::Borrowed("会话与标签页按键可在「设置 → 快捷键设置」里自定义（列表页按 s、会话页按顶部【设置】）：Enter 选中某项后按下新按键即可绑定，只接受 F2–F12 或 Ctrl/Alt 组合键（F1 留给帮助页），改完即时写入 ~/.ells/settings.ini；撞到已占用的键会自动互换，【恢复默认】一键还原。")),
+        ("文件浏览器", std::borrow::Cow::Borrowed("↑↓/滚轮 选择 · Enter 进入目录或下载 · u 上传文件 · U 上传整个目录 · d 下载 · m 新建目录 · n 重命名 · D 删除（递归，先确认）· Ctrl-C 取消全部在途传输 · r 刷新 · Backspace 上级 · Esc 返回终端")),
+        ("主机表单", std::borrow::Cow::Borrowed("Tab/↓ 下一个字段 · ↑ 上一个 · ←→ 切换认证方式 · Ctrl-F 选私钥 · Ctrl-J 选跳板机 · Ctrl-C 清空当前字段 · Enter 在\"私钥路径/跳板机\"上直接打开选择器，保存要点【保 存】或聚焦后回车")),
+        ("解锁保险库", std::borrow::Cow::Borrowed("输入主密码后回车；首次使用会要求输入两遍。主密码不可找回，忘记只能删除 ~/.ells/vault.bin 重来。")),
+        ("确认弹窗", std::borrow::Cow::Borrowed("←→/Tab 切换选项 · Enter 确认 · Esc 取消。传输冲突默认停在\"改名保留双方\"；主机密钥变更默认停在\"拒绝\"。")),
+        ("命令行", std::borrow::Cow::Borrowed("ells 打开列表；ells <别名> 直连；ells --dev 读 ~/.ells/hosts.dev.toml；ells -y 首次主机密钥自动接受（密钥变更仍然拒绝）。配置在 ~/.ells/。")),
     ];
     let mut lines: Vec<Line> = Vec::new();
     for (title, body) in sections {
@@ -370,7 +391,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::from(Span::styled(
-            body.to_string(),
+            body.into_owned(),
             Style::default().fg(Color::Gray),
         )));
         lines.push(Line::from(""));
@@ -873,6 +894,20 @@ fn draw_session(f: &mut Frame, app: &mut App) {
         TermMode::Embedded => "内嵌",
         TermMode::Passthrough => "直通",
     };
+    // 顶部按键提示跟着用户的自定义绑定走（KeyBinds 是 Copy，避开与 s 的借用冲突）
+    let binds = app.settings.keybinds;
+    use crate::keybinds::Action;
+    let key_hint = format!(
+        "{} 切模式 · {} 文件 · {} 重绘 · {} 搜索 · {} 新标签 · {}/{} 切换 · {} 关闭标签",
+        binds.display(Action::Passthrough),
+        binds.display(Action::Browser),
+        binds.display(Action::Redraw),
+        binds.display(Action::Search),
+        binds.display(Action::NewTab),
+        binds.display(Action::NextTab),
+        binds.display(Action::PrevTab),
+        binds.display(Action::CloseTab),
+    );
     let header = Line::from(vec![
         Span::styled(" ells ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
         Span::styled(format!("● {} ", s.label), Style::default().fg(Color::Yellow)),
@@ -886,10 +921,7 @@ fn draw_session(f: &mut Frame, app: &mut App) {
                 })
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(
-            "Ctrl-Q 切模式 · Ctrl-S 文件 · Ctrl-L 重绘 · F3 搜索 · F2 新标签 · F5/F6 切换 · Ctrl-] 关闭标签",
-            Style::default().fg(Color::DarkGray),
-        ),
+        Span::styled(key_hint, Style::default().fg(Color::DarkGray)),
     ]);
     let title_row = Rect {
         x: chunks[0].x,
@@ -903,7 +935,7 @@ fn draw_session(f: &mut Frame, app: &mut App) {
 
     // 第 1 行：标签条（点标签切换，点 + 新建）
     let titles: Vec<String> = app.slots.iter().map(Slot::title).collect();
-    draw_tab_bar(f, chunks[0], &titles, app.active);
+    draw_tab_bar(f, chunks[0], &titles, app.active, &app.settings.keybinds);
 
     // 第 2 行：一次性状态提示（连接/拦截/完成/取消）；空闲时给操作指引。
     let note_row = Rect {
@@ -1060,7 +1092,7 @@ fn draw_session(f: &mut Frame, app: &mut App) {
     // 底部不再叠加状态浮层：状态统一显示在顶部第二行，避免三处重复。
     // 弹窗最后渲染：内嵌终端的逐格写入会覆盖先画的浮层
     if app.settings_open {
-        draw_settings_overlay(f, app);
+        draw_settings_stack(f, app);
     }
     if app.transfer_popup {
         draw_transfer_popup(f, app);
@@ -1211,7 +1243,13 @@ fn tab_counter(app: &App) -> String {
 }
 
 /// 标签条：当前标签实心高亮，后台标签灰底，超出宽度的标签不画（F5/F6 仍能循环）。
-fn draw_tab_bar(f: &mut Frame, area: Rect, titles: &[String], active: usize) {
+fn draw_tab_bar(
+    f: &mut Frame,
+    area: Rect,
+    titles: &[String],
+    active: usize,
+    binds: &crate::keybinds::KeyBinds,
+) {
     let y = area.y + TAB_ROW;
     f.render_widget(
         Paragraph::new(Line::from("")).style(Style::default().bg(Color::DarkGray)),
@@ -1237,8 +1275,14 @@ fn draw_tab_bar(f: &mut Frame, area: Rect, titles: &[String], active: usize) {
         ))),
         plus,
     );
-    let hint = " F2 新建 · F5/F6 切换 · Ctrl-] 关闭标签 ";
-    if display_width(hint) + 2 <= area.width.saturating_sub(plus.right()) as usize {
+    let hint = format!(
+        " {} 新建 · {}/{} 切换 · {} 关闭标签 ",
+        binds.display(crate::keybinds::Action::NewTab),
+        binds.display(crate::keybinds::Action::NextTab),
+        binds.display(crate::keybinds::Action::PrevTab),
+        binds.display(crate::keybinds::Action::CloseTab),
+    );
+    if display_width(&hint) + 2 <= area.width.saturating_sub(plus.right()) as usize {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 hint,
@@ -1270,10 +1314,10 @@ fn clip_display(s: &str, width: usize) -> String {
     out
 }
 
-/// 设置弹窗的 6 个可点击行：高亮 / 保活 / 主密码开关 / 修改主密码 / 保存 / 取消。
+/// 设置弹窗的 7 个可点击行：高亮 / 保活 / 主密码开关 / 修改主密码 / 快捷键 / 保存 / 取消。
 /// 必须与 draw_settings_overlay 的几何完全一致。
-pub fn settings_hit_rects(area: Rect) -> [Rect; 6] {
-    let p = centered(56, 10, area);
+pub fn settings_hit_rects(area: Rect) -> [Rect; 7] {
+    let p = centered(56, 11, area);
     let ix = p.x + 1;
     let iy = p.y + 1;
     let iw = p.width.saturating_sub(2);
@@ -1282,14 +1326,31 @@ pub fn settings_hit_rects(area: Rect) -> [Rect; 6] {
         Rect { x: ix, y: iy + 1, width: iw, height: 1 },
         Rect { x: ix, y: iy + 2, width: iw, height: 1 },
         Rect { x: ix, y: iy + 3, width: iw, height: 1 },
-        Rect { x: ix.saturating_add(iw / 2).saturating_sub(16), y: iy + 5, width: 14, height: 1 },
-        Rect { x: ix.saturating_add(iw / 2).saturating_add(2), y: iy + 5, width: 14, height: 1 },
+        Rect { x: ix, y: iy + 4, width: iw, height: 1 },
+        Rect { x: ix.saturating_add(iw / 2).saturating_sub(16), y: iy + 6, width: 14, height: 1 },
+        Rect { x: ix.saturating_add(iw / 2).saturating_add(2), y: iy + 6, width: 14, height: 1 },
     ]
+}
+
+/// 快捷键面板的 10 个可点击行：8 个动作 + 恢复默认 + 返回设置。
+/// 必须与 draw_keybinds_overlay 的几何完全一致。
+pub fn keybinds_hit_rects(area: Rect) -> [Rect; 10] {
+    let p = centered(60, 15, area);
+    let ix = p.x + 1;
+    let iy = p.y + 1;
+    let iw = p.width.saturating_sub(2);
+    let mut rects = [Rect::ZERO; 10];
+    for (idx, slot) in rects.iter_mut().enumerate().take(8) {
+        *slot = Rect { x: ix, y: iy + idx as u16, width: iw, height: 1 };
+    }
+    rects[8] = Rect { x: ix, y: iy + 10, width: 14, height: 1 };
+    rects[9] = Rect { x: ix.saturating_add(iw).saturating_sub(14), y: iy + 10, width: 14, height: 1 };
+    rects
 }
 
 fn draw_settings_overlay(f: &mut Frame, app: &App) {
     let rects = settings_hit_rects(f.area());
-    let panel = centered(56, 10, f.area());
+    let panel = centered(56, 11, f.area());
     f.buffer_mut().set_style(panel, Style::default().bg(Color::Black));
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1382,25 +1443,39 @@ fn draw_settings_overlay(f: &mut Frame, app: &App) {
         }
     };
     f.render_widget(Paragraph::new(line3), rects[3]);
-    // 行 4：操作提示
+    // 行 4：快捷键设置子面板入口
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(" 快捷键设置：", row_base(focus == 4)),
+            Span::styled(
+                format!(
+                    " {} 项可改 · Enter/点击 打开 ",
+                    crate::keybinds::Action::ALL.len()
+                ),
+                row_base(focus == 4).fg(Color::DarkGray),
+            ),
+        ])),
+        rects[4],
+    );
+    // 行 5：操作提示
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             " ↑↓ 选择 · Enter/点击 修改 · ←→ 微调 · Esc 取消",
             Style::default().fg(Color::DarkGray).bg(Color::Black),
         ))),
-        Rect { x: rects[0].x, y: rects[0].y + 4, width: rects[0].width, height: 1 },
+        Rect { x: rects[0].x, y: rects[0].y + 5, width: rects[0].width, height: 1 },
     );
-    // 行 5：保存 / 取消按钮
+    // 行 6：保存 / 取消按钮
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             "【 保 存 】",
             Style::default()
                 .fg(Color::Black)
                 .bg(Color::Cyan)
-                .add_modifier(if focus == 4 { Modifier::BOLD } else { Modifier::empty() })
-                .add_modifier(if focus == 4 { Modifier::UNDERLINED } else { Modifier::empty() }),
+                .add_modifier(if focus == 5 { Modifier::BOLD } else { Modifier::empty() })
+                .add_modifier(if focus == 5 { Modifier::UNDERLINED } else { Modifier::empty() }),
         ))),
-        rects[4],
+        rects[5],
     );
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -1408,11 +1483,104 @@ fn draw_settings_overlay(f: &mut Frame, app: &App) {
             Style::default()
                 .fg(Color::White)
                 .bg(Color::DarkGray)
-                .add_modifier(if focus == 5 { Modifier::BOLD } else { Modifier::empty() })
-                .add_modifier(if focus == 5 { Modifier::UNDERLINED } else { Modifier::empty() }),
+                .add_modifier(if focus == 6 { Modifier::BOLD } else { Modifier::empty() })
+                .add_modifier(if focus == 6 { Modifier::UNDERLINED } else { Modifier::empty() }),
         ))),
-        rects[5],
+        rects[6],
     );
+}
+
+fn draw_keybinds_overlay(f: &mut Frame, app: &App) {
+    let rects = keybinds_hit_rects(f.area());
+    let panel = centered(60, 15, f.area());
+    f.buffer_mut().set_style(panel, Style::default().bg(Color::Black));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" 快捷键设置 ")
+        .title_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+    f.render_widget(Clear, panel);
+    f.render_widget(block, panel);
+    let binds = &app.settings.keybinds;
+    let row_base = |focused: bool| {
+        let mut s = Style::default().fg(Color::White).bg(Color::Black);
+        if focused {
+            s = s.add_modifier(Modifier::REVERSED);
+        }
+        s
+    };
+    for (idx, action) in crate::keybinds::Action::ALL.iter().enumerate() {
+        let focused = app.keybinds_focus == idx;
+        let recording = app.keybinds_recording == Some(*action);
+        let badge = if recording {
+            " 请按下新按键 · Esc 取消 ".to_string()
+        } else {
+            format!(" {} ", binds.display(*action))
+        };
+        let badge_style = if recording {
+            row_base(focused).fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        } else {
+            row_base(focused).fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(format!(" {}", pad_display(action.label(), 18)), row_base(focused)),
+                Span::styled(badge, badge_style),
+            ])),
+            rects[idx],
+        );
+    }
+    // 提示行 + 一次性结果行
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            " ↑↓ 选择 · Enter/点击 改键 · 只能绑 F2–F12 或 Ctrl/Alt 组合键",
+            Style::default().fg(Color::DarkGray).bg(Color::Black),
+        ))),
+        Rect { x: rects[0].x, y: rects[0].y + 8, width: rects[0].width, height: 1 },
+    );
+    let msg = match &app.keybinds_msg {
+        Some(text) => text.clone(),
+        None => " 改键即时生效并保存 · 与已占用的键会自动互换".to_string(),
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!(" {}", clip_display(&msg, rects[0].width as usize - 2)),
+            Style::default()
+                .fg(if app.keybinds_msg.is_some() { Color::Green } else { Color::DarkGray })
+                .bg(Color::Black),
+        ))),
+        Rect { x: rects[0].x, y: rects[0].y + 9, width: rects[0].width, height: 1 },
+    );
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "【恢复默认】",
+            Style::default()
+                .fg(Color::White)
+                .bg(Color::DarkGray)
+                .add_modifier(if app.keybinds_focus == 8 { Modifier::BOLD } else { Modifier::empty() }),
+        ))),
+        rects[8],
+    );
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "【 返 回 】",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(if app.keybinds_focus == 9 { Modifier::BOLD } else { Modifier::empty() }),
+        ))),
+        rects[9],
+    );
+}
+
+/// 设置弹窗 + 快捷键子面板：子面板要盖在设置之上，所以必须在两者都开时后画。
+pub fn draw_settings_stack(f: &mut Frame, app: &App) {
+    if !app.settings_open {
+        return;
+    }
+    draw_settings_overlay(f, app);
+    if app.keybinds_open {
+        draw_keybinds_overlay(f, app);
+    }
 }
 
 fn draw_transfer_popup(f: &mut Frame, app: &App) {

@@ -21,6 +21,7 @@ use tokio::sync::{mpsc, oneshot};
 use zeroize::Zeroizing;
 
 use crate::events::{self, AppEvent};
+use crate::keybinds::{Action, Chord};
 use crate::session::{SessionAction, SessionState, TermMode};
 use crate::settings::Settings;
 use crate::term;
@@ -296,8 +297,16 @@ pub struct App {
     pub settings: Settings,
     /// 全局设置弹窗是否打开（会话界面顶部「设置」按钮触发）。
     pub settings_open: bool,
-    /// 设置弹窗中当前聚焦的选项行（0=高亮 1=保活 2=主密码开关 3=修改主密码 4=保存 5=取消）。
+    /// 设置弹窗中当前聚焦的选项行（0=高亮 1=保活 2=主密码开关 3=修改主密码 4=快捷键 5=保存 6=取消）。
     pub settings_focus: usize,
+    /// 快捷键设置子面板（从设置弹窗进入）。
+    pub keybinds_open: bool,
+    /// 快捷键面板聚焦项（0–7=动作，8=恢复默认，9=返回设置）。
+    pub keybinds_focus: usize,
+    /// 正在等待用户按下新按键的动作；非 None 时本面板吃掉全部按键。
+    pub keybinds_recording: Option<Action>,
+    /// 快捷键面板底部的一次性提示（绑定成功 / 冲突互换 / 拒绝原因）。
+    pub keybinds_msg: Option<String>,
     /// 本次运行解锁用过的明文主密码（改密/关闭保护时写入自动解锁凭据需要它）。
     /// Zeroizing：这份密码要在整个运行期留着，drop 时必须抹掉，不能留在堆里。
     pub master_secret: Option<Zeroizing<String>>,
@@ -404,6 +413,10 @@ impl App {
             settings,
             settings_open: false,
             settings_focus: 0,
+            keybinds_open: false,
+            keybinds_focus: 0,
+            keybinds_recording: None,
+            keybinds_msg: None,
             master_secret: None,
             auto_master: None,
             mp_stage: MpStage::Idle,
@@ -900,7 +913,11 @@ impl App {
             return;
         }
         if self.settings_open {
-            self.handle_settings_key(&key);
+            if self.keybinds_open {
+                self.handle_keybinds_key(&key);
+            } else {
+                self.handle_settings_key(&key);
+            }
             return;
         }
         if self.transfer_popup {
@@ -912,29 +929,28 @@ impl App {
             self.handle_delete_confirm_key(&key);
             return;
         }
-        // 标签页控制在列表/会话/浏览器页都可用；弹窗、帮助页和表单里不抢键
-        match key.code {
-            KeyCode::F(2) => {
-                self.new_tab();
-                return;
-            }
-            KeyCode::F(5) => {
-                self.cycle_tab(true);
-                return;
-            }
-            KeyCode::F(6) => {
-                self.cycle_tab(false);
-                return;
-            }
-            _ => {}
+        // 标签页控制在列表/会话/浏览器页都可用；弹窗、帮助页和表单里不抢键。
+        // 按键全部来自设置里的绑定表（F2/F5/F6/Ctrl-] 只是默认值）。
+        let binds = self.settings.keybinds;
+        if binds.matches(Action::NewTab, &key) {
+            self.new_tab();
+            return;
         }
-        if ctrl && matches!(key.code, KeyCode::Char(']')) && self.screen == ScreenKind::Browser {
+        if binds.matches(Action::NextTab, &key) {
+            self.cycle_tab(true);
+            return;
+        }
+        if binds.matches(Action::PrevTab, &key) {
+            self.cycle_tab(false);
+            return;
+        }
+        if binds.matches(Action::CloseTab, &key) && self.screen == ScreenKind::Browser {
             self.slots[self.work].sz_pick_mode = false;
             self.detach_or_close_tab();
             return;
         }
         match self.screen {
-            ScreenKind::Session => self.handle_session_key(&key, ctrl).await,
+            ScreenKind::Session => self.handle_session_key(&key).await,
             ScreenKind::Unlock => self.handle_unlock_key(&key, ctrl),
             ScreenKind::List => self.handle_list_key(&key, ctrl),
             ScreenKind::Form => {
@@ -944,8 +960,9 @@ impl App {
         }
     }
 
-    async fn handle_session_key(&mut self, key: &KeyEvent, ctrl: bool) {
-        if ctrl && matches!(key.code, KeyCode::Char('s')) {
+    async fn handle_session_key(&mut self, key: &KeyEvent) {
+        let binds = self.settings.keybinds;
+        if binds.matches(Action::Browser, key) {
             self.open_browser();
             return;
         }
@@ -971,10 +988,13 @@ impl App {
             }
             return;
         }
-        // F3 = 搜索；`/` 仅在已回看历史时可用（平时它是远端的路径字符）。
+        // 搜索键（默认 F3）；`/` 仅在已回看历史时可用（平时它是远端的路径字符）。
         let embedded = self.slots[self.work].session.as_ref().map(|s| s.mode) == Some(TermMode::Embedded);
         let scrolled = self.slots[self.work].session.as_ref().is_some_and(|s| s.scroll > 0);
-        if embedded && (matches!(key.code, KeyCode::F(3)) || (scrolled && matches!(key.code, KeyCode::Char('/')))) {
+        if embedded
+            && (binds.matches(Action::Search, key)
+                || (scrolled && matches!(key.code, KeyCode::Char('/'))))
+        {
             self.open_search();
             return;
         }
@@ -982,8 +1002,9 @@ impl App {
     }
 
     fn forward_to_remote(&mut self, key: &KeyEvent) {
+        let binds = self.settings.keybinds;
         let action = match &mut self.slots[self.work].session {
-            Some(s) => s.handle_key(key),
+            Some(s) => s.handle_key(key, &binds),
             None => SessionAction::Keep,
         };
         if action == SessionAction::Detach {
@@ -1284,7 +1305,30 @@ impl App {
                 // 改密输入中：鼠标不参与，只认键盘
                 return;
             }
-            let [hl_r, ka_r, mp_r, change_r, save_r, cancel_r] = ui::settings_hit_rects(self.last_area);
+            if self.keybinds_recording.is_some() {
+                // 录制中：等键盘输入，鼠标不参与（否则会误取消/改错行）
+                return;
+            }
+            if self.keybinds_open {
+                let rects = ui::keybinds_hit_rects(self.last_area);
+                for (idx, rect) in rects.iter().enumerate() {
+                    if !hit(*rect, column, row) {
+                        continue;
+                    }
+                    self.keybinds_focus = idx;
+                    if idx < Action::ALL.len() {
+                        self.keybinds_recording = Some(Action::ALL[idx]);
+                    } else if idx == Action::ALL.len() {
+                        self.reset_keybinds();
+                    } else {
+                        self.close_keybinds();
+                    }
+                    return;
+                }
+                return;
+            }
+            let [hl_r, ka_r, mp_r, change_r, kb_r, save_r, cancel_r] =
+                ui::settings_hit_rects(self.last_area);
             if hit(hl_r, column, row) {
                 self.settings_focus = 0;
                 self.settings.highlight = !self.settings.highlight;
@@ -1295,6 +1339,8 @@ impl App {
                 self.toggle_master_setting();
             } else if hit(change_r, column, row) {
                 self.begin_master_change();
+            } else if hit(kb_r, column, row) {
+                self.open_keybinds();
             } else if hit(save_r, column, row) {
                 self.save_settings();
             } else if hit(cancel_r, column, row) {
@@ -1337,8 +1383,7 @@ impl App {
                 let [settings_r, upload_r, download_r, progress_r] =
                     ui::header_button_rects(self.last_area);
                 if hit(settings_r, column, row) {
-                    self.settings_open = true;
-                    self.settings_focus = 0;
+                    self.open_settings();
                 } else if hit(upload_r, column, row) {
                     self.trigger_upload();
                 } else if hit(download_r, column, row) {
@@ -1387,8 +1432,7 @@ impl App {
                 if hit(ui::homepage_rect(self.last_area), column, row) {
                     self.open_homepage();
                 } else if hit(ui::list_settings_rect(self.last_area), column, row) {
-                    self.settings_open = true;
-                    self.settings_focus = 0;
+                    self.open_settings();
                 }
             }
             _ => {}
@@ -1489,7 +1533,7 @@ impl App {
                 self.settings_focus = self.settings_focus.saturating_sub(1);
             }
             KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
-                self.settings_focus = (self.settings_focus + 1).min(5);
+                self.settings_focus = (self.settings_focus + 1).min(6);
             }
             KeyCode::Enter | KeyCode::Char(' ') => self.apply_settings_focus(),
             KeyCode::Left => match self.settings_focus {
@@ -1601,7 +1645,7 @@ impl App {
     }
 
     /// Enter/空格/点击 对当前聚焦项生效：0 切换高亮、1 循环保活档位、
-    /// 2 主密码保护开关、3 进入修改主密码输入、4 保存、5 取消
+    /// 2 主密码保护开关、3 进入修改主密码输入、4 打开快捷键面板、5 保存、6 取消
     fn apply_settings_focus(&mut self) {
         match self.settings_focus {
             0 => self.settings.highlight = !self.settings.highlight,
@@ -1610,9 +1654,99 @@ impl App {
             }
             2 => self.toggle_master_setting(),
             3 => self.begin_master_change(),
-            4 => self.save_settings(),
+            4 => self.open_keybinds(),
+            5 => self.save_settings(),
             _ => self.cancel_settings(),
         }
+    }
+
+    fn open_settings(&mut self) {
+        self.settings_open = true;
+        self.settings_focus = 0;
+        // 子面板状态不跨开关保留：否则上次停在「快捷键」里，重开就直接落在子面板上
+        self.keybinds_open = false;
+        self.keybinds_recording = None;
+        self.keybinds_msg = None;
+    }
+
+    fn open_keybinds(&mut self) {
+        self.keybinds_open = true;
+        self.keybinds_focus = 0;
+        self.keybinds_recording = None;
+        self.keybinds_msg = None;
+    }
+
+    /// 关闭快捷键面板回到设置页（改动已在绑定时逐项落盘，这里不再需要保存）
+    fn close_keybinds(&mut self) {
+        self.keybinds_open = false;
+        self.keybinds_recording = None;
+        self.keybinds_msg = None;
+        self.settings_focus = 4;
+    }
+
+    fn handle_keybinds_key(&mut self, key: &KeyEvent) {
+        if let Some(action) = self.keybinds_recording {
+            // 录制态吞掉所有按键：Esc/Backspace 取消，其余尝试绑定
+            if matches!(key.code, KeyCode::Esc | KeyCode::Backspace) {
+                self.keybinds_recording = None;
+                self.keybinds_msg = Some(format!("已取消修改「{}」", action.label()));
+                return;
+            }
+            self.apply_binding(action, key);
+            return;
+        }
+        let last = Action::ALL.len() + 1;
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.keybinds_focus = self.keybinds_focus.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
+                self.keybinds_focus = (self.keybinds_focus + 1).min(last);
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => match self.keybinds_focus {
+                idx if idx < Action::ALL.len() => {
+                    let action = Action::ALL[idx];
+                    self.keybinds_recording = Some(action);
+                    self.keybinds_msg =
+                        Some(format!("「{}」= {}", action.label(), self.settings.keybinds.display(action)));
+                }
+                i if i == Action::ALL.len() => self.reset_keybinds(),
+                _ => self.close_keybinds(),
+            },
+            KeyCode::Esc => self.close_keybinds(),
+            _ => {}
+        }
+    }
+
+    /// 把一次按键写成绑定：非法键给出原因，撞键则两个动作互换，成功即刻保存。
+    fn apply_binding(&mut self, action: Action, key: &KeyEvent) {
+        self.keybinds_recording = None;
+        let Some(chord) = Chord::from_event(key) else {
+            self.keybinds_msg = Some("请按功能键（F2–F12）或 Ctrl/Alt 组合键".to_string());
+            return;
+        };
+        if let Some(reason) = chord.rejection() {
+            self.keybinds_msg = Some(reason.to_string());
+            return;
+        }
+        let swapped = self.settings.keybinds.bind(action, chord);
+        self.settings.save();
+        self.keybinds_msg = Some(match swapped {
+            Some(other) => format!(
+                "「{}」= {}，与「{}」自动互换为 {}",
+                action.label(),
+                chord.display(),
+                other.label(),
+                self.settings.keybinds.display(other)
+            ),
+            None => format!("「{}」= {}，已保存", action.label(), chord.display()),
+        });
+    }
+
+    fn reset_keybinds(&mut self) {
+        self.settings.keybinds.reset();
+        self.settings.save();
+        self.keybinds_msg = Some("已恢复默认快捷键并保存".to_string());
     }
 
     fn save_settings(&mut self) {
@@ -1625,11 +1759,15 @@ impl App {
             if let Err(err) = crate::settings::write_master_backup(master.as_str()) {
                 self.status = Some(format!("设置已保存，但免密凭据写入失败: {err}"));
                 self.settings_open = false;
+                self.keybinds_open = false;
                 self.reset_master_edit();
                 return;
             }
         }
         self.settings_open = false;
+        self.keybinds_open = false;
+        self.keybinds_recording = None;
+        self.keybinds_msg = None;
         self.reset_master_edit();
         self.status = Some("设置已保存（保活间隔对下次连接生效）".to_string());
     }
@@ -1639,6 +1777,9 @@ impl App {
         self.settings = Settings::load();
         ells_core::ssh::set_keepalive_interval(self.settings.keepalive_secs);
         self.settings_open = false;
+        self.keybinds_open = false;
+        self.keybinds_recording = None;
+        self.keybinds_msg = None;
         self.reset_master_edit();
     }
 
@@ -2500,10 +2641,7 @@ impl App {
                     self.confirm_index = 0;
                 }
             }
-            KeyCode::Char('s') => {
-                self.settings_open = true;
-                self.settings_focus = 0;
-            }
+            KeyCode::Char('s') => self.open_settings(),
             KeyCode::Char('i') => self.import_ssh_config(),
             KeyCode::Char('?') | KeyCode::F(1) => self.help_open = true,
             KeyCode::Enter => {

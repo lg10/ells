@@ -2,6 +2,8 @@
 
 use std::path::PathBuf;
 
+use crate::keybinds::{Action, Chord, KeyBinds};
+
 #[derive(Debug, Clone)]
 pub struct Settings {
     /// 终端输出高亮（docker ps / 日志级别）
@@ -10,11 +12,18 @@ pub struct Settings {
     pub keepalive_secs: u64,
     /// 主密码保护：关闭后主密码存入本地凭据文件、启动自动解锁（安全性降为文件权限级）
     pub master_password_enabled: bool,
+    /// 界面快捷键（设置里可改，改完即时写盘）
+    pub keybinds: KeyBinds,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { highlight: true, keepalive_secs: 30, master_password_enabled: true }
+        Self {
+            highlight: true,
+            keepalive_secs: 30,
+            master_password_enabled: true,
+            keybinds: KeyBinds::default(),
+        }
     }
 }
 
@@ -66,7 +75,8 @@ impl Settings {
         let mut s = Self::default();
         for line in text.lines() {
             let Some((k, v)) = line.split_once('=') else { continue };
-            match k.trim() {
+            let k = k.trim();
+            match k {
                 "highlight" => s.highlight = v.trim() == "true",
                 "keepalive_secs" => {
                     if let Ok(n) = v.trim().parse::<u64>() {
@@ -76,7 +86,14 @@ impl Settings {
                 "master_password_enabled" => {
                     s.master_password_enabled = v.trim() != "false"
                 }
-                _ => {}
+                _ => {
+                    // key_new_tab=F2 之类：非法/未知键名直接忽略，保留默认值
+                    if let Some(action) = Action::from_ini_key(k) {
+                        if let Some(chord) = Chord::parse(v.trim()) {
+                            s.keybinds.assign(action, chord);
+                        }
+                    }
+                }
             }
         }
         s
@@ -87,10 +104,13 @@ impl Settings {
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let text = format!(
+        let mut text = format!(
             "highlight={}\nkeepalive_secs={}\nmaster_password_enabled={}\n",
             self.highlight, self.keepalive_secs, self.master_password_enabled
         );
+        for action in Action::ALL {
+            text.push_str(&format!("{}={}\n", action.ini_key(), self.keybinds.display(action)));
+        }
         let _ = std::fs::write(&path, text);
     }
 }
