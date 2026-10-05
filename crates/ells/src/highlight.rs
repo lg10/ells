@@ -116,6 +116,11 @@ pub fn line_colors(text: &str) -> Vec<Option<Color>> {
         return out;
     }
 
+    // docker ps 数据行：按列语义分色（ID / 镜像名 / 版本 / 命令 / 容器名）
+    for ((start, end), color) in docker_ps_spans(&chars) {
+        set(&mut out, start, end, color);
+    }
+
     // 行首时间戳（ISO 或 docker logs 带毫秒）弱化为灰色
     if let Some(len) = timestamp_len(&chars) {
         set(&mut out, 0, len, Color::DarkGray);
@@ -214,6 +219,158 @@ fn find_words(chars: &[char], word: &str) -> Vec<(usize, ())> {
         hits.push((i, ()));
     }
     hits
+}
+
+/// docker ps 的一列：去掉宽字符续格后的字格，以及它们各自的单元格下标。
+struct Field {
+    chars: Vec<char>,
+    cells: Vec<usize>,
+}
+
+impl Field {
+    /// 字格下标区间（左闭右开），可直接喂给逐格着色表。
+    fn range(&self, from: usize, to: usize) -> (usize, usize) {
+        (self.cells[from], self.cells[to - 1] + 1)
+    }
+
+    fn text(&self) -> String {
+        self.chars.iter().collect()
+    }
+}
+
+/// docker ps 数据行的列语义色：**ID 青 / 镜像名 洋红 / 版本（:tag）绿 / 摘要浅蓝 /
+/// 命令与"多久前"弱化灰 / 容器名 黄**。STATUS 与 PORTS 两列刻意整列不涂——那里的
+/// Up·Exited·IPv4 已经各自有更准的词级规则，糊成一片反而盖掉它们。
+///
+/// 判据是"第一个字段正好是 12 位或 64 位十六进制"（docker 的短 ID 与 --no-trunc 全长
+/// ID），所以 git 的 7~8 位短哈希、日志里随便一段十六进制都不会误进这条规则。
+fn docker_ps_spans(chars: &[char]) -> Vec<((usize, usize), Color)> {
+    let fields = split_fields(chars);
+    let Some(id) = fields.first() else { return Vec::new() };
+    if !is_container_id(&id.text()) {
+        return Vec::new();
+    }
+    let mut spans = vec![(id.range(0, id.chars.len()), Color::Cyan)];
+    for (i, f) in fields.iter().enumerate().skip(1) {
+        let is_last = i + 1 == fields.len();
+        let text = f.text();
+        if i == 1 {
+            // 第二列固定是 IMAGE（--format 改了顺序也只会得到"看着像镜像名"的分色）
+            spans.extend(image_spans(f));
+            continue;
+        }
+        if text.starts_with('"') || is_ago(&text) {
+            spans.push((f.range(0, f.chars.len()), Color::DarkGray));
+        } else if is_last && is_container_name(&text) {
+            spans.push((f.range(0, f.chars.len()), Color::Yellow));
+        }
+    }
+    spans
+}
+
+/// 只认这两个长度：短 ID 12 位、`--no-trunc` 64 位。
+fn is_container_id(text: &str) -> bool {
+    matches!(text.len(), 12 | 64) && text.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+
+fn is_ago(text: &str) -> bool {
+    text.ends_with(" ago") && text.starts_with(|c: char| c.is_ascii_digit())
+}
+
+/// 容器名：含字母（中文容器名也算）、只含名字允许的字符
+/// （`web-1`、`redis`、`app,worker`、`生产-1`）。
+fn is_container_name(text: &str) -> bool {
+    let mut letters = false;
+    for c in text.chars() {
+        if c.is_alphabetic() {
+            letters = true;
+        } else if !c.is_alphanumeric() && !matches!(c, '.' | '_' | '-' | '/' | ',') {
+            return false;
+        }
+    }
+    letters
+}
+
+/// `registry:5000/team/app:1.25` → 仓库名（含带端口的仓地址）洋红 + 版本绿；
+/// `app@sha256:abc…` → 摘要浅蓝。标签只看最后一个 `/` 之后那段，
+/// 否则镜像仓端口号里的冒号会被当成版本分隔。
+fn image_spans(field: &Field) -> Vec<((usize, usize), Color)> {
+    let c = &field.chars;
+    let name_like = |ch: &char| {
+        ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-' | ':' | '@' | '/' | '+')
+    };
+    if c.is_empty() || !c.iter().all(name_like) {
+        return Vec::new();
+    }
+    let digest_at = c.iter().position(|ch| *ch == '@');
+    let body_end = digest_at.unwrap_or(c.len());
+    let seg_start = c[..body_end]
+        .iter()
+        .rposition(|ch| *ch == '/')
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let tag_at = c[seg_start..body_end]
+        .iter()
+        .rposition(|ch| *ch == ':')
+        .map(|i| seg_start + i);
+    let mut spans = Vec::new();
+    match tag_at {
+        Some(i) if i + 1 < body_end => {
+            spans.push((field.range(0, i), Color::Magenta));
+            spans.push((field.range(i + 1, body_end), Color::Green));
+        }
+        _ => spans.push((field.range(0, body_end), Color::Magenta)),
+    }
+    if let Some(d) = digest_at {
+        spans.push((field.range(d, c.len()), Color::LightBlue));
+    }
+    spans
+}
+
+/// 按"连续两个以上空格"切列（docker 用列宽补齐，字段内部的空格只有一个，
+/// 例如 `Up 2 hours`、`"/docker-entrypoint.…"` 不会被切开）。
+fn split_fields(chars: &[char]) -> Vec<Field> {
+    // 宽字符续格只是同一个字的右半边，不参与切列与判定
+    let cells: Vec<(usize, char)> = chars
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| **c != '\0')
+        .map(|(i, c)| (i, *c))
+        .collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < cells.len() {
+        if cells[i].1 == ' ' {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let mut end = i;
+        while i < cells.len() {
+            if cells[i].1 == ' ' {
+                let mut run = 0;
+                while i + run < cells.len() && cells[i + run].1 == ' ' {
+                    run += 1;
+                }
+                if run >= 2 {
+                    i += run;
+                    break;
+                }
+            }
+            i += 1;
+            end = i;
+        }
+        // 行尾只剩一个空格时它会被当作字段内空格收进来，判定前得去掉
+        let mut stop = end;
+        while stop > start && cells[stop - 1].1 == ' ' {
+            stop -= 1;
+        }
+        out.push(Field {
+            chars: cells[start..stop].iter().map(|(_, c)| *c).collect(),
+            cells: cells[start..stop].iter().map(|(i, _)| *i).collect(),
+        });
+    }
+    out
 }
 
 /// 匹配 `2026-10-04`、`2026-10-04 12:34:56`、`2026-10-04T12:34:56.789Z` 前缀。
@@ -397,5 +554,72 @@ mod tests {
         let text = "abc45% done";
         let c = colored(text);
         assert_eq!(c[text.find('4').unwrap()], None);
+    }
+
+    #[test]
+    fn docker_ps_row_colors_each_column_by_role() {
+        let text = "a1b2c3d4e5f6   nginx:1.25   \"/docker-entrypoint.sh\"   3 days ago   Up 2 hours   80/tcp   web";
+        let c = colored(text);
+        // ID 整列青色，列间空白保持原色
+        assert_eq!(c[0], Some(Color::Cyan));
+        assert_eq!(c[11], Some(Color::Cyan));
+        assert_eq!(c[12], None);
+        // 镜像名与版本号分开
+        assert_eq!(c[text.find("nginx").unwrap()], Some(Color::Magenta));
+        assert_eq!(c[text.find("1.25").unwrap()], Some(Color::Green));
+        assert_eq!(c[text.find("1.25").unwrap() + 2], Some(Color::Green));
+        // 命令与"多久前"弱化；容器名黄
+        assert_eq!(c[text.find("\"/docker").unwrap()], Some(Color::DarkGray));
+        assert_eq!(c[text.find("3 days ago").unwrap()], Some(Color::DarkGray));
+        assert_eq!(c[text.find("web").unwrap()], Some(Color::Yellow));
+        // STATUS/PORTS 两列不整列涂色：Up 仍由词规则给绿，其余格子不动
+        assert_eq!(c[text.find("Up").unwrap()], Some(Color::Green));
+        assert_eq!(c[text.find("hours").unwrap()], None);
+        assert_eq!(c[text.find("80/tcp").unwrap()], None);
+    }
+
+    #[test]
+    fn docker_ps_image_registry_port_is_not_a_tag() {
+        let text = "deadbeefcafe   registry.example.com:5000/team/app:2.1@sha256:abcdef0123456789   \"node\"   1 hour ago   Up 5 minutes   web";
+        let c = colored(text);
+        // 仓地址里的端口冒号不能被当成"版本分隔"
+        assert_eq!(c[text.find(":5000").unwrap()], Some(Color::Magenta));
+        assert_eq!(c[text.find("5000").unwrap()], Some(Color::Magenta));
+        assert_eq!(c[text.find("2.1").unwrap()], Some(Color::Green));
+        assert_eq!(c[text.find("@sha256").unwrap()], Some(Color::LightBlue));
+        assert_eq!(c[text.find("abcdef0123456789").unwrap()], Some(Color::LightBlue));
+    }
+
+    #[test]
+    fn docker_ps_name_column_survives_a_single_trailing_space() {
+        // 屏幕行总会被补满空格，只剩一个时它是"字段内空格"，判定前必须剪掉
+        let text = "a1b2c3d4e5f6   nginx   \"sh\"   web ";
+        let c = colored(text);
+        assert_eq!(c[text.find("web").unwrap()], Some(Color::Yellow));
+        assert_eq!(c[text.len() - 1], None);
+    }
+
+    #[test]
+    fn docker_ps_handles_cjk_names_with_continuation_cells() {
+        // 宽字符续格在传入文本里是 '\0'：它既不是列分隔符，也不该挡住列判定
+        let head = "a1b2c3d4e5f6   nginx:1   \"sh\"   ";
+        let at = head.chars().count();
+        let text = format!("{head}生\0产-1");
+        let c = colored(&text);
+        assert_eq!(c[at], Some(Color::Yellow));
+        assert_eq!(c[at + 1], Some(Color::Yellow), "续格一并着色，渲染时会跳过");
+        assert_eq!(c[at + 3], Some(Color::Yellow));
+    }
+
+    #[test]
+    fn only_leading_container_ids_trigger_the_row_rule() {
+        // git 的 7 位短哈希、句子中间的十六进制都不该进这条规则
+        let c = colored("f3a1b9c chore: 清理临时件");
+        assert!(c.iter().all(|x| x.is_none()));
+        let c = colored("rebase onto a1b2c3d4e5f6 now");
+        assert!(c.iter().all(|x| x.is_none()));
+        // 大写十六进制（docker 不用）同样不算
+        let c = colored("A1B2C3D4E5F6   nginx:1   \"sh\"   web");
+        assert_eq!(c[0], None);
     }
 }

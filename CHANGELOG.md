@@ -9,6 +9,17 @@ English summary lives in each GitHub Release note; this file is the full history
 发版流程：把下面的 `[未发布 / Unreleased]` 小节改名为 `[x.y.z] - 日期`，再打 tag。
 CI 的 release 作业会按 tag 从本文件截取对应小节，作为 GitHub Release 说明。
 
+## [未发布 / Unreleased]
+
+### 变更
+- **`docker ps` 改成按列分色**：容器 ID 青、镜像名洋红、`:版本标签` 绿、镜像摘要
+  （`@sha256:…`）浅蓝、COMMAND 与 "3 days ago" 弱化成灰、NAMES 黄。STATUS 与 PORTS
+  两列刻意整列不动——那里的 `Up`/`Exited`/`Restarting`/IPv4 各自已有更准的词级颜色，
+  糊成一片反而会盖掉它们。判据是"行首正好是一段 12 位（或 `--no-trunc` 的 64 位）小写
+  十六进制 ID"，因此 git 的 7~8 位短哈希、日志里随便一段十六进制都不会被误染；镜像的
+  版本分隔只看最后一个 `/` 之后的冒号，所以 `registry.corp.com:5000/pay/app:2.1` 里
+  端口号不会被当成版本。
+
 ## [0.1.6] - 2026-10-06
 
 ### 新增
