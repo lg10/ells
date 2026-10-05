@@ -11,6 +11,10 @@ CI 的 release 作业会按 tag 从本文件截取对应小节，作为 GitHub R
 
 ## [未发布 / Unreleased]
 
+（暂无）
+
+## [0.1.4] - 2026-10-05
+
 ### 新增
 - **主机密钥校验（TOFU）**：首次连接时确认并记录到 `~/.ells/known_hosts`
   （OpenSSH 兼容格式，同时读 `~/.ssh/known_hosts` 里已有的记录），之后密钥变化会
