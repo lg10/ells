@@ -1296,27 +1296,44 @@ pub fn session_emu_rect(area: Rect) -> Rect {
 pub const HEADER_ROWS: u16 = 4;
 /// 标签条在标题栏里的行号（0 起）。第 0 行留给模式行和官网徽章。
 pub const TAB_ROW: u16 = 1;
-/// 一个标签占的列宽（含左右空格）。
-const TAB_CELL: u16 = 14;
+/// 标签名最多占多少列（CJK 按 2 列算），超出截断。
+const TAB_TITLE_MAX: usize = 12;
+/// 相邻标签之间的分隔条宽度。这一列不属于任何标签，点它不切标签。
+const TAB_GAP: u16 = 1;
+/// 标签最短列宽，保证单字符别名也点得中。
+const TAB_MIN: u16 = 6;
 
-/// 标签条几何：绘制与鼠标命中必须用同一份定义。
-pub fn tab_rects(area: Rect, count: usize) -> Vec<(usize, Rect)> {
+/// 单个标签的列宽：` 1:标题 `，随标题实际长度走（不再定宽 14，两个标签时不会隔得老远）。
+fn tab_cell_width(idx: usize, title: &str) -> u16 {
+    let label = display_width(&clip_display(title, TAB_TITLE_MAX)) as u16;
+    let num = idx.to_string().len() as u16;
+    (label + num + 3).max(TAB_MIN)
+}
+
+/// 标签条几何：绘制与鼠标命中必须用同一份定义。宽度从左边放不下时起就不再列出后面的标签。
+pub fn tab_rects(area: Rect, titles: &[String]) -> Vec<(usize, Rect)> {
     let y = area.y + TAB_ROW;
-    (0..count)
-        .filter_map(|i| {
-            let x = area.x + 1 + (i as u16) * TAB_CELL;
-            (x + TAB_CELL <= area.x + area.width).then_some((
-                i,
-                Rect { x, y, width: TAB_CELL, height: 1 },
-            ))
-        })
-        .collect()
+    let mut x = area.x + 1;
+    let mut out = Vec::with_capacity(titles.len());
+    for (idx, title) in titles.iter().enumerate() {
+        let width = tab_cell_width(idx, title);
+        if x + width > area.x + area.width {
+            break;
+        }
+        out.push((idx, Rect { x, y, width, height: 1 }));
+        x += width + TAB_GAP;
+    }
+    out
 }
 
 /// 标签条末尾的「+」：新建标签。
-pub fn tab_new_rect(area: Rect, count: usize) -> Rect {
+pub fn tab_new_rect(area: Rect, titles: &[String]) -> Rect {
+    let x = tab_rects(area, titles)
+        .last()
+        .map(|(_, r)| r.right() + TAB_GAP)
+        .unwrap_or(area.x + 1);
     Rect {
-        x: (area.x + 1 + (count as u16) * TAB_CELL).min(area.x + area.width.saturating_sub(3)),
+        x: x.min(area.x + area.width.saturating_sub(3)),
         y: area.y + TAB_ROW,
         width: 3,
         height: 1,
@@ -1336,19 +1353,33 @@ fn draw_tab_bar(
         Paragraph::new(Line::from("")).style(Style::default().bg(Color::DarkGray)),
         Rect { x: area.x, y, width: area.width, height: 1 },
     );
-    for (idx, rect) in tab_rects(area, titles.len()) {
-        let title = clip_display(titles.get(idx).map(String::as_str).unwrap_or(""), 9);
-        let style = if idx == active {
+    let rects = tab_rects(area, titles);
+    for (i, (idx, rect)) in rects.iter().enumerate() {
+        let title = clip_display(titles.get(*idx).map(String::as_str).unwrap_or(""), TAB_TITLE_MAX);
+        let style = if *idx == active {
             Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::White).bg(Color::Black)
         };
         f.render_widget(
-            Paragraph::new(Line::from(Span::styled(format!(" {}:{}", idx + 1, title), style))),
-            rect,
+            Paragraph::new(Line::from(Span::styled(
+                format!(" {}:{} ", idx + 1, title),
+                style,
+            ))),
+            *rect,
         );
+        // 分隔条画在两个标签之间那一列上：它不属于任何标签，所以窄标签也不会黏在一起
+        if i + 1 < rects.len() {
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    "│",
+                    Style::default().fg(Color::Black).bg(Color::DarkGray),
+                ))),
+                Rect { x: rect.right(), y, width: TAB_GAP, height: 1 },
+            );
+        }
     }
-    let plus = tab_new_rect(area, titles.len());
+    let plus = tab_new_rect(area, titles);
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             " + ",
@@ -1764,5 +1795,60 @@ fn centered(width: u16, height: u16, area: Rect) -> Rect {
         y: area.y + (area.height - h) / 2,
         width: w,
         height: h,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ts(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn tabs_hug_their_titles_with_one_column_between() {
+        let area = Rect::new(0, 0, 80, 24);
+        let titles = ts(&["web", "db-server"]);
+        let rects = tab_rects(area, &titles);
+        assert_eq!(rects.len(), 2);
+        assert_eq!(rects[0].1.width, tab_cell_width(0, "web"));
+        // 关键就是这一列间隙：过去固定 14 列时两个短标签中间空了 9 列
+        assert_eq!(rects[1].1.x - rects[0].1.right(), TAB_GAP);
+        assert!(rects[0].1.width < TAB_TITLE_MAX as u16);
+        // 「+」紧跟在最后一个标签的分隔条之后
+        assert_eq!(tab_new_rect(area, &titles).x, rects[1].1.right() + TAB_GAP);
+    }
+
+    #[test]
+    fn cell_width_never_clips_what_it_draws() {
+        // 列宽算小了文字会被裁掉；只允许比文字宽（短名字靠 TAB_MIN 兜底多留空格）
+        for title in ["web", "", "生产数据库服务器", &"x".repeat(40)] {
+            let label = clip_display(title, TAB_TITLE_MAX);
+            let drawn = display_width(&format!(" 1:{label} ")) as u16;
+            assert!(
+                tab_cell_width(0, title) >= drawn,
+                "「{title}」列宽 {} 装不下画出的 {} 列",
+                tab_cell_width(0, title),
+                drawn,
+            );
+            if drawn >= TAB_MIN {
+                assert_eq!(tab_cell_width(0, title), drawn, "「{title}」列宽要贴着文字走");
+            }
+        }
+        // 再长的名字也封顶，不会一路把后面的标签挤下屏
+        assert_eq!(tab_cell_width(0, &"x".repeat(40)), tab_cell_width(0, &"y".repeat(300)));
+    }
+
+    #[test]
+    fn narrow_terms_keep_the_gap_and_drop_the_tail() {
+        let titles = ts(&["alpha", "bravo", "charlie"]);
+        let rects = tab_rects(Rect::new(0, 0, 24, 24), &titles);
+        assert_eq!(rects.len(), 2, "第三个放不下就必须整个丢掉");
+        for pair in rects.windows(2) {
+            assert_eq!(pair[1].1.x - pair[0].1.right(), TAB_GAP);
+        }
+        assert!(rects.last().unwrap().1.right() <= 24);
+        assert!(tab_rects(Rect::new(0, 0, 8, 24), &titles).len() < titles.len());
     }
 }

@@ -1364,12 +1364,13 @@ impl App {
     /// 标签条命中测试：列表页/会话页/浏览器页共用第 1 行的同一份几何。
     /// 返回 true 表示这一下已被标签条吃掉，页面自己的命中测试不用再跑。
     fn hit_tab_bar(&mut self, column: u16, row: u16) -> bool {
-        let count = self.slots.len();
-        if hit(ui::tab_new_rect(self.last_area, count), column, row) {
+        // 标签宽度随标题长度走，所以命中测试必须拿同一份标题来算，不能用个数
+        let titles: Vec<String> = self.slots.iter().map(Slot::title).collect();
+        if hit(ui::tab_new_rect(self.last_area, &titles), column, row) {
             self.new_tab();
             return true;
         }
-        if let Some((idx, _)) = ui::tab_rects(self.last_area, count)
+        if let Some((idx, _)) = ui::tab_rects(self.last_area, &titles)
             .into_iter()
             .find(|(_, r)| hit(*r, column, row))
         {
