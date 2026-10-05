@@ -53,6 +53,18 @@ jobs:
           path: target/${{ matrix.target }}/debug/ells${{ matrix.os == 'windows-latest' && '.exe' || '' }}
           if-no-files-found: error
 
+  # workflow 文件里一个重复的映射键会让 GitHub 判定整个文件无效（PyYAML 不报错），
+  # 表现为"零作业、名字是文件路径、立刻失败"的运行——发布就是这么静默没跑的，
+  # 所以这里用严格 loader 把它变成普通测试失败。
+  workflows-lint:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install PyYAML
+        run: sudo apt-get update && sudo apt-get install -y python3-yaml
+      - name: Validate workflow / issue-form YAML
+        run: python3 tools/check-workflow-keys.py .github
+
   # 用 macOS 自带 /bin/sh（GNU bash 3.2）在 LC_ALL=C 下真跑一遍安装 + 卸载：
   # C locale 会复现"展开后紧跟多字节字符被并入变量名"这类老 shell 崩溃
   install-smoke:

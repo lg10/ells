@@ -11,7 +11,14 @@ CI 的 release 作业会按 tag 从本文件截取对应小节，作为 GitHub R
 
 ## [未发布 / Unreleased]
 
-（暂无）
+### 修复
+- 发布流水线：`release.yml` 里重复的 `fail_on_unmatched_files` 键让 GitHub 判定整个
+  workflow 无效，v0.1.4 第一次打 tag 时零作业直接失败、没有产出任何产物。
+
+### 内部
+- CI 新增 `workflows-lint` 作业（`tools/check-workflow-keys.py`）：用会拒绝重复映射键
+  的严格 YAML loader 校验 workflow 与 issue 表单——这类错误在 GitHub 侧是静默失败，
+  必须在本机拦下。
 
 ## [0.1.4] - 2026-10-05
 
