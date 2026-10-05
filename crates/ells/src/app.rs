@@ -1,29 +1,28 @@
 use anyhow::Result;
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+    EnableBracketedPaste, EnableMouseCapture, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
 };
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-use crossterm::{
-    execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen},
-};
+use crossterm::terminal::enable_raw_mode;
+use crossterm::execute;
+use crossterm::terminal::EnterAlternateScreen;
 use ells_core::host::{Auth, Host};
 use ells_core::ssh::RemoteSession;
 use ells_core::vault::{self, VaultKey};
-use ells_core::Vault;
-use ells_transfer::{self, FileEntry, Progress};
+use ells_core::{HostKeyPolicy, HostKeyPrompt, KeyTrust, Vault};
+use ells_transfer::{self, Cancel, FileEntry, Progress};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
 use ratatui::Terminal;
 use russh_sftp::client::SftpSession;
-use std::io::{stdout, Write};
-use std::path::PathBuf;
+use std::io::stdout;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::events::{self, AppEvent};
 use crate::session::{SessionAction, SessionState, TermMode};
 use crate::settings::Settings;
+use crate::term;
 use crate::ui;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,6 +136,50 @@ impl BrowserState {
     }
 }
 
+/// 通用确认弹窗：若干说明行 + 2~3 个按钮，答案用回调送回发起任务。
+/// 主机密钥确认与传输覆盖确认共用它，避免每加一种确认就多一套状态与绘制代码。
+pub struct Choice {
+    pub title: String,
+    pub lines: Vec<String>,
+    pub options: Vec<String>,
+    pub selected: usize,
+    /// 快捷字母（如 y/n）到选项下标的映射
+    pub shortcuts: &'static [(char, usize)],
+    /// 危险态：红色标题（密钥变更这类安全告警）
+    pub danger: bool,
+    /// None = 用户按 Esc 关闭
+    on_pick: Box<dyn FnOnce(Option<usize>) + Send>,
+}
+
+/// 传输目标已存在时的用户决定。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Conflict {
+    Cancel,
+    Rename,
+    Overwrite,
+}
+
+/// 后台传输任务发给 UI 的覆盖确认请求（UI 回答后任务继续）。
+pub struct ConflictPrompt {
+    /// "远端" / "本地"
+    pub location: &'static str,
+    pub name: String,
+    pub target: String,
+    /// 目标已存在内容的大小（未知传 None）
+    pub size: Option<u64>,
+    pub responder: oneshot::Sender<Conflict>,
+}
+
+impl std::fmt::Debug for ConflictPrompt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConflictPrompt")
+            .field("location", &self.location)
+            .field("name", &self.name)
+            .field("target", &self.target)
+            .finish_non_exhaustive()
+    }
+}
+
 pub struct App {
     pub screen: ScreenKind,
     pub unlock: UnlockState,
@@ -180,6 +223,12 @@ pub struct App {
     pub delete_confirm: Option<String>,
     /// 删除确认弹窗聚焦按钮（0=保留 1=删除）。
     pub confirm_index: usize,
+    /// 当前确认弹窗（主机密钥 / 覆盖冲突），同一时刻最多一个。
+    pub choice: Option<Choice>,
+    /// 主机密钥策略：连接任务用它发问，UI 用它的通道回答。
+    hostkey: HostKeyPolicy,
+    /// 本次会话所有传输共享的取消位（Ctrl-C 一次停全部）。
+    cancel: Cancel,
     /// 传输详情弹窗是否打开（顶部聚合进度条触发）。
     pub transfer_popup: bool,
     /// 最近一次绘制的终端区域，用于把鼠标坐标映射到顶部按钮。
@@ -187,6 +236,8 @@ pub struct App {
     pub vault: Vault,
     pub vault_key: Option<VaultKey>,
     pub pending_connect: Option<Host>,
+    /// 后台连接进行中显示的主机标签（连上之后作为会话名使用）。
+    pub connecting_label: Option<String>,
     pub direct_alias: Option<String>,
     pub pending_unlock_action: bool,
     pub status: Option<String>,
@@ -197,28 +248,35 @@ pub struct App {
     event_rx: mpsc::UnboundedReceiver<AppEvent>,
 }
 
-pub async fn run(alias: Option<String>, dev: bool) -> Result<()> {
+pub async fn run(alias: Option<String>, dev: bool, yes: bool) -> Result<()> {
     enable_raw_mode()?;
     let mut out = stdout();
-    execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
+    // 括号粘贴：粘贴整段命令时终端会包上 ESC[200~/201~，ells 据此把它当一次
+    // 粘贴处理，而不是逐字符输入（也避免换行被当成回车立刻执行）。
+    execute!(out, EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(out);
     let mut terminal = Terminal::new(backend)?;
 
     let (tx, rx) = mpsc::unbounded_channel::<AppEvent>();
     events::spawn_input_stream(tx.clone());
 
-    let mut app = App::startup(tx, rx, alias, dev);
+    // 主机密钥发问走 UI 事件环：连接必须在后台任务里跑完，
+    // 否则等待弹窗回答时会把事件环卡死（弹窗没人按键 = 死锁）。
+    let (hkey_tx, mut hkey_rx) = mpsc::unbounded_channel::<HostKeyPrompt>();
+    let forward = tx.clone();
+    tokio::spawn(async move {
+        while let Some(prompt) = hkey_rx.recv().await {
+            if forward.send(AppEvent::HostKey(prompt)).is_err() {
+                return;
+            }
+        }
+    });
+
+    let mut app = App::startup(tx, rx, alias, dev, HostKeyPolicy::new(hkey_tx, yes));
     let result = app.loop_run(&mut terminal).await;
 
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
+    term::restore_terminal();
     terminal.show_cursor()?;
-    // 空标题 = 让终端回落到默认标签名（Windows Terminal/iTerm2 均如此处理）
-    set_term_title("");
     result
 }
 
@@ -228,6 +286,7 @@ impl App {
         rx: mpsc::UnboundedReceiver<AppEvent>,
         alias: Option<String>,
         dev: bool,
+        hostkey: HostKeyPolicy,
     ) -> Self {
         let settings = Settings::load();
         ells_core::ssh::set_keepalive_interval(settings.keepalive_secs);
@@ -273,11 +332,15 @@ impl App {
             mp_busy: false,
             delete_confirm: None,
             confirm_index: 0,
+            choice: None,
+            hostkey,
+            cancel: Cancel::default(),
             transfer_popup: false,
             last_area: Rect::ZERO,
             vault: Vault::default(),
             vault_key: None,
             pending_connect: None,
+            connecting_label: None,
             direct_alias: alias,
             pending_unlock_action: false,
             status: None,
@@ -337,19 +400,14 @@ impl App {
             }
             // Connect only AFTER the "正在连接…" frame is on screen.
             if let Some(host) = self.pending_connect.take() {
-                self.connect(host).await;
-                continue;
+                self.spawn_connect(host);
             }
             let Some(ev) = self.event_rx.recv().await else {
                 break;
             };
             match ev {
                 AppEvent::Key(key) => self.handle_key(key).await,
-                AppEvent::Paste(text) => {
-                    if let Some(s) = &mut self.session {
-                        s.handle_paste(&text);
-                    }
-                }
+                AppEvent::Paste(text) => self.handle_paste(&text),
                 AppEvent::Resize(cols, rows) => {
                     if let Some(s) = &mut self.session {
                         s.handle_resize(cols, rows);
@@ -397,6 +455,9 @@ impl App {
                     self.settings_open = false;
                     self.transfer_popup = false;
                 }
+                AppEvent::HostKey(prompt) => self.ask_host_key(prompt),
+                AppEvent::Connected(res) => self.on_connected(res),
+                AppEvent::Conflict(prompt) => self.ask_conflict(prompt),
                 AppEvent::PickedFile { field, path } => {
                     if self.screen == ScreenKind::Form {
                         if let Some(p) = path {
@@ -503,6 +564,40 @@ impl App {
                     if let Some(pending) = self.pending_zmodem.take() {
                         self.on_zmodem_event(pending);
                     }
+                }
+                AppEvent::PickedUploadDir(path) => {
+                    self.dialog_open = false;
+                    match path {
+                        Some(p) => self.start_upload(PathBuf::from(p)),
+                        None => {
+                            self.status = Some("已取消上传（未选择目录）".to_string());
+                            self.upload_dest = None;
+                        }
+                    }
+                    if let Some(pending) = self.pending_zmodem.take() {
+                        self.on_zmodem_event(pending);
+                    }
+                }
+                AppEvent::PickedSaveDir { entry, path } => {
+                    self.dialog_open = false;
+                    match path {
+                        Some(p) => {
+                            if self.sz_pick_mode {
+                                self.sz_pick_mode = false;
+                                self.screen = ScreenKind::Session;
+                            }
+                            self.start_download_dir(entry, PathBuf::from(p));
+                        }
+                        None => {
+                            self.status = Some("已取消下载（未选择保存目录）".to_string());
+                        }
+                    }
+                    if let Some(pending) = self.pending_zmodem.take() {
+                        self.on_zmodem_event(pending);
+                    }
+                }
+                AppEvent::SftpStarted { label, direction } => {
+                    self.register_transfer(label, direction);
                 }
                 AppEvent::SftpCwd(Ok(dir)) => {
                     self.remote_cwd = dir.clone();
@@ -634,6 +729,11 @@ impl App {
             _ => key,
         };
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        // 确认弹窗（主机密钥 / 覆盖冲突）优先吃掉所有按键：此刻后台任务在等回答
+        if self.choice.is_some() {
+            self.handle_choice_key(&key);
+            return;
+        }
         if self.settings_open {
             self.handle_settings_key(&key);
             return;
@@ -674,6 +774,20 @@ impl App {
 
     /// 顶部按钮行/弹窗的鼠标命中测试。
     fn handle_mouse(&mut self, column: u16, row: u16) {
+        if self.choice.is_some() {
+            let (lines, options) = match &self.choice {
+                Some(c) => (c.lines.len(), c.options.len()),
+                None => (0, 0),
+            };
+            let (_, buttons) = ui::choice_rects(self.last_area, lines, options);
+            if let Some(idx) = buttons.iter().position(|r| hit(*r, column, row)) {
+                self.answer_choice(Some(idx));
+            } else {
+                // 点在面板外：Esc 同义（拒绝），绝不把点击透传到下层页面
+                self.answer_choice(None);
+            }
+            return;
+        }
         if self.settings_open {
             if self.mp_stage != MpStage::Idle {
                 // 改密输入中：鼠标不参与，只认键盘
@@ -799,7 +913,7 @@ impl App {
             None => return,
         };
         if !text.is_empty() {
-            copy_osc52(&text);
+            term::copy_osc52(&text);
             let n = text.chars().count();
             self.status = Some(format!("已复制 {n} 个字符（OSC 52 剪贴板）"));
         }
@@ -1100,22 +1214,43 @@ impl App {
         });
     }
 
+    /// 递归上传整个目录（浏览器 `U`）。
+    fn open_upload_dir_picker(&mut self, dest: String) {
+        if self.sftp.is_none() {
+            return;
+        }
+        self.dialog_open = true;
+        self.upload_dest = Some(dest);
+        let tx = self.event_tx.clone();
+        tokio::spawn(async move {
+            let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+            let path = tokio::task::spawn_blocking(move || {
+                crate::dialog::pick_directory("选择要上传的目录", home)
+            })
+            .await
+            .ok()
+            .flatten();
+            let _ = tx.send(AppEvent::PickedUploadDir(path));
+        });
+    }
+
+    /// 上传本地文件或目录（目录自动走递归上传）。目标目录取 upload_dest，其次当前浏览目录。
     fn start_upload(&mut self, local: PathBuf) {
         let Some(sftp) = self.sftp.clone() else {
-            self.status = Some(format!("上传失败：{local:?} 该连接没有 SFTP 通道"));
+            self.status = Some("上传失败：该连接没有 SFTP 通道".to_string());
             return;
         };
         let Some(name) = local.file_name().map(|s| s.to_string_lossy().into_owned()) else {
             self.status = Some("无法解析所选文件名".to_string());
             return;
         };
-        let dest = self
-            .upload_dest
-            .take()
-            .unwrap_or_else(|| self.browser.path.clone());
-        let remote = ells_transfer::remote_join(&dest, &name);
-        self.register_transfer(name.clone(), "上传");
+        let dest = self.upload_dest.take().unwrap_or_default();
+        if dest.is_empty() {
+            self.status = Some("上传失败：还不知道要传到哪个远端目录".to_string());
+            return;
+        }
         let tx = self.event_tx.clone();
+        let cancel = self.fresh_cancel();
         tokio::spawn(async move {
             let (ptx, mut prx) = mpsc::unbounded_channel::<Progress>();
             let pump_tx = tx.clone();
@@ -1124,24 +1259,18 @@ impl App {
                     let _ = pump_tx.send(AppEvent::SftpProgress(pr));
                 }
             });
-            let res = match ells_transfer::upload(&sftp, &local, remote, ptx).await {
-                Ok(()) => Ok(name),
-                Err(err) => Err((name, format!("{err:#}"))),
-            };
+            let res = run_upload(sftp, local, dest, name, ptx, &tx, &cancel).await;
             let _ = tx.send(AppEvent::SftpDone(res));
             let _ = pump.await;
         });
     }
 
     fn start_download(&mut self, entry: FileEntry) {
-        let dest_dir = dirs::download_dir()
-            .or_else(dirs::home_dir)
-            .unwrap_or_else(|| PathBuf::from("."));
-        let name = entry.name.clone();
-        self.spawn_download(entry, dest_dir, name);
+        let dest_dir = download_home();
+        self.download_to(entry, dest_dir, None, true);
     }
 
-    /// Download to an explicit local path chosen via the system "Save As" dialog.
+    /// 下载到系统「另存为」给出的确切路径：原生对话框自己会问覆盖，不再多问一次。
     fn start_download_to(&mut self, entry: FileEntry, dest: PathBuf) {
         let dest_dir = dest
             .parent()
@@ -1151,15 +1280,29 @@ impl App {
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| entry.name.clone());
-        self.spawn_download(entry, dest_dir, name);
+        self.download_to(entry, dest_dir, Some(name), false);
     }
 
-    fn spawn_download(&mut self, entry: FileEntry, dest_dir: PathBuf, name: String) {
+    /// 下载目录：落到用户选定的目录里（同名子目录存在时问覆盖 / 改名 / 取消）。
+    fn start_download_dir(&mut self, entry: FileEntry, dir: PathBuf) {
+        self.download_to(entry, dir, None, true);
+    }
+
+    fn download_to(
+        &mut self,
+        entry: FileEntry,
+        dest_dir: PathBuf,
+        rename: Option<String>,
+        confirm_overwrite: bool,
+    ) {
         let Some(sftp) = self.sftp.clone() else {
+            self.status = Some("该服务器不支持 SFTP 文件传输".to_string());
             return;
         };
-        self.register_transfer(entry.name.clone(), "下载");
+        let label = entry.name.clone();
+        let name = rename.unwrap_or(label.clone());
         let tx = self.event_tx.clone();
+        let cancel = self.fresh_cancel();
         tokio::spawn(async move {
             let (ptx, mut prx) = mpsc::unbounded_channel::<Progress>();
             let pump_tx = tx.clone();
@@ -1168,21 +1311,14 @@ impl App {
                     let _ = pump_tx.send(AppEvent::SftpProgress(pr));
                 }
             });
-            let res = match ells_transfer::download(&sftp, entry.path, &dest_dir, ptx, &name)
-                .await
-            {
-                Ok(path) => {
-                    let _ = path;
-                    Ok(entry.name)
-                }
-                Err(err) => Err((entry.name, format!("{err:#}"))),
-            };
+            let res = run_download(sftp, entry, dest_dir, name, confirm_overwrite, ptx, &tx, &cancel)
+                .await;
             let _ = tx.send(AppEvent::SftpDone(res));
             let _ = pump.await;
         });
     }
 
-    /// `sz <one-file>`: resolve the remote path and open the native Save As dialog.
+    /// `sz <one-file>`: 远端可能是目录，先问清类型再决定弹「另存为」还是「选择目录」。
     fn open_sz_save_as(&mut self, file: &str, cwd: String) {
         let path = if file.starts_with('/') {
             file.to_string()
@@ -1190,7 +1326,7 @@ impl App {
             ells_transfer::remote_join(&cwd, file)
         };
         let name = path.rsplit('/').next().unwrap_or(&path).to_string();
-        self.open_save_as(FileEntry {
+        self.open_pick_target(FileEntry {
             name,
             path,
             is_dir: false,
@@ -1198,26 +1334,76 @@ impl App {
         });
     }
 
-    fn open_save_as(&mut self, entry: FileEntry) {
-        if self.sftp.is_none() {
+    /// 为一次下载选落点：目录→系统目录选择框，文件→系统另存为。
+    /// 类型未知时（sz 只给了路径）先在后台查一次远端元数据。
+    fn open_pick_target(&mut self, entry: FileEntry) {
+        let Some(sftp) = self.sftp.clone() else {
             self.status = Some("该服务器不支持 SFTP 文件传输".to_string());
             return;
-        }
+        };
         self.dialog_open = true;
         let tx = self.event_tx.clone();
         tokio::spawn(async move {
-            let dir = dirs::download_dir()
-                .or_else(dirs::home_dir)
-                .unwrap_or_else(|| PathBuf::from("."));
+            let mut entry = entry;
+            if entry.size == 0 {
+                if let Ok(Some(meta)) = ells_transfer::remote_meta(&sftp, &entry.path).await {
+                    entry.is_dir = meta.is_dir;
+                    entry.size = meta.size;
+                }
+            }
+            let dir = download_home();
+            let is_dir = entry.is_dir;
             let name = entry.name.clone();
             let path = tokio::task::spawn_blocking(move || {
-                crate::dialog::save_file("保存下载文件", dir, &name)
+                if is_dir {
+                    crate::dialog::pick_directory("选择保存目录", dir)
+                } else {
+                    crate::dialog::save_file("保存下载文件", dir, &name)
+                }
             })
             .await
             .ok()
             .flatten();
-            let _ = tx.send(AppEvent::PickedSave { entry, path });
+            let _ = tx.send(if is_dir {
+                AppEvent::PickedSaveDir { entry, path }
+            } else {
+                AppEvent::PickedSave { entry, path }
+            });
         });
+    }
+
+    fn open_save_as(&mut self, entry: FileEntry) {
+        self.open_pick_target(entry);
+    }
+
+    /// 每次新传输领一个干净的取消位（上一次 Ctrl-C 之后必须还能继续传）。
+    fn fresh_cancel(&mut self) -> Cancel {
+        if self.cancel.is_cancelled() {
+            self.cancel = Cancel::default();
+        }
+        self.cancel.clone()
+    }
+
+    /// Ctrl-C：取消本次会话全部进行中的传输。已写入的部分不会被自动删除。
+    fn cancel_transfers(&mut self) {
+        let active = self
+            .browser
+            .transfers
+            .iter()
+            .filter(|t| !t.done)
+            .count();
+        if active == 0 {
+            self.status = Some("没有进行中的传输（Ctrl-C 用于取消传输）".to_string());
+            return;
+        }
+        // 覆盖确认弹窗挂在那里时先替用户答"取消"，否则任务会一直等
+        if self.choice.is_some() {
+            self.answer_choice(None);
+        }
+        self.cancel.cancel();
+        self.status = Some(format!(
+            "已请求取消 {active} 个传输（已下载的部分文件不会自动删除）"
+        ));
     }
 
     fn register_transfer(&mut self, label: String, direction: &'static str) {
@@ -1430,14 +1616,16 @@ impl App {
                 let path = self.browser.path.clone();
                 self.open_upload_picker(path)
             }
+            KeyCode::Char('U') => {
+                let path = self.browser.path.clone();
+                self.open_upload_dir_picker(path)
+            }
             KeyCode::Char('d') => {
                 if let Some(entry) = self.browser.entries.get(self.browser.selected).cloned() {
-                    if !entry.is_dir {
-                        if self.sz_pick_mode {
-                            self.open_save_as(entry);
-                        } else {
-                            self.start_download(entry);
-                        }
+                    if self.sz_pick_mode || entry.is_dir {
+                        self.open_save_as(entry);
+                    } else {
+                        self.start_download(entry);
                     }
                 }
             }
@@ -1445,7 +1633,7 @@ impl App {
                 let path = self.browser.path.clone();
                 self.start_listing(path);
             }
-            KeyCode::Char('c') if ctrl => {}
+            KeyCode::Char('c') if ctrl => self.cancel_transfers(),
             _ => {
                 let _ = ctrl;
             }
@@ -1623,7 +1811,7 @@ impl App {
             ScreenKind::Browser => "ells-远程文件".to_string(),
         };
         if self.term_title.as_deref() != Some(title.as_str()) {
-            set_term_title(&title);
+            term::set_term_title(&title);
             self.term_title = Some(title);
         }
     }
@@ -1651,17 +1839,33 @@ impl App {
         }
     }
 
-    async fn connect(&mut self, host: Host) {
-        let label = format!("{} · {}", host.alias, host.target());
-        let (cols, rows) = term_size();
+    /// 连接放到后台任务：主机密钥确认要求事件环一直能响应按键。
+    fn spawn_connect(&mut self, host: Host) {
+        self.connecting_label = Some(format!("{} · {}", host.alias, host.target()));
         let vault = self.vault.clone();
-        let result = RemoteSession::connect(&host, &vault, cols, rows.max(2) - 1).await;
-        match result {
+        let policy = self.hostkey.clone();
+        let (cols, rows) = term_size();
+        let tx = self.event_tx.clone();
+        tokio::spawn(async move {
+            let res = RemoteSession::connect(&host, &vault, cols, rows.max(2) - 1, &policy)
+                .await
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(AppEvent::Connected(res));
+        });
+    }
+
+    fn on_connected(&mut self, res: std::result::Result<RemoteSession, String>) {
+        match res {
             Ok(mut session) => {
                 if let Some(rx) = session.take_output() {
                     events::spawn_remote_pump(rx, self.event_tx.clone());
                 }
+                let label = self
+                    .connecting_label
+                    .take()
+                    .unwrap_or_else(|| "会话".to_string());
                 self.sftp = session.sftp();
+                let (cols, rows) = term_size();
                 let state = SessionState::new(label, session, rows, cols);
                 self.session = Some(state);
                 self.screen = ScreenKind::Session;
@@ -1672,11 +1876,157 @@ impl App {
                 // 新连接从零开始：清掉上一个会话的传输记录
                 self.browser.transfers.clear();
                 self.transfer_popup = false;
+                self.cancel = Cancel::default();
                 self.refresh_remote_cwd();
             }
             Err(err) => {
-                self.status = Some(format!("连接失败: {err:#}"));
+                self.connecting_label = None;
+                self.status = Some(format!("连接失败: {err}"));
             }
+        }
+    }
+
+    /// 首次见到 / 密钥变更：把决策交给用户，连接任务在等这把密钥的回答。
+    fn ask_host_key(&mut self, prompt: HostKeyPrompt) {
+        let changed = prompt.trust == KeyTrust::Changed;
+        let lines = vec![
+            format!("主机：{}:{}", prompt.host, prompt.port),
+            format!("算法：{}", prompt.algorithm),
+            format!("指纹：{}", prompt.fingerprint),
+            if changed {
+                "与已记录的密钥不一致：可能是服务器重装，也可能是中间人攻击。请先在服务器侧核对指纹。"
+            } else {
+                "首次连接该主机。请与云控制台或管理员核对指纹后再接受。"
+            }
+            .to_string(),
+        ];
+        let responder = prompt.responder;
+        self.choice = Some(Choice {
+            title: if changed { "主机密钥已变更" } else { "确认主机密钥" }.to_string(),
+            lines,
+            options: if changed {
+                vec!["拒 绝".to_string(), "我已核对，更新记录".to_string()]
+            } else {
+                vec!["拒 绝".to_string(), "接受并记录".to_string()]
+            },
+            // 密钥变更时默认停在"拒绝"；首次连接按 TOFU 默认"接受"
+            selected: if changed { 0 } else { 1 },
+            shortcuts: &[('n', 0), ('y', 1)],
+            danger: changed,
+            on_pick: Box::new(move |idx| {
+                let _ = responder.send(matches!(idx, Some(1)));
+            }),
+        });
+    }
+
+    /// 目标已存在：取消 / 改名保留双方 / 覆盖。默认落在"改名"，不预设丢数据。
+    fn ask_conflict(&mut self, prompt: ConflictPrompt) {
+        let mut lines = vec![
+            format!("文件：{}", prompt.name),
+            format!("目标：{}", prompt.target),
+        ];
+        if let Some(size) = prompt.size {
+            lines.push(format!("已存在：{}", ui::human_size(size)));
+        }
+        lines.push(format!(
+            "覆盖会丢掉原有内容，改名会把两份都留下（{}）。",
+            if prompt.location == "远端" { "远端" } else { "本地" }
+        ));
+        let responder = prompt.responder;
+        self.choice = Some(Choice {
+            title: format!("{}已存在同名文件", prompt.location),
+            lines,
+            options: vec![
+                "取 消".to_string(),
+                "改名保留双方".to_string(),
+                "覆盖原文件".to_string(),
+            ],
+            selected: 1,
+            shortcuts: &[('n', 0), ('r', 1), ('o', 2)],
+            danger: false,
+            on_pick: Box::new(move |idx| {
+                let decision = match idx {
+                    Some(2) => Conflict::Overwrite,
+                    Some(1) => Conflict::Rename,
+                    _ => Conflict::Cancel,
+                };
+                let _ = responder.send(decision);
+            }),
+        });
+    }
+
+    fn answer_choice(&mut self, idx: Option<usize>) {
+        if let Some(choice) = self.choice.take() {
+            (choice.on_pick)(idx);
+        }
+    }
+
+    fn handle_choice_key(&mut self, key: &KeyEvent) {
+        let Some(choice) = &self.choice else {
+            return;
+        };
+        let n = choice.options.len().max(1);
+        let moved = match key.code {
+            KeyCode::Left => Some((choice.selected + n - 1) % n),
+            KeyCode::Right | KeyCode::Tab => Some((choice.selected + 1) % n),
+            _ => None,
+        };
+        if let Some(next) = moved {
+            if let Some(c) = self.choice.as_mut() {
+                c.selected = next;
+            }
+            return;
+        }
+        match key.code {
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                let selected = self.choice.as_ref().map(|c| c.selected).unwrap_or(0);
+                self.answer_choice(Some(selected));
+            }
+            KeyCode::Esc => self.answer_choice(None),
+            KeyCode::Char(c) => {
+                let hit = self
+                    .choice
+                    .as_ref()
+                    .and_then(|ch| ch.shortcuts.iter().find(|(k, _)| *k == c))
+                    .map(|(_, idx)| *idx);
+                if let Some(idx) = hit {
+                    self.answer_choice(Some(idx));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// 粘贴：会话页原样交给远端（与原生终端一致，换行由远端 shell 处理）；
+    /// 表单/解锁页去掉全部控制字符，避免多行粘贴把单行输入框撑成一段乱码。
+    fn handle_paste(&mut self, text: &str) {
+        if self.choice.is_some() {
+            return;
+        }
+        if self.screen == ScreenKind::Session {
+            if !text.is_empty() {
+                if let Some(s) = &mut self.session {
+                    s.handle_paste(text);
+                }
+            }
+            return;
+        }
+        let clean = sanitize_input(text);
+        if clean.is_empty() {
+            return;
+        }
+        match self.screen {
+            ScreenKind::Unlock if !self.unlock.busy => {
+                self.unlock.input.push_str(&clean);
+                self.unlock.error = None;
+            }
+            ScreenKind::Form if self.form.footer.is_none() => {
+                if let Some(field) = self.form.fields.get_mut(self.form.focus) {
+                    field.value.push_str(&clean);
+                }
+                self.form.error = None;
+            }
+            _ => {}
         }
     }
 
@@ -2198,6 +2548,195 @@ impl FormState {
     }
 }
 
+/// 本地默认下载目录（拿不到就落到当前目录）。
+fn download_home() -> PathBuf {
+    dirs::download_dir()
+        .or_else(dirs::home_dir)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// 远端目录里已占用的名字。listing 失败时退化为只含冲突名，仍能选出未占用候选。
+async fn remote_taken(
+    sftp: &SftpSession,
+    dir: &str,
+    fallback: &str,
+) -> std::collections::HashSet<String> {
+    let mut taken: std::collections::HashSet<String> = ells_transfer::list(sftp, dir)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    if taken.is_empty() {
+        taken.insert(fallback.to_string());
+    }
+    taken
+}
+
+/// 本地目录里已占用的名字（语义与 remote_taken 相同）。
+fn local_taken(dir: &Path, fallback: &str) -> std::collections::HashSet<String> {
+    let mut taken = std::collections::HashSet::new();
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for entry in rd.flatten() {
+            if let Some(name) = entry.file_name().to_str() {
+                taken.insert(name.to_string());
+            }
+        }
+    }
+    if taken.is_empty() {
+        taken.insert(fallback.to_string());
+    }
+    taken
+}
+
+/// 目标已存在时把决定交给 UI（取消 / 改名 / 覆盖），返回最终使用的名字；
+/// None = 用户放弃。UI 不回答（比如会话断了）也按放弃处理，绝不默默覆盖。
+async fn ask_overwrite<T: Fn(&str) -> bool>(
+    tx: &mpsc::UnboundedSender<AppEvent>,
+    location: &'static str,
+    name: &str,
+    target: &str,
+    size: Option<u64>,
+    taken: T,
+) -> Option<String> {
+    let (responder, answer) = oneshot::channel();
+    if tx
+        .send(AppEvent::Conflict(ConflictPrompt {
+            location,
+            name: name.to_string(),
+            target: target.to_string(),
+            size,
+            responder,
+        }))
+        .is_err()
+    {
+        return None;
+    }
+    match answer.await.ok()? {
+        Conflict::Cancel => None,
+        Conflict::Overwrite => Some(name.to_string()),
+        Conflict::Rename => Some(ells_transfer::unique_in(name, taken)),
+    }
+}
+
+/// 一次上传（文件或整个目录树）：先问覆盖，再真跑，名字可能因"改名"而变。
+async fn run_upload(
+    sftp: Arc<SftpSession>,
+    local: PathBuf,
+    dest: String,
+    name: String,
+    ptx: mpsc::UnboundedSender<Progress>,
+    tx: &mpsc::UnboundedSender<AppEvent>,
+    cancel: &Cancel,
+) -> std::result::Result<String, (String, String)> {
+    let is_dir = match std::fs::metadata(&local) {
+        Ok(md) => md.is_dir(),
+        Err(err) => {
+            return Err((name, format!("无法读取本地路径 {}：{err}", local.display())));
+        }
+    };
+    let target = ells_transfer::remote_join(&dest, &name);
+    let mut final_name = name.clone();
+    match ells_transfer::remote_meta(&sftp, &target).await {
+        Ok(Some(meta)) => {
+            let taken = remote_taken(&sftp, &dest, &name).await;
+            let chosen =
+                ask_overwrite(tx, "远端", &name, &target, Some(meta.size), |c| {
+                    taken.contains(c)
+                })
+                .await;
+            match chosen {
+                Some(n) => final_name = n,
+                None => {
+                    let msg = format!("已取消上传：{name}");
+                    return Err((name, msg));
+                }
+            }
+        }
+        Ok(None) => {}
+        Err(err) => return Err((name, format!("{err:#}"))),
+    }
+    let _ = tx.send(AppEvent::SftpStarted {
+        label: final_name.clone(),
+        direction: "上传",
+    });
+    let res = if is_dir {
+        ells_transfer::upload_tree(&sftp, &local, &dest, &final_name, ptx, cancel)
+            .await
+            .map(|_| ())
+    } else {
+        let remote = ells_transfer::remote_join(&dest, &final_name);
+        ells_transfer::upload(&sftp, &local, remote, ptx, cancel).await
+    };
+    match res {
+        Ok(()) => Ok(final_name),
+        Err(err) => Err((final_name, format!("{err:#}"))),
+    }
+}
+
+/// 一次下载（文件或整个目录树）。`confirm_overwrite` = false 用于系统另存为
+/// （原生对话框自己已经问过覆盖，不能再问一遍）。
+async fn run_download(
+    sftp: Arc<SftpSession>,
+    entry: FileEntry,
+    dest_dir: PathBuf,
+    name: String,
+    confirm_overwrite: bool,
+    ptx: mpsc::UnboundedSender<Progress>,
+    tx: &mpsc::UnboundedSender<AppEvent>,
+    cancel: &Cancel,
+) -> std::result::Result<String, (String, String)> {
+    let label = entry.name.clone();
+    // 类型以服务器为准：sz 只给了路径，浏览器条目的 is_dir 可能已经过期
+    let is_dir = match ells_transfer::remote_meta(&sftp, &entry.path).await {
+        Ok(Some(meta)) => meta.is_dir,
+        _ => entry.is_dir,
+    };
+    let mut final_name = name.clone();
+    let target = dest_dir.join(&name);
+    if confirm_overwrite && ells_transfer::local_exists(&target) {
+        let size = std::fs::metadata(&target)
+            .ok()
+            .filter(|m| m.is_file())
+            .map(|m| m.len());
+        let shown = target.display().to_string();
+        let taken = local_taken(&dest_dir, &name);
+        let chosen =
+            ask_overwrite(tx, "本地", &name, &shown, size, |c| taken.contains(c)).await;
+        match chosen {
+            Some(n) => final_name = n,
+            None => {
+                let msg = format!("已取消下载：{label}");
+                return Err((label, msg));
+            }
+        }
+    }
+    let _ = tx.send(AppEvent::SftpStarted {
+        label: final_name.clone(),
+        direction: "下载",
+    });
+    let res = if is_dir {
+        ells_transfer::download_tree(&sftp, &entry.path, &dest_dir, &final_name, ptx, cancel)
+            .await
+            .map(|_| ())
+    } else {
+        ells_transfer::download(
+            &sftp,
+            entry.path.clone(),
+            &dest_dir,
+            ptx,
+            &final_name,
+            cancel,
+        )
+        .await
+        .map(|_| ())
+    };
+    match res {
+        Ok(()) => Ok(final_name),
+        Err(err) => Err((final_name, format!("{err:#}"))),
+    }
+}
+
 fn term_size() -> (u16, u16) {
     crossterm::terminal::size()
         .map(|(c, r)| (c as u16, r as u16))
@@ -2231,21 +2770,9 @@ fn cycle_keepalive(cur: u64) -> u64 {
     }
 }
 
-/// 通过 OSC 52 转义序列把文本放进终端模拟器的剪贴板
-/// （Windows Terminal / iTerm2 / kitty 等原生支持，无需系统剪贴板依赖）。
-fn copy_osc52(text: &str) {
-    use base64::Engine as _;
-    let b64 = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
-    let mut out = stdout();
-    let _ = write!(out, "\x1b]52;c;{b64}\x1b\\");
-    let _ = out.flush();
-}
-
-/// OSC 0 设置终端标签页/窗口标题（Windows Terminal、iTerm2、kitty 等均支持）。
-fn set_term_title(title: &str) {
-    let mut out = stdout();
-    let _ = write!(out, "\x1b]0;{title}\x07");
-    let _ = out.flush();
+/// 去掉全部控制字符（含 \r \n \t）：单行输入框只接受可打印内容。
+fn sanitize_input(text: &str) -> String {
+    text.chars().filter(|c| !c.is_control()).collect()
 }
 
 /// 用系统默认浏览器打开 URL（URL 为编译期常量，无注入风险）。

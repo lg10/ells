@@ -3,11 +3,11 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Borders, Clear, Gauge, List, ListItem, ListState as RtListState, Paragraph,
+    Block, Borders, Clear, Gauge, List, ListItem, ListState as RtListState, Paragraph, Wrap,
 };
 use ratatui::Frame;
 
-use crate::app::{App, FieldKind, ScreenKind, UnlockStage};
+use crate::app::{App, Choice, FieldKind, ScreenKind, UnlockStage};
 use crate::session::TermMode;
 
 pub fn draw(f: &mut Frame, app: &mut App) {
@@ -18,6 +18,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         ScreenKind::Form => draw_form(f, app),
         ScreenKind::Session => draw_session(f, app),
         ScreenKind::Browser => draw_browser(f, app),
+    }
+    // 确认弹窗永远盖在最上层：它可能出现在任何页面（连接中 / 传输中）
+    if let Some(choice) = &app.choice {
+        draw_choice(f, choice);
     }
 }
 
@@ -287,6 +291,97 @@ fn draw_delete_confirm(f: &mut Frame, confirm_index: usize, alias: &str) {
     );
 }
 
+/// 确认弹窗几何：面板 + 等宽按钮槽。绘制与鼠标命中测试必须同源，否则点按钮会打偏。
+pub fn choice_rects(area: Rect, lines: usize, options: usize) -> (Rect, Vec<Rect>) {
+    let options = (options as u16).max(1);
+    let panel = centered(62, lines as u16 + 4, area);
+    let slot = panel.width.saturating_sub(2) / options;
+    let buttons = (0..options)
+        .map(|i| Rect {
+            x: panel.x + 1 + slot * i,
+            y: panel.y + panel.height.saturating_sub(3),
+            width: slot,
+            height: 1,
+        })
+        .collect();
+    (panel, buttons)
+}
+
+/// 通用确认弹窗：主机密钥确认与传输覆盖确认共用一套绘制（语义由 Choice 自己带）。
+fn draw_choice(f: &mut Frame, choice: &Choice) {
+    let area = f.area();
+    let (panel, buttons) = choice_rects(area, choice.lines.len(), choice.options.len());
+    f.render_widget(Clear, panel);
+    let danger = choice.danger;
+    let title_color = if danger { Color::Red } else { Color::Cyan };
+    f.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(format!(" {} ", choice.title))
+            .title_style(
+                Style::default()
+                    .fg(title_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        panel,
+    );
+    let inner = Rect {
+        x: panel.x + 1,
+        y: panel.y + 1,
+        width: panel.width.saturating_sub(2),
+        height: panel.height.saturating_sub(4),
+    };
+    let text: Vec<Line> = choice
+        .lines
+        .iter()
+        .map(|l| {
+            Line::from(Span::styled(
+                l.clone(),
+                Style::default().fg(if danger { Color::Yellow } else { Color::Gray }),
+            ))
+        })
+        .collect();
+    f.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), inner);
+    for (i, rect) in buttons.iter().enumerate() {
+        let Some(label) = choice.options.get(i) else {
+            continue;
+        };
+        let selected = i == choice.selected;
+        // 危险弹窗里"让步"的那个选项永远标红，即便焦点不在它上面
+        let accept_risky = danger && i > 0;
+        let style = Style::default()
+            .fg(if selected {
+                Color::Black
+            } else if accept_risky {
+                Color::Red
+            } else {
+                Color::Gray
+            })
+            .bg(if selected { Color::White } else { Color::Reset })
+            .add_modifier(if selected {
+                Modifier::BOLD
+            } else {
+                Modifier::empty()
+            });
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(format!("【 {label} 】"), style))),
+            *rect,
+        );
+    }
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            " ←→/Tab 切换 · Enter 确认 · Esc 取消",
+            Style::default().fg(Color::DarkGray),
+        ))),
+        Rect {
+            x: panel.x + 1,
+            y: panel.y + panel.height.saturating_sub(2),
+            width: panel.width.saturating_sub(2),
+            height: 1,
+        },
+    );
+}
+
 /// 表单面板矩形：n 个输入行 + 错误行 + 空行 + 按钮行 + 2 行提示。
 /// 绘制与鼠标命中测试共用，保证几何一致。
 pub fn form_inner(area: Rect, vis_len: usize) -> Rect {
@@ -469,7 +564,7 @@ fn auth_label(v: &str) -> &'static str {
     }
 }
 
-fn human_size(bytes: u64) -> String {
+pub fn human_size(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut value = bytes as f64;
     let mut unit = 0;

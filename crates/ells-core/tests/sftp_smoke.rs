@@ -2,8 +2,8 @@ use std::time::Duration;
 
 use ells_core::host::{Auth, Host};
 use ells_core::ssh::RemoteSession;
-use ells_core::Vault;
-use ells_transfer::Progress;
+use ells_core::{HostKeyPolicy, Vault};
+use ells_transfer::{Cancel, Progress};
 use rand::{RngCore, SeedableRng};
 use tokio::sync::mpsc;
 
@@ -25,9 +25,15 @@ const SIZE: usize = 256 * 1024; // 262144 bytes
 #[tokio::test]
 #[ignore = "requires fake_sshd with sftp"]
 async fn sftp_smoke() {
-    let mut session = RemoteSession::connect(&test_host(), &Vault::default(), 80, 24)
-        .await
-        .expect("连接 fake sshd 失败");
+    let mut session = RemoteSession::connect(
+        &test_host(),
+        &Vault::default(),
+        80,
+        24,
+        &HostKeyPolicy::trust_all(),
+    )
+    .await
+    .expect("连接 fake sshd 失败");
 
     // 1. SFTP 子系统必须可用
     let sftp = match session.sftp() {
@@ -62,9 +68,10 @@ async fn sftp_smoke() {
     std::fs::write(&src, &data).expect("写入本地随机文件失败");
 
     let (tx, mut rx) = mpsc::unbounded_channel::<Progress>();
+    let cancel = Cancel::default();
     tokio::time::timeout(
         Duration::from_secs(30),
-        ells_transfer::upload(&sftp, &src, "/upload_test.bin".into(), tx.clone()),
+        ells_transfer::upload(&sftp, &src, "/upload_test.bin".into(), tx.clone(), &cancel),
     )
     .await
     .expect("upload 超时")
@@ -102,6 +109,7 @@ async fn sftp_smoke() {
             &dl_dir,
             tx2.clone(),
             "upload_test.bin",
+            &cancel,
         ),
     )
     .await

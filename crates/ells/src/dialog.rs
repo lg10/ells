@@ -23,6 +23,11 @@ pub enum Job {
         file_name: String,
         respond: Sender<Option<String>>,
     },
+    PickDir {
+        title: String,
+        directory: PathBuf,
+        respond: Sender<Option<String>>,
+    },
     Shutdown,
 }
 
@@ -60,6 +65,15 @@ pub fn save_file(title: &str, directory: PathBuf, file_name: &str) -> Option<Str
     )
 }
 
+/// 选择目录（递归上传的源、目录下载的落点）；None = 用户取消。
+pub fn pick_directory(title: &str, directory: PathBuf) -> Option<String> {
+    let (respond, rx) = channel();
+    ask(
+        Job::PickDir { title: title.to_string(), directory, respond },
+        rx,
+    )
+}
+
 /// 通知服务循环退出（`main` 的关闭守卫会调用）。
 pub fn shutdown() {
     if let Some(tx) = JOBS.get() {
@@ -82,6 +96,14 @@ pub fn run_service(rx: Receiver<Job>) {
                     dialog = dialog.add_filter(name, &refs);
                 }
                 let picked = dialog.pick_file().and_then(to_string);
+                let _ = respond.send(picked);
+            }
+            Job::PickDir { title, directory, respond } => {
+                let mut dialog = rfd::FileDialog::new().set_title(&title);
+                if directory.is_dir() {
+                    dialog = dialog.set_directory(&directory);
+                }
+                let picked = dialog.pick_folder().and_then(to_string);
                 let _ = respond.send(picked);
             }
             Job::Save { title, directory, file_name, respond } => {

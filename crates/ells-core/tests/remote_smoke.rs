@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use ells_core::host::{Auth, Host};
 use ells_core::ssh::{RemoteEvent, RemoteSession};
-use ells_core::Vault;
+use ells_core::{HostKeyPolicy, Vault};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 fn test_host() -> Host {
@@ -28,9 +28,10 @@ async fn next_data(rx: &mut UnboundedReceiver<RemoteEvent>) -> Option<Vec<u8>> {
 #[tokio::test]
 #[ignore = "requires tests/fake_sshd.py running on 127.0.0.1:2222"]
 async fn remote_shell_roundtrip() {
-    let mut session = RemoteSession::connect(&test_host(), &Vault::default(), 80, 24)
-        .await
-        .expect("connect to fake sshd");
+    let mut session =
+        RemoteSession::connect(&test_host(), &Vault::default(), 80, 24, &HostKeyPolicy::trust_all())
+            .await
+            .expect("connect to fake sshd");
     let mut rx = session.take_output().expect("output rx");
 
     let mut banner = String::new();

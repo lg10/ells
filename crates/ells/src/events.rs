@@ -1,10 +1,12 @@
 use crossterm::event::{Event as CrosstermEvent, KeyEvent, MouseEventKind};
-use ells_core::ssh::RemoteEvent;
+use ells_core::ssh::{RemoteEvent, RemoteSession};
 use ells_core::vault::VaultKey;
-use ells_core::Vault;
+use ells_core::{HostKeyPrompt, Vault};
 use ells_transfer::{FileEntry, Progress};
 use futures::StreamExt;
 use tokio::sync::mpsc;
+
+use crate::app::ConflictPrompt;
 
 #[derive(Debug)]
 pub enum AppEvent {
@@ -21,6 +23,12 @@ pub enum AppEvent {
     MouseScroll { delta: i8 },
     RemoteData(Vec<u8>),
     RemoteClosed,
+    /// 主机密钥待确认：由 UI 弹窗回答，连接任务在等待这个回答。
+    HostKey(HostKeyPrompt),
+    /// 后台连接（含认证与主机密钥确认）结束。
+    Connected(std::result::Result<RemoteSession, String>),
+    /// 传输目标已存在，等用户选择覆盖 / 改名 / 取消。
+    Conflict(ConflictPrompt),
     /// Result of the native file dialog: path selected for a form field
     /// (None when the dialog was cancelled).
     PickedFile { field: usize, path: Option<String> },
@@ -40,6 +48,12 @@ pub enum AppEvent {
     PickedUpload(Option<String>),
     /// Native "Save As" dialog result for a download (sz interception flow).
     PickedSave { entry: FileEntry, path: Option<String> },
+    /// 目录上传：系统目录选择框的结果（递归上传整个目录）。
+    PickedUploadDir(Option<String>),
+    /// 目录下载：本地落点目录（sz 传目录 / 浏览器下载目录）。
+    PickedSaveDir { entry: FileEntry, path: Option<String> },
+    /// 传输通过覆盖确认、真正开跑：UI 这时才登记进度条目。
+    SftpStarted { label: String, direction: &'static str },
     /// Resolved remote home directory for the browser.
     SftpHome(std::result::Result<String, String>),
     /// Directory listing for the browser.

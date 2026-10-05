@@ -333,20 +333,43 @@ fn hex_preview(bytes: &[u8], max: usize) -> String {
     out
 }
 
-/// 真机排障日志：追加写入 %TEMP%\ells-zmodem.log；失败静默忽略，不影响功能。
+/// 真机排障日志：默认完全关闭。设 `ELLS_ZMODEM_LOG=1` 才写
+/// `~/.ells/zmodem.log`（含远端输出的十六进制片段与文件名，属敏感数据，
+/// 不放公共可读的 %TEMP%，也不默认落盘）。失败静默忽略，不影响功能。
 fn zlog(args: &std::fmt::Arguments) {
     use std::fmt::Write as _;
     use std::io::Write as _;
+    if !zlog_enabled() {
+        return;
+    }
     let mut msg = String::new();
     let _ = write!(msg, "{args}");
     let ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    let path = std::env::temp_dir().join("ells-zmodem.log");
+    let Some(path) = zlog_path() else { return };
+    if zlog_oversized(&path) {
+        let _ = std::fs::write(&path, "（日志超过 256KB，已截断重新开始）\n");
+    }
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
         let _ = writeln!(f, "{ms} {msg}");
     }
+}
+
+fn zlog_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("ELLS_ZMODEM_LOG").is_ok_and(|v| !v.is_empty() && v != "0")
+    })
+}
+
+fn zlog_path() -> Option<std::path::PathBuf> {
+    dirs::home_dir().map(|h| h.join(".ells").join("zmodem.log"))
+}
+
+fn zlog_oversized(path: &std::path::Path) -> bool {
+    std::fs::metadata(path).map(|m| m.len() > 256 * 1024).unwrap_or(false)
 }
 
 /// 把一行回显文本解析为命令 token 列表：剥掉常见提示符前缀。

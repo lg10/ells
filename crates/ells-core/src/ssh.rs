@@ -4,6 +4,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 
 use crate::host::{Auth, Host};
+use crate::hostkey::HostKeyPolicy;
 
 /// Events streamed back from the remote SSH channel to the UI.
 #[derive(Debug)]
@@ -37,18 +38,53 @@ pub struct RemoteSession {
     alive: bool,
 }
 
-#[derive(Debug)]
-pub struct Handler;
+// AppEvent 派生了 Debug，因此这里必须可实现；通道本身没有意义且不可打印。
+impl std::fmt::Debug for RemoteSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RemoteSession")
+            .field("sftp", &self.sftp.is_some())
+            .field("alive", &self.alive)
+            .finish_non_exhaustive()
+    }
+}
+
+/// russh 回调：唯一的职责是把主机密钥交给 `HostKeyPolicy` 判定。
+/// 旧的实现无条件 `Ok(true)`，任何中间人都能透明接管连接。
+pub struct Handler {
+    host: String,
+    port: u16,
+    policy: HostKeyPolicy,
+}
+
+impl std::fmt::Debug for Handler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Handler")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Handler {
+    fn new(host: &str, port: u16, policy: &HostKeyPolicy) -> Self {
+        Self {
+            host: host.to_string(),
+            port,
+            policy: policy.clone(),
+        }
+    }
+}
 
 impl russh::client::Handler for Handler {
     type Error = russh::Error;
 
     async fn check_server_key(
         &mut self,
-        _server_public_key: &russh::keys::PublicKeyOrCertificate,
+        server_public_key: &russh::keys::PublicKeyOrCertificate,
     ) -> std::result::Result<bool, Self::Error> {
-        // M1: blind accept. TOFU fingerprint prompt lands with M2 UI polish.
-        Ok(true)
+        let key = server_public_key.public_key();
+        // 拒绝 = russh 中断握手；具体原因（首次待确认 / 密钥变更）已由 UI 弹窗告知用户
+        Ok(self.policy.verify(&self.host, self.port, &key).await)
     }
 }
 
@@ -58,9 +94,10 @@ impl RemoteSession {
         vault: &crate::Vault,
         cols: u16,
         rows: u16,
+        policy: &HostKeyPolicy,
     ) -> Result<Self> {
         let mut visited = Vec::new();
-        let handle = connect_handle(host, vault, &mut visited).await?;
+        let handle = connect_handle(host, vault, &mut visited, policy).await?;
 
         // Open the SFTP subsystem first; a server without it must not block
         // the shell session.
@@ -187,6 +224,7 @@ fn connect_handle<'a>(
     host: &'a Host,
     vault: &'a crate::Vault,
     visited: &'a mut Vec<String>,
+    policy: &'a HostKeyPolicy,
 ) -> std::pin::Pin<
     Box<dyn std::future::Future<Output = Result<russh::client::Handle<Handler>>> + Send + 'a>,
 > {
@@ -204,13 +242,14 @@ fn connect_handle<'a>(
             keepalive_max: 3,
             ..Default::default()
         });
+        let handler = Handler::new(&host.hostname, host.port, policy);
         let mut handle = match host.jump.as_deref() {
             Some(alias) => {
                 let jump_host = vault
                     .find(alias)
                     .with_context(|| format!("找不到跳板机别名 `{alias}`"))?
                     .clone();
-                let jump_handle = connect_handle(&jump_host, vault, visited).await?;
+                let jump_handle = connect_handle(&jump_host, vault, visited, policy).await?;
                 let channel = jump_handle
                     .channel_open_direct_tcpip(
                         host.hostname.as_str(),
@@ -225,19 +264,34 @@ fn connect_handle<'a>(
                             host.hostname, host.port
                         )
                     })?;
-                russh::client::connect_stream(config, channel.into_stream(), Handler)
+                russh::client::connect_stream(config, channel.into_stream(), handler)
                     .await
                     .with_context(|| {
                         format!("无法经跳板机与 {}:{} 建立 SSH", host.hostname, host.port)
                     })?
             }
-            None => russh::client::connect(config, (host.hostname.as_str(), host.port), Handler)
+            None => russh::client::connect(config, (host.hostname.as_str(), host.port), handler)
                 .await
                 .with_context(|| format!("无法连接 {}:{}", host.hostname, host.port))?,
         };
         authenticate(&mut handle, host).await?;
         Ok(handle)
     })
+}
+
+/// RSA 密钥要用哪种哈希：跟随服务器 `server-sig-algs` 协商结果。
+/// 固定 `None`（即 ssh-rsa/SHA1）在 OpenSSH 8.8+ 上会被直接拒登。
+async fn rsa_hash(
+    handle: &russh::client::Handle<Handler>,
+    algorithm: russh::keys::Algorithm,
+) -> Option<russh::keys::HashAlg> {
+    if !matches!(algorithm, russh::keys::Algorithm::Rsa { .. }) {
+        return None;
+    }
+    match handle.best_supported_rsa_hash().await {
+        Ok(Some(hash)) => hash,
+        _ => None,
+    }
 }
 
 async fn authenticate(handle: &mut russh::client::Handle<Handler>, host: &Host) -> Result<()> {
@@ -278,18 +332,79 @@ async fn authenticate(handle: &mut russh::client::Handle<Handler>, host: &Host) 
                         .with_context(|| format!("无法加载私钥 {}", expanded)),
                 }
             };
-            let key = russh::keys::PrivateKeyWithHashAlg::new(std::sync::Arc::new(key), None);
+            let hash = rsa_hash(handle, key.algorithm()).await;
+            let key = russh::keys::PrivateKeyWithHashAlg::new(std::sync::Arc::new(key), hash);
             let result = handle
                 .authenticate_publickey(&host.user, key)
                 .await
                 .map_err(|e| anyhow!("密钥认证失败: {e}"))?;
             describe(result, "密钥")
         }
-        Auth::Agent => Err(anyhow!(
-            "该主机的「认证方式」被存成了 ssh-agent（此方式尚未实现，与跳板机无关）。\
-             请返回后按 e 编辑该主机，用 ←/→ 把认证方式改为「密钥」或「密码」再保存"
-        )),
+        Auth::Agent => authenticate_agent(handle, host).await,
     }
+}
+
+/// ssh-agent / Pageant 认证：把签名外包给 agent，ells 进程不接触私钥。
+async fn authenticate_agent(handle: &mut russh::client::Handle<Handler>, host: &Host) -> Result<()> {
+    use russh::keys::agent::client::AgentClient;
+
+    let mut client: AgentClient<Box<dyn russh::keys::agent::client::AgentStream + Send + Unpin>> =
+        connect_agent().await?;
+    let identities = client
+        .request_identities()
+        .await
+        .map_err(|e| anyhow!("向 ssh-agent 查询密钥失败: {e}"))?;
+    if identities.is_empty() {
+        bail!("ssh-agent 里没有任何密钥（先用 ssh-add 加入密钥再试）");
+    }
+    let mut last = None;
+    for identity in identities {
+        let public = identity.public_key().as_ref().clone();
+        let hash = rsa_hash(handle, public.algorithm()).await;
+        let result = handle
+            .authenticate_publickey_with(&host.user, public, hash, &mut client)
+            .await
+            .map_err(|e| anyhow!("ssh-agent 认证失败: {e}"))?;
+        match result {
+            russh::client::AuthResult::Success => return Ok(()),
+            failure @ russh::client::AuthResult::Failure { .. } => last = Some(failure),
+        }
+    }
+    describe(last.expect("agent 至少提供了一把密钥"), "ssh-agent")
+}
+
+/// 按平台连接可用的 agent：Windows 先试 OpenSSH 命名管道再试 Pageant，
+/// Unix/macOS 走 SSH_AUTH_SOCK。
+#[cfg(unix)]
+async fn connect_agent(
+) -> Result<russh::keys::agent::client::AgentClient<Box<dyn russh::keys::agent::client::AgentStream + Send + Unpin>>>
+{
+    use russh::keys::agent::client::AgentClient;
+    let client = AgentClient::connect_env()
+        .await
+        .map_err(|e| anyhow!("连不上 ssh-agent（SSH_AUTH_SOCK 未设置或已失效）: {e}"))?;
+    Ok(client.dynamic())
+}
+
+#[cfg(windows)]
+async fn connect_agent(
+) -> Result<russh::keys::agent::client::AgentClient<Box<dyn russh::keys::agent::client::AgentStream + Send + Unpin>>>
+{
+    use russh::keys::agent::client::AgentClient;
+    if let Ok(client) = AgentClient::connect_named_pipe(r"\\.\pipe\openssh-ssh-agent").await {
+        return Ok(client.dynamic());
+    }
+    let client = AgentClient::connect_pageant()
+        .await
+        .map_err(|e| anyhow!("连不上 ssh-agent / Pageant（请确认 ssh-agent 服务或 Pageant 正在运行）: {e}"))?;
+    Ok(client.dynamic())
+}
+
+#[cfg(not(any(unix, windows)))]
+async fn connect_agent(
+) -> Result<russh::keys::agent::client::AgentClient<Box<dyn russh::keys::agent::client::AgentStream + Send + Unpin>>>
+{
+    bail!("此平台不支持 ssh-agent 认证")
 }
 
 fn describe(result: russh::client::AuthResult, method: &str) -> Result<()> {
@@ -323,6 +438,7 @@ fn expand_tilde(path: &str) -> String {
 fn decrypt_des3_pem(pem: &str, passphrase: &str) -> Result<Vec<u8>> {
     use cbc::cipher::{BlockDecryptMut, KeyIvInit, block_padding::Pkcs7};
     use md5::Digest;
+    use zeroize::{Zeroize, Zeroizing};
 
     let iv_hex = pem
         .lines()
@@ -368,9 +484,11 @@ fn decrypt_des3_pem(pem: &str, passphrase: &str) -> Result<Vec<u8>> {
 
     let cipher = cbc::Decryptor::<des::TdesEde3>::new_from_slices(&dk, &iv)
         .map_err(|e| anyhow!("3DES 初始化失败: {e}"))?;
+    dk.zeroize();
     let n = ct.len();
     anyhow::ensure!(n > 0 && n % 8 == 0, "私钥密文长度异常");
-    let mut buf = ct;
+    // Zeroizing：明文私钥在 drop 时清零，不留在校堆内存里等 GC/交换
+    let mut buf = Zeroizing::new(ct);
     let len = cipher
         .decrypt_padded_mut::<Pkcs7>(&mut buf)
         .map_err(|_| anyhow!("3DES 解密失败（口令可能不正确）"))?
