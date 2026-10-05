@@ -290,6 +290,7 @@ impl App {
             let mut app = base;
             app.vault = vault::load_dev_vault().unwrap_or_default();
             app.status = Some("开发模式：读取 ~/.ells/hosts.dev.toml".to_string());
+            app.pending_unlock_action = true;
             return app;
         }
         let stage = if vault::vault_exists() {
@@ -325,6 +326,10 @@ impl App {
     ) -> Result<()> {
         while !self.done {
             self.sync_term_title();
+            // `ells <别名>` / `s <别名>`：保险库就绪后一次性直连，不停在主机列表
+            if std::mem::take(&mut self.pending_unlock_action) {
+                self.try_direct_connect();
+            }
             let passthrough = self.screen == ScreenKind::Session
                 && self.session.as_ref().map(|s| s.mode) == Some(TermMode::Passthrough);
             if !passthrough {
@@ -1518,18 +1523,6 @@ impl App {
     }
 
     fn handle_list_key(&mut self, key: &KeyEvent, ctrl: bool) {
-        // One-shot: after unlocking, honour `ells <alias>` direct connect.
-        if std::mem::take(&mut self.pending_unlock_action) {
-            if let Some(alias) = self.direct_alias.clone() {
-                if let Some(host) = self.vault.find(&alias).cloned() {
-                    self.start_connect(host);
-                    return;
-                }
-                self.status = Some(format!("找不到别名为 `{alias}` 的主机"));
-            }
-            self.direct_alias = None;
-        }
-
         let len = self.vault.hosts.len();
         match key.code {
             KeyCode::Esc => self.done = true,
@@ -1638,6 +1631,24 @@ impl App {
     fn start_connect(&mut self, host: Host) {
         self.status = Some(format!("正在连接 {}…", host.alias));
         self.pending_connect = Some(host);
+    }
+
+    /// `ells <别名>` / `s <别名>`：解锁后按别名直连，只尝试一次。
+    fn try_direct_connect(&mut self) {
+        let Some(alias) = self.direct_alias.take() else {
+            return;
+        };
+        let lower = alias.to_lowercase();
+        let host = self
+            .vault
+            .hosts
+            .iter()
+            .find(|h| h.alias == alias || h.alias.to_lowercase() == lower)
+            .cloned();
+        match host {
+            Some(host) => self.start_connect(host),
+            None => self.status = Some(format!("找不到别名为 `{alias}` 的主机")),
+        }
     }
 
     async fn connect(&mut self, host: Host) {
