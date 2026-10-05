@@ -424,7 +424,9 @@ fn describe(result: russh::client::AuthResult, method: &str) -> Result<()> {
     }
 }
 
-fn expand_tilde(path: &str) -> String {
+/// 展开 `~/`：ssh 配置里的 IdentityFile 常带波浪号，落库前必须换成绝对路径，
+/// 否则备份私钥、加载私钥都会去找一个字面叫 `~` 的目录。
+pub fn expand_tilde(path: &str) -> String {
     if let Some(rest) = path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\")) {
         if let Some(home) = dirs::home_dir() {
             return home.join(rest).to_string_lossy().into_owned();

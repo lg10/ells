@@ -180,6 +180,21 @@ impl std::fmt::Debug for ConflictPrompt {
     }
 }
 
+/// 通用文本输入弹窗：远端新建目录 / 重命名 / 会话内搜索共用一套。
+/// 回调在 UI 事件环里执行，只能靠自己捕获的克隆句柄干活（不能碰 App）。
+pub struct Prompt {
+    pub title: String,
+    pub label: &'static str,
+    pub buffer: String,
+    pub error: Option<String>,
+    /// 用于把输入拼成提示（如搜索的 "n 下一个"）；None = 无附加操作
+    pub hint: Option<&'static str>,
+    /// 允许空值提交（搜索框清空 = 取消过滤）
+    pub allow_empty: bool,
+    /// None = 用户取消
+    on_done: Box<dyn FnOnce(Option<String>) + Send>,
+}
+
 pub struct App {
     pub screen: ScreenKind,
     pub unlock: UnlockState,
@@ -225,6 +240,10 @@ pub struct App {
     pub confirm_index: usize,
     /// 当前确认弹窗（主机密钥 / 覆盖冲突），同一时刻最多一个。
     pub choice: Option<Choice>,
+    /// 当前文本输入弹窗（新建目录 / 重命名 / 搜索），同一时刻最多一个。
+    pub prompt: Option<Prompt>,
+    /// 全键位帮助页（? / F1 打开，任意退出键关闭）。
+    pub help_open: bool,
     /// 主机密钥策略：连接任务用它发问，UI 用它的通道回答。
     hostkey: HostKeyPolicy,
     /// 本次会话所有传输共享的取消位（Ctrl-C 一次停全部）。
@@ -333,6 +352,8 @@ impl App {
             delete_confirm: None,
             confirm_index: 0,
             choice: None,
+            prompt: None,
+            help_open: false,
             hostkey,
             cancel: Cancel::default(),
             transfer_popup: false,
@@ -458,6 +479,7 @@ impl App {
                 AppEvent::HostKey(prompt) => self.ask_host_key(prompt),
                 AppEvent::Connected(res) => self.on_connected(res),
                 AppEvent::Conflict(prompt) => self.ask_conflict(prompt),
+                AppEvent::ImportHosts(hosts) => self.import_hosts(hosts),
                 AppEvent::PickedFile { field, path } => {
                     if self.screen == ScreenKind::Form {
                         if let Some(p) = path {
@@ -599,6 +621,17 @@ impl App {
                 AppEvent::SftpStarted { label, direction } => {
                     self.register_transfer(label, direction);
                 }
+                AppEvent::SftpOp(res) => match res {
+                    Ok(msg) => {
+                        self.status = Some(msg);
+                        // 目录内容变了：立刻重扫，否则用户看到的还是旧列表
+                        if self.screen == ScreenKind::Browser && !self.browser.loading {
+                            let path = self.browser.path.clone();
+                            self.start_listing(path);
+                        }
+                    }
+                    Err(err) => self.status = Some(err),
+                },
                 AppEvent::SftpCwd(Ok(dir)) => {
                     self.remote_cwd = dir.clone();
                     if self.rz_pending {
@@ -734,6 +767,22 @@ impl App {
             self.handle_choice_key(&key);
             return;
         }
+        if self.prompt.is_some() {
+            self.handle_prompt_key(&key, ctrl);
+            return;
+        }
+        if self.help_open {
+            // 帮助页是全屏信息层：只认退出键，其余一律不落到下层页面
+            match key.code {
+                KeyCode::Esc
+                | KeyCode::Enter
+                | KeyCode::Char('?')
+                | KeyCode::Char('q')
+                | KeyCode::F(1) => self.help_open = false,
+                _ => {}
+            }
+            return;
+        }
         if self.settings_open {
             self.handle_settings_key(&key);
             return;
@@ -763,6 +812,14 @@ impl App {
             self.open_browser();
             return;
         }
+        // 会话页不能占用 `?`（那是远端的字符），帮助只用 F1；
+        // 直通模式不绘制 ells 界面，此时开帮助只会把按键吞进空气里。
+        if matches!(key.code, KeyCode::F(1))
+            && self.session.as_ref().map(|s| s.mode) != Some(TermMode::Passthrough)
+        {
+            self.help_open = true;
+            return;
+        }
         let action = match &mut self.session {
             Some(s) => s.handle_key(key),
             None => SessionAction::Keep,
@@ -786,6 +843,19 @@ impl App {
                 // 点在面板外：Esc 同义（拒绝），绝不把点击透传到下层页面
                 self.answer_choice(None);
             }
+            return;
+        }
+        if self.prompt.is_some() {
+            // 输入弹窗只认键盘；点面板外 = 取消，绝不把点击透传给下层页面
+            let panel = ui::prompt_rect(self.last_area);
+            if !hit(panel, column, row) {
+                self.answer_prompt(None);
+            }
+            return;
+        }
+        if self.help_open {
+            // 帮助页几乎占满屏幕，无法区分内外：任意按下即关闭，不透传给下层页面
+            self.help_open = false;
             return;
         }
         if self.settings_open {
@@ -1406,6 +1476,118 @@ impl App {
         ));
     }
 
+    /// m：在当前远端目录下新建子目录。
+    fn prompt_mkdir(&mut self) {
+        let Some(sftp) = self.sftp.clone() else {
+            self.status = Some("该服务器不支持 SFTP 文件传输".to_string());
+            return;
+        };
+        let dir = self.browser.path.clone();
+        let tx = self.event_tx.clone();
+        self.prompt = Some(Prompt {
+            title: "新建目录".to_string(),
+            label: "目录名",
+            buffer: String::new(),
+            error: None,
+            hint: None,
+            allow_empty: false,
+            on_done: Box::new(move |name| {
+                let Some(name) = name else { return };
+                let path = ells_transfer::remote_join(&dir, &name);
+                tokio::spawn(async move {
+                    let res = ells_transfer::mkdir(&sftp, &path)
+                        .await
+                        .map(|_| format!("已创建目录 {path}"))
+                        .map_err(|e| format!("{e:#}"));
+                    let _ = tx.send(AppEvent::SftpOp(res));
+                });
+            }),
+        });
+    }
+
+    /// n：重命名选中项（仍在原目录内，改名 = 移到同目录的新名字）。
+    fn prompt_rename(&mut self) {
+        let Some(sftp) = self.sftp.clone() else {
+            self.status = Some("该服务器不支持 SFTP 文件传输".to_string());
+            return;
+        };
+        let Some(entry) = self.browser.entries.get(self.browser.selected).cloned() else {
+            self.status = Some("请先选中要重命名的项".to_string());
+            return;
+        };
+        let parent = ells_transfer::remote_parent(&entry.path);
+        let tx = self.event_tx.clone();
+        self.prompt = Some(Prompt {
+            title: format!("重命名 {}", entry.name),
+            label: "新名字",
+            buffer: entry.name.clone(),
+            error: None,
+            hint: None,
+            allow_empty: false,
+            on_done: Box::new(move |name| {
+                let Some(name) = name else { return };
+                let to = ells_transfer::remote_join(&parent, &name);
+                if to == entry.path {
+                    let _ = tx.send(AppEvent::SftpOp(Ok("名字没变，未做改动".to_string())));
+                    return;
+                }
+                let from = entry.path.clone();
+                tokio::spawn(async move {
+                    let res = ells_transfer::rename(&sftp, &from, &to)
+                        .await
+                        .map(|_| format!("已重命名 {from} → {to}"))
+                        .map_err(|e| format!("{e:#}"));
+                    let _ = tx.send(AppEvent::SftpOp(res));
+                });
+            }),
+        });
+    }
+
+    /// D：删除选中项。目录会递归删除且不可恢复，因此永远先问一次。
+    fn ask_delete_entry(&mut self) {
+        let Some(sftp) = self.sftp.clone() else {
+            self.status = Some("该服务器不支持 SFTP 文件传输".to_string());
+            return;
+        };
+        let Some(entry) = self.browser.entries.get(self.browser.selected).cloned() else {
+            self.status = Some("请先选中要删除的项".to_string());
+            return;
+        };
+        let tx = self.event_tx.clone();
+        let cancel = self.fresh_cancel();
+        self.choice = Some(Choice {
+            title: "删除确认".to_string(),
+            lines: vec![
+                format!("名称：{}", entry.name),
+                format!("路径：{}", entry.path),
+                if entry.is_dir {
+                    "目录会被递归删除，里面的所有内容一起消失。".to_string()
+                } else {
+                    "文件会被删除。".to_string()
+                },
+                "此操作不可恢复。".to_string(),
+            ],
+            options: vec!["取 消".to_string(), "删 除".to_string()],
+            selected: 0,
+            shortcuts: &[('n', 0), ('y', 1)],
+            danger: true,
+            on_pick: Box::new(move |idx| {
+                if !matches!(idx, Some(1)) {
+                    return;
+                }
+                let path = entry.path.clone();
+                let cancel2 = cancel.clone();
+                tokio::spawn(async move {
+                    let res = ells_transfer::remove_tree(&sftp, &path, &cancel2)
+                        .await
+                        .map(|n| format!("已删除 {path}（{n} 项）"))
+                        .map_err(|e| format!("{e:#}"));
+                    let _ = tx.send(AppEvent::SftpOp(res));
+                });
+            }),
+        });
+    }
+
     fn register_transfer(&mut self, label: String, direction: &'static str) {
         // 完成的传输保留在本次会话里（顶部"传输进度 x/x"要统计总数），
         // 只在异常多时裁掉最旧的，防止长会话内存无限增长
@@ -1633,6 +1815,9 @@ impl App {
                 let path = self.browser.path.clone();
                 self.start_listing(path);
             }
+            KeyCode::Char('m') => self.prompt_mkdir(),
+            KeyCode::Char('n') => self.prompt_rename(),
+            KeyCode::Char('D') => self.ask_delete_entry(),
             KeyCode::Char('c') if ctrl => self.cancel_transfers(),
             _ => {
                 let _ = ctrl;
@@ -1710,6 +1895,85 @@ impl App {
         }
     }
 
+    /// i：导入 ~/.ssh/config。只新增库里没有的别名，绝不覆盖用户已经填好密码的主机。
+    fn import_ssh_config(&mut self) {
+        let all = ells_core::sshconfig::load_user_config();
+        if all.is_empty() {
+            self.status = Some("~/.ssh/config 里没有可导入的主机".to_string());
+            return;
+        }
+        let fresh: Vec<Host> = all
+            .into_iter()
+            .filter(|h| !self.vault.hosts.iter().any(|e| e.alias == h.alias))
+            .collect();
+        if fresh.is_empty() {
+            self.status = Some("~/.ssh/config 里的主机都已经在了".to_string());
+            return;
+        }
+        let mut lines: Vec<String> = fresh
+            .iter()
+            .take(8)
+            .map(|h| format!("{} → {}（{}）", h.alias, h.target(), h.auth_label()))
+            .collect();
+        if fresh.len() > 8 {
+            lines.push(format!("…共 {} 台", fresh.len()));
+        }
+        lines.push(String::new());
+        lines.push("密码认证的机器导入后需在「编辑」里补密码。".to_string());
+        let tx = self.event_tx.clone();
+        let count = fresh.len();
+        self.choice = Some(Choice {
+            title: "导入 ~/.ssh/config".to_string(),
+            lines,
+            options: vec!["取 消".to_string(), format!("导 入 {count} 台")],
+            selected: 1,
+            shortcuts: &[('n', 0), ('y', 1)],
+            danger: false,
+            on_pick: Box::new(move |idx| {
+                if matches!(idx, Some(1)) {
+                    let _ = tx.send(AppEvent::ImportHosts(fresh));
+                }
+            }),
+        });
+    }
+
+    fn import_hosts(&mut self, hosts: Vec<Host>) {
+        let mut imported = 0usize;
+        let mut backed_up = 0usize;
+        let mut key_errors = Vec::new();
+        for host in hosts {
+            let mut host = host;
+            let alias = host.alias.clone();
+            match self.backup_key(&mut host) {
+                Ok(copied) => {
+                    backed_up += copied as usize;
+                    self.vault.upsert(host);
+                    imported += 1;
+                }
+                Err(err) => key_errors.push(format!("{alias}: {err}")),
+            }
+            self.list.selected = 0;
+        }
+        if imported > 0 {
+            self.save_vault();
+        }
+        self.status = match key_errors.is_empty() {
+            true => Some(format!(
+                "已导入 {imported} 台主机{}",
+                if backed_up > 0 {
+                    format!("（{backed_up} 把私钥已备份到 ~/.ells/keys）")
+                } else {
+                    String::new()
+                }
+            )),
+            false => Some(format!(
+                "已导入 {imported} 台；{} 台私钥备份失败：{}",
+                key_errors.len(),
+                key_errors.join("；")
+            )),
+        };
+    }
+
     fn handle_list_key(&mut self, key: &KeyEvent, ctrl: bool) {
         let len = self.vault.hosts.len();
         match key.code {
@@ -1745,6 +2009,8 @@ impl App {
                 self.settings_open = true;
                 self.settings_focus = 0;
             }
+            KeyCode::Char('i') => self.import_ssh_config(),
+            KeyCode::Char('?') | KeyCode::F(1) => self.help_open = true,
             KeyCode::Enter => {
                 if let Some(host) = self.vault.hosts.get(self.list.selected).cloned() {
                     self.start_connect(host);
@@ -1994,6 +2260,49 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+
+    fn handle_prompt_key(&mut self, key: &KeyEvent, ctrl: bool) {
+        match key.code {
+            KeyCode::Esc => self.answer_prompt(None),
+            KeyCode::Enter => {
+                let raw = self.prompt.as_ref().map(|p| p.buffer.clone()).unwrap_or_default();
+                let value = raw.trim();
+                let allow_empty = self.prompt.as_ref().is_some_and(|p| p.allow_empty);
+                if value.is_empty() && !allow_empty {
+                    if let Some(p) = self.prompt.as_mut() {
+                        p.error = Some("内容不能为空".to_string());
+                    }
+                    return;
+                }
+                self.answer_prompt(Some(value.to_string()));
+            }
+            KeyCode::Backspace => {
+                if let Some(p) = self.prompt.as_mut() {
+                    p.buffer.pop();
+                    p.error = None;
+                }
+            }
+            KeyCode::Delete => {
+                if let Some(p) = self.prompt.as_mut() {
+                    p.buffer.clear();
+                    p.error = None;
+                }
+            }
+            KeyCode::Char(c) if !ctrl && !c.is_control() => {
+                if let Some(p) = self.prompt.as_mut() {
+                    p.buffer.push(c);
+                    p.error = None;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn answer_prompt(&mut self, value: Option<String>) {
+        if let Some(prompt) = self.prompt.take() {
+            (prompt.on_done)(value);
         }
     }
 

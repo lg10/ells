@@ -1,7 +1,7 @@
 use crossterm::event::{Event as CrosstermEvent, KeyEvent, MouseEventKind};
 use ells_core::ssh::{RemoteEvent, RemoteSession};
 use ells_core::vault::VaultKey;
-use ells_core::{HostKeyPrompt, Vault};
+use ells_core::{Host, HostKeyPrompt, Vault};
 use ells_transfer::{FileEntry, Progress};
 use futures::StreamExt;
 use tokio::sync::mpsc;
@@ -29,6 +29,8 @@ pub enum AppEvent {
     Connected(std::result::Result<RemoteSession, String>),
     /// 传输目标已存在，等用户选择覆盖 / 改名 / 取消。
     Conflict(ConflictPrompt),
+    /// 用户在导入确认框里点了"导入"（空列表 = 取消）。
+    ImportHosts(Vec<Host>),
     /// Result of the native file dialog: path selected for a form field
     /// (None when the dialog was cancelled).
     PickedFile { field: usize, path: Option<String> },
@@ -54,6 +56,8 @@ pub enum AppEvent {
     PickedSaveDir { entry: FileEntry, path: Option<String> },
     /// 传输通过覆盖确认、真正开跑：UI 这时才登记进度条目。
     SftpStarted { label: String, direction: &'static str },
+    /// 远端改名/新建/删除完成（Ok 给状态行文案）。
+    SftpOp(std::result::Result<String, String>),
     /// Resolved remote home directory for the browser.
     SftpHome(std::result::Result<String, String>),
     /// Directory listing for the browser.

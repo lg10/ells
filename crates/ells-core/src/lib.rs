@@ -1,6 +1,7 @@
 pub mod host;
 pub mod hostkey;
 pub mod ssh;
+pub mod sshconfig;
 pub mod vault;
 
 pub use host::{Auth, Host};

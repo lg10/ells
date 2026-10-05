@@ -7,7 +7,7 @@ use ratatui::widgets::{
 };
 use ratatui::Frame;
 
-use crate::app::{App, Choice, FieldKind, ScreenKind, UnlockStage};
+use crate::app::{App, Choice, FieldKind, Prompt, ScreenKind, UnlockStage};
 use crate::session::TermMode;
 
 pub fn draw(f: &mut Frame, app: &mut App) {
@@ -22,6 +22,13 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // 确认弹窗永远盖在最上层：它可能出现在任何页面（连接中 / 传输中）
     if let Some(choice) = &app.choice {
         draw_choice(f, choice);
+    }
+    if let Some(prompt) = &app.prompt {
+        draw_prompt(f, prompt);
+    }
+    // 帮助页在最上层：它由任意页面唤起，且期间不响应其它键位
+    if app.help_open {
+        draw_help(f, app.last_area);
     }
 }
 
@@ -180,7 +187,7 @@ fn draw_list(f: &mut Frame, app: &mut App) {
         );
     }
 
-    let keys = " ↑↓/jk 选择 · Enter 连接 · a 新增 · e 编辑 · d 删除（需确认） · s 设置 · q 退出 ";
+    let keys = " ↑↓ 选择 · Enter 连接 · a 新增 · e 编辑 · d 删除 · i 导入 · s 设置 · ? 帮助 · q 退出 ";
     f.render_widget(
         Paragraph::new(keys).style(Style::default().fg(Color::DarkGray)),
         chunks[1],
@@ -288,6 +295,120 @@ fn draw_delete_confirm(f: &mut Frame, confirm_index: usize, alias: &str) {
             Style::default().fg(Color::DarkGray),
         ))),
         Rect { x: inner_x, y: panel.y + panel.height.saturating_sub(2), width: inner_w, height: 1 },
+    );
+}
+
+/// 帮助页：分区块列出全部键位。内容是编译期常量，宽度不够时自动换行。
+fn draw_help(f: &mut Frame, area: Rect) {
+    let panel = centered(area.width.saturating_sub(2), area.height.saturating_sub(2), area);
+    f.render_widget(Clear, panel);
+    f.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" ells 快捷键 ")
+            .title_style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        panel,
+    );
+    let sections: [(&str, &str); 7] = [
+        ("主机列表", "↑↓/jk 选择 · Enter 连接 · a 新增 · e 编辑 · d 删除（二次确认）· s 设置 · i 导入 ~/.ssh/config · ?/F1 帮助 · q/Ctrl-C 退出"),
+        ("会话终端", "直接打字即发往远端 · Ctrl-S 文件浏览器 · Ctrl-Q 内嵌/直通 · Ctrl-] 断开返回列表 · Ctrl-L 整屏重绘 · 滚轮回看 · 拖选复制（OSC 52）· / 搜索历史 · F1 帮助"),
+        ("文件浏览器", "↑↓/滚轮 选择 · Enter 进入目录或下载 · u 上传文件 · U 上传整个目录 · d 下载 · m 新建目录 · n 重命名 · D 删除（递归，先确认）· Ctrl-C 取消全部在途传输 · r 刷新 · Backspace 上级 · Esc 返回终端"),
+        ("主机表单", "Tab/↓ 下一个字段 · ↑ 上一个 · ←→ 切换认证方式 · Ctrl-F 选私钥 · Ctrl-J 选跳板机 · Ctrl-C 清空当前字段 · Enter 在\"私钥路径/跳板机\"上直接打开选择器，保存要点【保 存】或聚焦后回车"),
+        ("解锁保险库", "输入主密码后回车；首次使用会要求输入两遍。主密码不可找回，忘记只能删除 ~/.ells/vault.bin 重来。"),
+        ("确认弹窗", "←→/Tab 切换选项 · Enter 确认 · Esc 取消。传输冲突默认停在\"改名保留双方\"；主机密钥变更默认停在\"拒绝\"。"),
+        ("命令行", "ells 打开列表；ells <别名> 直连；ells --dev 读 ~/.ells/hosts.dev.toml；ells -y 首次主机密钥自动接受（密钥变更仍然拒绝）。配置在 ~/.ells/。"),
+    ];
+    let mut lines: Vec<Line> = Vec::new();
+    for (title, body) in sections {
+        lines.push(Line::from(Span::styled(
+            format!("【{title}】"),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(Span::styled(
+            body.to_string(),
+            Style::default().fg(Color::Gray),
+        )));
+        lines.push(Line::from(""));
+    }
+    lines.push(Line::from(Span::styled(
+        " Esc / q / ? / F1 关闭",
+        Style::default().fg(Color::DarkGray),
+    )));
+    f.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }),
+        Rect {
+            x: panel.x + 1,
+            y: panel.y + 1,
+            width: panel.width.saturating_sub(2),
+            height: panel.height.saturating_sub(2),
+        },
+    );
+}
+
+/// 文本输入弹窗面板矩形（绘制与鼠标命中测试共用）。
+pub fn prompt_rect(area: Rect) -> Rect {
+    centered(56, 5, area)
+}
+
+/// 通用文本输入弹窗：远端新建目录 / 重命名 / 会话内搜索共用。
+fn draw_prompt(f: &mut Frame, prompt: &Prompt) {
+    let panel = prompt_rect(f.area());
+    f.render_widget(Clear, panel);
+    f.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(format!(" {} ", prompt.title))
+            .title_style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        panel,
+    );
+    let inner_x = panel.x + 1;
+    let inner_w = panel.width.saturating_sub(2);
+    let prefix = format!("{}：", prompt.label);
+    // 输入超过一行宽度时保留尾部（用户在改文件名时关心的是后半段）
+    let room = inner_w
+        .saturating_sub(prefix.chars().count() as u16 + 2)
+        .max(1) as usize;
+    let mut tail: Vec<char> = prompt.buffer.chars().rev().take(room).collect();
+    tail.reverse();
+    let shown: String = tail.into_iter().collect();
+    let text = Line::from(vec![
+        Span::styled(prefix, Style::default().fg(Color::DarkGray)),
+        Span::styled(shown, Style::default().fg(Color::White)),
+        Span::styled(
+            "▏",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]);
+    f.render_widget(
+        Paragraph::new(text),
+        Rect { x: inner_x, y: panel.y + 1, width: inner_w, height: 1 },
+    );
+    let note = match &prompt.error {
+        Some(err) => (format!(" {err}"), Color::Yellow),
+        None => {
+            let mut hint = " Enter 确认 · Esc 取消".to_string();
+            if let Some(extra) = prompt.hint {
+                hint.push_str(" · ");
+                hint.push_str(extra);
+            }
+            (hint, Color::DarkGray)
+        }
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(note.0, Style::default().fg(note.1)))),
+        Rect { x: inner_x, y: panel.y + 2, width: inner_w, height: 1 },
     );
 }
 
@@ -661,7 +782,7 @@ fn draw_browser(f: &mut Frame, app: &mut App) {
         );
     } else {
         let keys =
-            " ↑↓/jk/滚轮 选择 · 鼠标点击选中 · Enter 进入目录/下载 · u 上传 · d 下载 · Backspace 上级 · r 刷新 · Esc/Ctrl-S 返回终端 ";
+            " ↑↓/滚轮 选择 · Enter 进入/下载 · u 上传文件 · U 上传目录 · d 下载 · m 新建目录 · n 重命名 · D 删除 · Ctrl-C 取消传输 · r 刷新 · Esc 返回终端 ";
         f.render_widget(
             Paragraph::new(keys).style(Style::default().fg(Color::DarkGray)),
             chunks[2],
