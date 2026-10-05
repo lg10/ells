@@ -422,11 +422,11 @@ fn draw_form(f: &mut Frame, app: &mut App) {
     f.render_widget(
         Paragraph::new(vec![
             Line::from(Span::styled(
-                " Tab/↓ 下一项 · Enter 仅切换输入项 · 到按钮后 Enter/点击 保存 · ←/→ 切换认证",
+                " Tab/↓ 移项 · Enter 选私钥/跳板机 · ←/→ 换认证",
                 Style::default().fg(Color::DarkGray),
             )),
             Line::from(Span::styled(
-                " 鼠标点击输入框定位 · Ctrl-F 选私钥 · Ctrl-J 选跳板机 · 私钥口令仅当私钥加密才填",
+                " 鼠标点击定位 · 按钮 Enter/点击 保存 · 私钥口令仅加密私钥才填",
                 Style::default().fg(Color::DarkGray),
             )),
         ]),
@@ -438,7 +438,7 @@ fn draw_form(f: &mut Frame, app: &mut App) {
         let area = centered(52, h.min(f.area().height.saturating_sub(2)), f.area());
         let block = Block::default()
             .borders(Borders::ALL)
-            .title(" 选择跳板机 · Enter 确认 · Esc 关闭 ")
+            .title(" 选择跳板机 · ↑↓ 选择 · Enter 确认 · Esc 关闭 ")
             .title_style(Style::default().fg(Color::Cyan));
         let pinner = block.inner(area);
         f.render_widget(Clear, area);

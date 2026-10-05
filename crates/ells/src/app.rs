@@ -1760,8 +1760,11 @@ impl App {
                     self.form.footer = None;
                     self.screen = ScreenKind::List;
                 }
-                None => {
-                    match vis.iter().position(|&i| i == focus) {
+                None => match role {
+                    // 选择型输入框：Enter 打开选择器，换行只用上下键
+                    Some(FieldRole::KeyPath) => self.open_picker(),
+                    Some(FieldRole::Jump) => self.open_jump_picker(),
+                    _ => match vis.iter().position(|&i| i == focus) {
                         Some(pos) if pos + 1 < vis.len() => self.form.focus = vis[pos + 1],
                         Some(_) => self.form.footer = Some(0),
                         None => {
@@ -1769,8 +1772,8 @@ impl App {
                                 self.form.focus = first;
                             }
                         }
-                    }
-                }
+                    },
+                },
             },
             KeyCode::Char(c) if !ctrl => {
                 let mut target = focus;
@@ -1805,34 +1808,46 @@ impl App {
     }
 
     fn handle_jump_picker_key(&mut self, key: &KeyEvent) {
-        let Some(picker) = self.form.jump_picker.as_mut() else {
-            return;
-        };
         match key.code {
-            KeyCode::Up => {
-                picker.selected = picker.selected.saturating_sub(1);
-            }
-            KeyCode::Down | KeyCode::Tab => {
-                if picker.selected + 1 < picker.items.len() {
-                    picker.selected += 1;
-                }
-            }
-            KeyCode::Enter => {
-                let alias = picker.items[picker.selected].0.clone();
-                self.form.jump_picker = None;
-                if let Some(f) = self
-                    .form
-                    .fields
-                    .iter_mut()
-                    .find(|f| f.role == FieldRole::Jump)
-                {
-                    f.value = alias;
-                }
-            }
+            KeyCode::Up => self.move_jump_picker(false),
+            KeyCode::Down | KeyCode::Tab => self.move_jump_picker(true),
+            KeyCode::Enter => self.confirm_jump_picker(),
             KeyCode::Esc | KeyCode::Char('j') => {
                 self.form.jump_picker = None;
             }
             _ => {}
+        }
+    }
+
+    fn move_jump_picker(&mut self, down: bool) {
+        let Some(picker) = self.form.jump_picker.as_mut() else {
+            return;
+        };
+        if down {
+            if picker.selected + 1 < picker.items.len() {
+                picker.selected += 1;
+            }
+        } else {
+            picker.selected = picker.selected.saturating_sub(1);
+        }
+    }
+
+    fn confirm_jump_picker(&mut self) {
+        let alias = match &self.form.jump_picker {
+            Some(picker) if !picker.items.is_empty() => {
+                let i = picker.selected.min(picker.items.len() - 1);
+                picker.items[i].0.clone()
+            }
+            _ => return,
+        };
+        self.form.jump_picker = None;
+        if let Some(f) = self
+            .form
+            .fields
+            .iter_mut()
+            .find(|f| f.role == FieldRole::Jump)
+        {
+            f.value = alias;
         }
     }
 
@@ -1855,6 +1870,16 @@ impl App {
 
     fn open_picker(&mut self) {
         let field = self.form.focus;
+        if self
+            .form
+            .fields
+            .get(field)
+            .map(|f| f.role != FieldRole::KeyPath)
+            .unwrap_or(true)
+        {
+            self.form.error = Some("只有\"私钥路径\"可以用文件选择框".to_string());
+            return;
+        }
         let current = self
             .form
             .fields
