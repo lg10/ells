@@ -19,11 +19,15 @@ ells-transfer.workspace = true
 futures.workspace = true
 ratatui.workspace = true
 rfd = "0.15"
+# 自更新：ring 只用来算 SHA256（russh 已经带了 ring，这里是显式声明直接依赖），
+# ureq 关掉默认特性、只留 rustls，避免为了下载一个二进制再拖进 gzip/brotli/charset。
+ring = "0.17.14"
 russh.workspace = true
 russh-sftp.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
+ureq = { version = "3.4.2", default-features = false, features = ["rustls"] }
 zeroize.workspace = true
 
 [build-dependencies]

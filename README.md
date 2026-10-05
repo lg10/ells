@@ -35,6 +35,7 @@ ells is an all-in-one terminal SSH client written in pure Rust. It embeds a real
 - 🪟 **Multi-session tabs** — one process, several servers: `F2` new tab, `F5`/`F6` or a mouse click to switch, `Ctrl-]` to close. Background tabs keep their own output, transfers and state. The host list shows which machines are already connected (`●`), and `Ctrl-G` drops you back to that list without touching the connection — Enter or a click on the tab returns.
 - 🔍 **Scrollback search** — `F3` searches the history buffer, `n`/`N` jump between hits.
 - 🛠 **Remote file operations** — `m` mkdir, `n` rename, `D` delete (confirmed twice) inside the browser, `Ctrl-C` cancels in-flight transfers, and a dropped connection can be re-established straight from the vault.
+- 🔄 **In-app updates** — ells checks for a new release at every start (one HEAD request, no anonymous API quota), shows a badge, and on confirm downloads the right asset, stream-verifies it against `SHA256SUMS.txt` and swaps itself in place. A checksum mismatch never touches the running binary.
 - 📥 **`~/.ssh/config` import** — press `i` in the host list to pull in your existing OpenSSH hosts.
 - 🌏 **Chinese-first UI**, native OS file dialogs, zero telemetry.
 
@@ -72,6 +73,23 @@ $env:ELLS_INSTALL_DIR="$env:USERPROFILE\bin"; irm https://raw.githubusercontent.
 
 `ELLS_API_URL` / `ELLS_DOWNLOAD_URL` point the release lookup and download at a mirror or an intranet. If installation misbehaves, run `sh diagnose.sh` — it prints the shell, curl, architecture and proxy decisions the installer is about to make.
 
+### Updating in place
+
+Once installed you rarely need the installer again. ells asks GitHub for a newer release in the background on **every start** — a single HEAD request whose redirected URL carries the version, so nothing is downloaded and no anonymous API quota is spent. When there is something newer, the host list grows a `【v0.1.6 可更新】` badge; click it (or press Enter on the 「自动更新」 row in settings) and the confirm dialog then does four things:
+
+1. downloads the asset for your platform (`ells-linux-x86_64` / `ells-macos-universal` / `ells-windows-x86_64.exe`) into a temp file next to ells;
+2. hashes it with SHA256 **while streaming**, and compares against the release's `SHA256SUMS.txt` — on a mismatch, or a short body, the temp file is deleted and **nothing is replaced**;
+3. swaps the new binary in. A running image on Windows cannot be deleted but can be renamed, so `ells.exe` becomes `ells.exe.old` and the new file takes its place; your current session keeps running, and a failed swap is renamed back;
+4. reports "the new version is in place" — the file on disk is new, the process is still old. Press Enter / 【立即重启】 to restart into it. The confirm dialog says up front how many live sessions that would drop.
+
+`Esc` or 【取消下载】 aborts a download in progress and cleans the temp file up. The automatic check at startup fails **silently** (no network should not block you); only explicit checks and updates print a reason, in Chinese. The next start also sweeps leftover `.old` files and temp files older than a day.
+
+- Prefer not to be checked: toggle 「自动更新」 off with `←` in settings (`auto_update=false` in `settings.ini`). You can still press Enter on that row to check by hand.
+- Scripting and troubleshooting: `ells --check-update` prints the result and exits — no download, no TUI, no terminal state touched.
+- The last check is cached in `~/.ells/update.cache` (a version and a timestamp, nothing about your hosts).
+- Mirrors / intranet: `ELLS_DOWNLOAD_URL` (asset base) and `ELLS_API_URL` (release lookup) — the same contract the install scripts use.
+- Platforms with no prebuilt package (e.g. Linux aarch64) are pointed at the install scripts instead of being overwritten with something that cannot run.
+
 ### Uninstall
 
 ```bash
@@ -103,19 +121,22 @@ First run asks you to create a master password and a vault. Add a host with `a`,
 ### Usage
 
 ```
-ells [ALIAS] [--dev] [-y]
+ells [ALIAS] [--dev] [-y] [--check-update]
 
-  ALIAS      connect to this host alias right after unlock
-             (the installed short command `s <alias>` does the same)
-  --dev      load plaintext hosts from ~/.ells/hosts.dev.toml (development only,
-             nothing is persisted)
-  -y, --yes  auto-accept and record a first-seen host key; key *changes* are
-             still refused
+  ALIAS           connect to this host alias right after unlock
+                  (the installed short command `s <alias>` does the same)
+  --dev           load plaintext hosts from ~/.ells/hosts.dev.toml (development only,
+                  nothing is persisted)
+  -y, --yes       auto-accept and record a first-seen host key; key *changes* are
+                  still refused
+  --check-update  print whether a newer release exists and exit — no download, no TUI
 
 Environment: ELLS_LOG=1 logs to stderr; ELLS_ZMODEM_LOG=1 additionally writes
-sz/rz interception diagnostics to ~/.ells/zmodem.log; ELLS_YES=1 == -y.
+sz/rz interception diagnostics to ~/.ells/zmodem.log; ELLS_YES=1 == -y;
+ELLS_API_URL / ELLS_DOWNLOAD_URL point update checks at a mirror or intranet.
 
-Config lives in ~/.ells/: vault.bin (credentials), settings.ini, known_hosts.
+Config lives in ~/.ells/: vault.bin (credentials), settings.ini, known_hosts,
+update.cache (last update check).
 ```
 
 ### Key bindings (essentials)

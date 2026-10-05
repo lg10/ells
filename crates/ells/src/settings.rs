@@ -17,6 +17,8 @@ pub struct Settings {
     pub keybinds: KeyBinds,
     /// 界面配色主题：设置里循环切换，预览即时生效，点【保 存】才写盘
     pub theme: theme::Theme,
+    /// 启动时自动查一次新版本（只在后台问一次 GitHub，不下载）
+    pub auto_update: bool,
 }
 
 impl Default for Settings {
@@ -27,6 +29,7 @@ impl Default for Settings {
             master_password_enabled: true,
             keybinds: KeyBinds::default(),
             theme: theme::Theme::platform_default(),
+            auto_update: true,
         }
     }
 }
@@ -103,6 +106,7 @@ impl Settings {
                         s.theme = t;
                     }
                 }
+                "auto_update" => s.auto_update = v.trim() != "false",
                 _ => {
                     // key_new_tab=F2 之类：非法/未知键名直接忽略，保留默认值
                     if let Some(action) = Action::from_ini_key(k) {
@@ -122,11 +126,12 @@ impl Settings {
             let _ = std::fs::create_dir_all(dir);
         }
         let mut text = format!(
-            "highlight={}\nkeepalive_secs={}\nmaster_password_enabled={}\ntheme={}\n",
+            "highlight={}\nkeepalive_secs={}\nmaster_password_enabled={}\ntheme={}\nauto_update={}\n",
             self.highlight,
             self.keepalive_secs,
             self.master_password_enabled,
-            self.theme.ini_value()
+            self.theme.ini_value(),
+            self.auto_update
         );
         for action in Action::ALL {
             text.push_str(&format!("{}={}\n", action.ini_key(), self.keybinds.display(action)));

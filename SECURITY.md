@@ -33,7 +33,8 @@ GNOME Terminal 等）、触发路径、以及能复现的最小步骤。
 ## 支持版本
 
 0.x 阶段只维护最新版：安全修复会直接发新版本，不会回填已公开的旧 tag。
-请尽快升级到 `install.sh` / `install.ps1` 拉到的最新版。
+请尽快升级到最新版——启动时的徽标点一下就行（见 README 的「应用内更新」），
+或者重跑 `install.sh` / `install.ps1`。
 
 ## ells 的安全边界（请知情使用）
 
@@ -48,6 +49,12 @@ GNOME Terminal 等）、触发路径、以及能复现的最小步骤。
    第三方验证 —— 如果第一次就连上了恶意中继，ells 无法察觉；密钥后续变化会阻断
    并告警。对高风险主机请人工核对指纹。
 5. **`sz`/`rz` 劫持会把远端文件写进你选择的本地路径**，覆盖前会二次确认。
+6. **应用内更新信任的是"GitHub 发布资产 + TLS"**，和 `install.sh` 同一套模型：二进制没有
+   独立签名，靠发布里的 `SHA256SUMS.txt` 与传输层 TLS 保证没被换过，校验不过就绝不替换。
+   需要更强保证时请继续用安装脚本手工更新，并在设置里关掉「自动更新」。
+7. **开着「自动更新」时，每次启动会向 GitHub 发一个 HEAD 请求**（User-Agent 里带 ells
+   版本号），这是 ells 唯一的外连，不含主机、地址或用户名。想让进程完全不主动出网就把
+   `auto_update` 设为 `false`，更新改由 `ells --check-update` 手工触发。
 
 ## Reporting a vulnerability (English)
 
@@ -71,3 +78,9 @@ vault first or replace every identifying value with a fake one.
 
 ells only supports the latest 0.x release: security fixes ship as a new version and
 are never backported to published tags.
+
+In-app updates trust the same model as the installers: the binary is fetched from the
+GitHub release and verified against `SHA256SUMS.txt` over TLS — there is no separate
+code signature, and a checksum mismatch aborts the replacement. With 「自动更新」 left
+on, each start sends one HEAD request to GitHub carrying only ells's version in the
+User-Agent; disable it if you would rather nothing leave the machine on its own.

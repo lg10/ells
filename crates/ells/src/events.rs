@@ -99,6 +99,14 @@ pub enum AppEvent {
         slot: u32,
         res: std::result::Result<String, (String, String)>,
     },
+    /// 自更新：后台检查完成。Ok(Some(tag)) = 有更新，Ok(None) = 已是最新。
+    UpdateChecked(std::result::Result<Option<String>, String>),
+    /// 用户在确认弹窗里点了【更 新】（回调够不着 App，只能再发一个事件回来）。
+    UpdateAccepted,
+    /// 自更新：下载进度（total 为 None 时服务端没给 Content-Length）。
+    UpdateProgress { transferred: u64, total: Option<u64> },
+    /// 自更新：下载 + 校验 + 替换的整体结果。
+    UpdateDone(std::result::Result<(), String>),
 }
 
 pub fn spawn_input_stream(tx: mpsc::UnboundedSender<AppEvent>) {

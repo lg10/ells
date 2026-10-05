@@ -17,6 +17,7 @@ use russh_sftp::client::SftpSession;
 use std::io::stdout;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{mpsc, oneshot};
 use zeroize::Zeroizing;
 
@@ -27,6 +28,7 @@ use crate::settings::Settings;
 use crate::term;
 use crate::theme;
 use crate::ui;
+use crate::update;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum ScreenKind {
@@ -279,6 +281,51 @@ pub struct Prompt {
     on_done: Box<dyn FnOnce(Option<String>) + Send>,
 }
 
+/// 自更新的界面状态。徽标只在 `latest` 有值时画；`downloading`/`applied` 期间弹窗是模态的。
+#[derive(Default)]
+pub struct UpdateState {
+    /// 确认比当前新的版本号（`v0.1.6`）；None = 无更新可提示
+    pub latest: Option<String>,
+    /// 后台检查在跑（启动即真，界面不为它单独画东西）
+    pub checking: bool,
+    /// 后台下载在跑
+    pub downloading: bool,
+    pub transferred: u64,
+    pub total: Option<u64>,
+    /// 已经替换到位，只差重启
+    pub applied: bool,
+    /// 换上去的目标版本（`latest` 在成功后要清空，弹窗文案得留着它）
+    pub applied_tag: Option<String>,
+    /// 失败文案：只在用户主动检查/更新时出现，启动那次静默（没网不该拦人）
+    pub error: Option<String>,
+    /// 上次检查成功的时刻（unix 秒），设置页说成"多久之前"
+    pub checked_at: Option<u64>,
+    /// 取消位：Clone 出的 Arc 交给后台任务，界面按【取消下载】置位
+    cancel: Arc<AtomicBool>,
+}
+
+impl UpdateState {
+    /// 弹窗是否占屏：下载中，或"已替换待重启"。
+    pub fn modal(&self) -> bool {
+        self.downloading || self.applied
+    }
+
+    /// 顶部徽标文案。绘制与命中测试共用这一份，宽度才不会两边算得不一致。
+    pub fn badge(&self) -> Option<String> {
+        self.latest.as_ref().map(|tag| format!("【{tag} 可更新】"))
+    }
+
+    /// 重新开始一轮下载：取消位必须是新的，否则下一次一点就"已取消"。
+    fn reset_cancel(&mut self) {
+        self.cancel = Arc::new(AtomicBool::new(false));
+    }
+
+    /// 请后台停下（真正中止要等它下一次读到这个位）。
+    fn request_cancel(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
 pub struct App {
     pub screen: ScreenKind,
     pub unlock: UnlockState,
@@ -298,7 +345,8 @@ pub struct App {
     pub settings: Settings,
     /// 全局设置弹窗是否打开（会话界面顶部「设置」按钮触发）。
     pub settings_open: bool,
-    /// 设置弹窗中当前聚焦的选项行（0=高亮 1=保活 2=主密码开关 3=修改主密码 4=快捷键 5=保存 6=取消）。
+    /// 设置弹窗中当前聚焦的选项行（0=高亮 1=保活 2=主密码开关 3=修改主密码 4=快捷键
+    /// 5=主题 6=检查更新 7=保存 8=取消）。
     pub settings_focus: usize,
     /// 快捷键设置子面板（从设置弹窗进入）。
     pub keybinds_open: bool,
@@ -331,6 +379,10 @@ pub struct App {
     hostkey: HostKeyPolicy,
     /// 传输详情弹窗是否打开（顶部聚合进度条触发）。
     pub transfer_popup: bool,
+    /// 自更新状态（启动后台查一次，徽标点开才下载）。
+    pub update: UpdateState,
+    /// 更新已替换到位，退出 `loop_run` 后由 `run()` 负责拉起新版本。
+    pub restart_after_exit: bool,
     /// 最近一次绘制的终端区域，用于把鼠标坐标映射到顶部按钮。
     pub last_area: Rect,
     pub vault: Vault,
@@ -377,10 +429,17 @@ pub async fn run(alias: Option<String>, dev: bool, yes: bool) -> Result<()> {
 
     let mut app = App::startup(tx, rx, alias, dev, HostKeyPolicy::new(hkey_tx, yes));
     let result = app.loop_run(&mut terminal).await;
+    let restart = std::mem::take(&mut app.restart_after_exit);
 
     term::restore_terminal();
     terminal.show_cursor()?;
-    result
+    result?;
+    if restart {
+        // 终端已还原、旧进程要让位：拉起新版本后马上退出，中间不再往屏幕写东西
+        update::restart().map_err(anyhow::Error::msg)?;
+        std::process::exit(0);
+    }
+    Ok(())
 }
 
 impl App {
@@ -395,7 +454,9 @@ impl App {
         // 保险库、known_hosts、自动解锁凭据都在 ~/.ells：先把它收紧到仅当前用户可读
         ells_core::harden_config_dir();
         ells_core::ssh::set_keepalive_interval(settings.keepalive_secs);
-        let base = Self {
+        // 上一次更新留下的备份件与陈旧临时件：Windows 上运行中的 exe 删不掉，只能等这次
+        update::cleanup_leftovers();
+        let mut base = Self {
             screen: ScreenKind::List,
             unlock: UnlockState {
                 input: String::new(),
@@ -431,6 +492,8 @@ impl App {
             help_open: false,
             hostkey,
             transfer_popup: false,
+            update: UpdateState::default(),
+            restart_after_exit: false,
             last_area: Rect::ZERO,
             vault: Vault::default(),
             vault_key: None,
@@ -445,6 +508,11 @@ impl App {
             event_tx: tx,
             event_rx: rx,
         };
+        // 每次启动都问一次（用户选的），缓存只用来把"上次检查"说成"多久之前"
+        base.update.checked_at = update::read_cache().map(|c| c.checked_at);
+        if base.settings.auto_update {
+            base.spawn_update_check();
+        }
         if dev {
             let mut app = base;
             app.vault = vault::load_dev_vault().unwrap_or_default();
@@ -582,6 +650,17 @@ impl App {
                     }
                 }
                 AppEvent::HostKey(prompt) => self.ask_host_key(prompt),
+                AppEvent::UpdateChecked(res) => self.on_update_checked(res),
+                AppEvent::UpdateAccepted => {
+                    if let Some(tag) = self.update.latest.clone() {
+                        self.spawn_update_apply(tag);
+                    }
+                }
+                AppEvent::UpdateProgress { transferred, total } => {
+                    self.update.transferred = transferred;
+                    self.update.total = total;
+                }
+                AppEvent::UpdateDone(res) => self.on_update_done(res),
                 AppEvent::Connected { res, .. } => self.on_connected(res),
                 AppEvent::Reconnect { host, .. } => self.start_connect(host, Some(self.work)),
                 AppEvent::Conflict { prompt, .. } => self.ask_conflict(prompt),
@@ -920,6 +999,10 @@ impl App {
             } else {
                 self.handle_settings_key(&key);
             }
+            return;
+        }
+        if self.update.modal() {
+            self.handle_update_key(&key);
             return;
         }
         if self.transfer_popup {
@@ -1437,7 +1520,7 @@ impl App {
                 }
                 return;
             }
-            let [hl_r, ka_r, mp_r, change_r, kb_r, theme_r, save_r, cancel_r] =
+            let [hl_r, ka_r, mp_r, change_r, kb_r, theme_r, update_r, save_r, cancel_r] =
                 ui::settings_hit_rects(self.last_area);
             if hit(hl_r, column, row) {
                 self.settings_focus = 0;
@@ -1454,10 +1537,29 @@ impl App {
             } else if hit(theme_r, column, row) {
                 self.settings_focus = 5;
                 self.step_theme(false);
+            } else if hit(update_r, column, row) {
+                self.settings_focus = 6;
+                self.run_update_row();
             } else if hit(save_r, column, row) {
                 self.save_settings();
             } else if hit(cancel_r, column, row) {
                 self.cancel_settings();
+            }
+            return;
+        }
+        if self.update.modal() {
+            // 更新弹窗是模态的：面板外的点击也不许穿到下层页面
+            let panel = ui::update_popup_rect(self.last_area);
+            let [main_r, alt_r] = ui::update_button_rects(self.last_area);
+            if self.update.downloading {
+                if hit(main_r, column, row) {
+                    self.update.request_cancel();
+                    self.status = Some("正在取消下载…".to_string());
+                }
+            } else if hit(main_r, column, row) {
+                self.quit_for_restart();
+            } else if hit(alt_r, column, row) || !hit(panel, column, row) {
+                self.dismiss_update();
             }
             return;
         }
@@ -1540,6 +1642,13 @@ impl App {
             ScreenKind::List => {
                 if self.hit_tab_bar(column, row) {
                     return;
+                }
+                // 徽标只画在第 0 行，命中范围跟着文案宽度走（同源，见 UpdateState::badge）
+                if let Some(label) = self.update.badge() {
+                    if hit(ui::update_badge_rect(self.last_area, &label), column, row) {
+                        self.offer_update();
+                        return;
+                    }
                 }
                 if hit(ui::homepage_rect(self.last_area), column, row) {
                     self.open_homepage();
@@ -1645,7 +1754,7 @@ impl App {
                 self.settings_focus = self.settings_focus.saturating_sub(1);
             }
             KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
-                self.settings_focus = (self.settings_focus + 1).min(7);
+                self.settings_focus = (self.settings_focus + 1).min(8);
             }
             KeyCode::Enter | KeyCode::Char(' ') => self.apply_settings_focus(),
             KeyCode::Left => match self.settings_focus {
@@ -1656,6 +1765,7 @@ impl App {
                 }
                 2 => self.toggle_master_setting(),
                 5 => self.step_theme(true),
+                6 => self.settings.auto_update = false,
                 _ => {}
             },
             KeyCode::Right => match self.settings_focus {
@@ -1666,6 +1776,7 @@ impl App {
                 }
                 2 => self.toggle_master_setting(),
                 5 => self.step_theme(false),
+                6 => self.settings.auto_update = true,
                 _ => {}
             },
             KeyCode::Char('h') => self.settings.highlight = !self.settings.highlight,
@@ -1760,7 +1871,7 @@ impl App {
 
     /// Enter/空格/点击 对当前聚焦项生效：0 切换高亮、1 循环保活档位、
     /// 2 主密码保护开关、3 进入修改主密码输入、4 打开快捷键面板、5 下一套主题、
-    /// 6 保存、其余取消
+    /// 6 检查/开始更新、7 保存、其余取消
     fn apply_settings_focus(&mut self) {
         match self.settings_focus {
             0 => self.settings.highlight = !self.settings.highlight,
@@ -1771,7 +1882,8 @@ impl App {
             3 => self.begin_master_change(),
             4 => self.open_keybinds(),
             5 => self.step_theme(false),
-            6 => self.save_settings(),
+            6 => self.run_update_row(),
+            7 => self.save_settings(),
             _ => self.cancel_settings(),
         }
     }
@@ -1781,6 +1893,163 @@ impl App {
     fn step_theme(&mut self, backwards: bool) {
         self.settings.theme = self.settings.theme.shift(backwards);
         theme::apply(self.settings.theme);
+    }
+
+    /// 后台查一次新版本。启动时问一次、设置页按行时再问一次，都不占事件环。
+    fn spawn_update_check(&mut self) {
+        self.update.checking = true;
+        self.update.error = None;
+        let tx = self.event_tx.clone();
+        tokio::spawn(async move {
+            let res = tokio::task::spawn_blocking(update::check)
+                .await
+                .map_err(|e| format!("后台任务异常: {e}"))
+                .and_then(|r| r);
+            let _ = tx.send(AppEvent::UpdateChecked(res));
+        });
+    }
+
+    /// 检查回来的结果：有更新才立徽标，失败只记一句话（启动那次没网不该拦人）。
+    fn on_update_checked(&mut self, res: std::result::Result<Option<String>, String>) {
+        self.update.checking = false;
+        self.update.checked_at = update::read_cache().map(|c| c.checked_at);
+        match res {
+            Ok(Some(tag)) => {
+                let fresh = self.update.latest.as_deref() != Some(tag.as_str());
+                self.update.latest = Some(tag.clone());
+                if fresh {
+                    self.status = Some(format!("发现新版本 {tag}，点顶部徽标即可更新"));
+                }
+            }
+            Ok(None) => self.update.latest = None,
+            Err(msg) => self.update.error = Some(msg),
+        }
+    }
+
+    /// 设置页第 6 行的 Enter：已知有更新就直接进确认，否则先查一次。
+    fn run_update_row(&mut self) {
+        if self.update.latest.is_some() {
+            self.offer_update();
+        } else {
+            self.spawn_update_check();
+        }
+    }
+
+    /// 更新确认弹窗：说清下什么、会不会打断现有会话，默认停在【更 新】。
+    fn offer_update(&mut self) {
+        let Some(tag) = self.update.latest.clone() else {
+            return;
+        };
+        if self.choice.is_some() {
+            // 一次只弹一个模态框：已有弹窗时把这次意愿留在徽标上，不叠加
+            self.status = Some("请先处理当前弹窗，再点顶部徽标更新".to_string());
+            return;
+        }
+        let asset = update::asset_name().unwrap_or("对应平台的安装包");
+        let mut lines = vec![
+            format!("当前 v{} · 最新 {tag}", update::current_version()),
+            format!("将下载 {asset} 并替换 ells 自身（SHA256 校验不过不会替换）。"),
+        ];
+        if self.slots.iter().any(|s| s.session.is_some() || s.connecting) {
+            lines.push("注意：有会话正在连接或已连着，重启后才能用新版本。".to_string());
+        }
+        let tx = self.event_tx.clone();
+        self.choice = Some(Choice {
+            title: format!("更新到 {tag}"),
+            lines,
+            options: vec!["稍 后".to_string(), "更 新".to_string()],
+            selected: 1,
+            shortcuts: &[('n', 0), ('y', 1)],
+            danger: false,
+            on_pick: Box::new(move |idx| {
+                if matches!(idx, Some(1)) {
+                    let _ = tx.send(AppEvent::UpdateAccepted);
+                }
+            }),
+        });
+    }
+
+    /// 下载并替换自身：进度走事件，取消位交给界面按。
+    fn spawn_update_apply(&mut self, tag: String) {
+        self.update.reset_cancel();
+        self.update.downloading = true;
+        self.update.applied = false;
+        self.update.applied_tag = Some(tag.clone());
+        self.update.transferred = 0;
+        self.update.total = None;
+        self.update.error = None;
+        // 弹窗已经吃掉下层界面，设置页留着只会让用户以为还能点
+        self.settings_open = false;
+        let cancel = self.update.cancel.clone();
+        let tx = self.event_tx.clone();
+        tokio::spawn(async move {
+            let report = tx.clone();
+            let res = tokio::task::spawn_blocking(move || {
+                update::apply(&tag, &cancel, &mut |done, total| {
+                    let _ = report.send(AppEvent::UpdateProgress {
+                        transferred: done,
+                        total,
+                    });
+                })
+            })
+            .await
+            .map_err(|e| format!("后台任务异常: {e}"))
+            .and_then(|r| r);
+            let _ = tx.send(AppEvent::UpdateDone(res));
+        });
+    }
+
+    fn on_update_done(&mut self, res: std::result::Result<(), String>) {
+        self.update.downloading = false;
+        match res {
+            Ok(()) => {
+                self.update.applied = true;
+                self.update.latest = None;
+                self.update.error = None;
+            }
+            Err(msg) => {
+                // 取消和失败分得开：用户自己按的取消不该写成"更新失败"
+                if self.update.cancel.load(Ordering::Relaxed) {
+                    self.status = Some(format!(
+                        "已取消下载，仍是 v{}",
+                        update::current_version()
+                    ));
+                } else {
+                    self.update.error = Some(msg.clone());
+                    self.status = Some(format!("更新失败：{msg}"));
+                }
+            }
+        }
+    }
+
+    /// 更新弹窗按键：下载中只认取消，替换完只认重启/稍后。
+    fn handle_update_key(&mut self, key: &KeyEvent) {
+        if self.update.downloading {
+            if matches!(key.code, KeyCode::Esc | KeyCode::Char('c')) {
+                self.update.request_cancel();
+                self.status = Some("正在取消下载…".to_string());
+            }
+            return;
+        }
+        match key.code {
+            KeyCode::Enter | KeyCode::Char('y') => self.quit_for_restart(),
+            _ => self.dismiss_update(),
+        }
+    }
+
+    /// 关掉"已替换待重启"弹窗：新版本已经在盘上，只是这个进程还是旧的。
+    fn dismiss_update(&mut self) {
+        self.update.applied = false;
+        self.status = Some(format!(
+            "已更新到新版本，重启 ells 后生效（当前仍是 v{}）",
+            update::current_version()
+        ));
+    }
+
+    /// 退出并把终端交还给新版本（`run()` 收尾时负责真正拉起）。
+    fn quit_for_restart(&mut self) {
+        self.restart_after_exit = true;
+        self.done = true;
     }
 
     fn open_settings(&mut self) {

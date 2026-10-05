@@ -30,6 +30,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         ScreenKind::Session => draw_session(f, app),
         ScreenKind::Browser => draw_browser(f, app),
     }
+    // 更新进度/待重启弹窗先画：它盖住列表与设置页，但确认弹窗仍要在它之上可答
+    if app.update.modal() {
+        draw_update_popup(f, app);
+    }
     // 确认弹窗永远盖在最上层：它可能出现在任何页面（连接中 / 传输中）
     if let Some(choice) = &app.choice {
         draw_choice(f, choice);
@@ -86,6 +90,23 @@ pub fn list_settings_rect(area: Rect) -> Rect {
         x: area.x.saturating_add(area.width).saturating_sub(8),
         y: area.y.saturating_add(area.height).saturating_sub(3),
         width: 8,
+        height: 1,
+    }
+}
+
+/// 可更新徽标的矩形：第 0 行、官网徽章（右端 14 列）左侧留一格。
+/// 宽度由文案自己算出来，所以绘制与命中测试必须传同一份文案。
+pub fn update_badge_rect(area: Rect, label: &str) -> Rect {
+    let w = (display_width(label) as u16)
+        .min(area.width.saturating_sub(17))
+        .max(1);
+    Rect {
+        x: area
+            .x
+            .saturating_add(area.width)
+            .saturating_sub(15u16.saturating_add(w)),
+        y: area.y,
+        width: w,
         height: 1,
     }
 }
@@ -331,6 +352,20 @@ fn draw_list(f: &mut Frame, app: &mut App) {
 
     // 顶部右端官网徽章
     draw_homepage_badge(f, f.area());
+    // 可更新徽标紧挨官网徽章左侧：只在后台确认有新版本后才出现
+    if let Some(label) = app.update.badge() {
+        let rect = update_badge_rect(f.area(), &label);
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                label,
+                Style::default()
+                    .fg(theme::on_accent())
+                    .bg(theme::warn())
+                    .add_modifier(Modifier::BOLD),
+            ))),
+            rect,
+        );
+    }
 
     // 删除二级确认弹窗最后渲染，盖住列表
     if let Some(alias) = app.delete_confirm.clone() {
@@ -1430,12 +1465,12 @@ fn clip_display(s: &str, width: usize) -> String {
 
 /// 设置弹窗面板。命中测试与绘制必须同源，加一行只改这一处。
 fn settings_panel(area: Rect) -> Rect {
-    centered(56, 12, area)
+    centered(56, 13, area)
 }
 
-/// 设置弹窗的 8 个可点击行：高亮 / 保活 / 主密码开关 / 修改主密码 / 快捷键 / 主题 / 保存 / 取消。
-/// 必须与 draw_settings_overlay 的几何完全一致。
-pub fn settings_hit_rects(area: Rect) -> [Rect; 8] {
+/// 设置弹窗的 9 个可点击行：高亮 / 保活 / 主密码开关 / 修改主密码 / 快捷键 / 主题 /
+/// 检查更新 / 保存 / 取消。必须与 draw_settings_overlay 的几何完全一致。
+pub fn settings_hit_rects(area: Rect) -> [Rect; 9] {
     let p = settings_panel(area);
     let ix = p.x + 1;
     let iy = p.y + 1;
@@ -1447,8 +1482,9 @@ pub fn settings_hit_rects(area: Rect) -> [Rect; 8] {
         Rect { x: ix, y: iy + 3, width: iw, height: 1 },
         Rect { x: ix, y: iy + 4, width: iw, height: 1 },
         Rect { x: ix, y: iy + 5, width: iw, height: 1 },
-        Rect { x: ix.saturating_add(iw / 2).saturating_sub(16), y: iy + 7, width: 14, height: 1 },
-        Rect { x: ix.saturating_add(iw / 2).saturating_add(2), y: iy + 7, width: 14, height: 1 },
+        Rect { x: ix, y: iy + 6, width: iw, height: 1 },
+        Rect { x: ix.saturating_add(iw / 2).saturating_sub(16), y: iy + 8, width: 14, height: 1 },
+        Rect { x: ix.saturating_add(iw / 2).saturating_add(2), y: iy + 8, width: 14, height: 1 },
     ]
 }
 
@@ -1598,25 +1634,59 @@ fn draw_settings_overlay(f: &mut Frame, app: &App) {
         ])),
         rects[5],
     );
-    // 行 6：操作提示
+    // 行 6：自动更新开关 + 检查结果（Enter 立即检查，有更新则进确认）
+    let checked = app
+        .update
+        .checked_at
+        .map(crate::update::age_label)
+        .unwrap_or_else(|| "从未".to_string());
+    let update_note = if app.update.checking {
+        " 正在检查… ".to_string()
+    } else if let Some(tag) = app.update.latest.as_deref() {
+        format!(" 最新 {tag} · Enter 更新 ")
+    } else if app.update.error.is_some() {
+        " 检查失败（见下方） ".to_string()
+    } else {
+        format!(" 已是最新 · 上次检查 {checked} ")
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(" 自动更新：", row_base(focus == 6)),
+            Span::styled(
+                if st.auto_update { " 开 " } else { " 关 " },
+                row_base(focus == 6)
+                    .fg(if st.auto_update { theme::ok() } else { theme::dim() })
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(update_note, row_base(focus == 6).fg(theme::accent())),
+        ])),
+        rects[6],
+    );
+    // 行 7：操作提示（更新检查失败时这行让给它，长文案才放得下）
+    let hint = match &app.update.error {
+        Some(err) => format!(" 检查更新失败：{err}"),
+        None => " ↑↓ 选择 · Enter/点击 修改 · ←→ 微调 · Esc 取消".to_string(),
+    };
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            " ↑↓ 选择 · Enter/点击 修改 · ←→ 微调 · Esc 取消",
-            Style::default().fg(theme::dim()).bg(theme::bg()),
+            hint,
+            Style::default()
+                .fg(if app.update.error.is_some() { theme::warn() } else { theme::dim() })
+                .bg(theme::bg()),
         ))),
-        Rect { x: rects[0].x, y: rects[0].y + 6, width: rects[0].width, height: 1 },
+        Rect { x: rects[0].x, y: rects[0].y + 7, width: rects[0].width, height: 1 },
     );
-    // 行 7：保存 / 取消按钮
+    // 行 8：保存 / 取消按钮
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             "【 保 存 】",
             Style::default()
                 .fg(theme::on_accent())
                 .bg(theme::accent_bg())
-                .add_modifier(if focus == 6 { Modifier::BOLD } else { Modifier::empty() })
-                .add_modifier(if focus == 6 { Modifier::UNDERLINED } else { Modifier::empty() }),
+                .add_modifier(if focus == 7 { Modifier::BOLD } else { Modifier::empty() })
+                .add_modifier(if focus == 7 { Modifier::UNDERLINED } else { Modifier::empty() }),
         ))),
-        rects[6],
+        rects[7],
     );
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -1624,10 +1694,10 @@ fn draw_settings_overlay(f: &mut Frame, app: &App) {
             Style::default()
                 .fg(theme::text())
                 .bg(theme::band())
-                .add_modifier(if focus == 7 { Modifier::BOLD } else { Modifier::empty() })
-                .add_modifier(if focus == 7 { Modifier::UNDERLINED } else { Modifier::empty() }),
+                .add_modifier(if focus == 8 { Modifier::BOLD } else { Modifier::empty() })
+                .add_modifier(if focus == 8 { Modifier::UNDERLINED } else { Modifier::empty() }),
         ))),
-        rects[7],
+        rects[8],
     );
 }
 
@@ -1802,6 +1872,111 @@ fn draw_transfer_popup(f: &mut Frame, app: &App) {
     }
 }
 
+/// 更新弹窗面板（进度/结果 + 按钮），绘制与命中测试同源。
+pub fn update_popup_rect(area: Rect) -> Rect {
+    centered(56, 7, area)
+}
+
+/// 更新弹窗的两个按钮：下载中只有第一个（【取消下载】），
+/// 待重启时左【立即重启】右【稍后】。
+pub fn update_button_rects(area: Rect) -> [Rect; 2] {
+    let p = update_popup_rect(area);
+    let ix = p.x + 1;
+    let iw = p.width.saturating_sub(2);
+    let y = p.y + p.height.saturating_sub(2);
+    [
+        Rect { x: ix.saturating_add(iw / 2).saturating_sub(16), y, width: 16, height: 1 },
+        Rect { x: ix.saturating_add(iw / 2).saturating_add(2), y, width: 16, height: 1 },
+    ]
+}
+
+fn draw_update_popup(f: &mut Frame, app: &App) {
+    let area = update_popup_rect(f.area());
+    let buttons = update_button_rects(f.area());
+    let u = &app.update;
+    let (title, head, note, ratio, button) = if u.downloading {
+        let asset = crate::update::asset_name().unwrap_or("更新包");
+        let r = ratio_of(u.transferred, u.total);
+        (
+            format!(" 正在更新 · {asset} "),
+            format!(
+                " 已下载 {}{}（{}%）",
+                human_size(u.transferred),
+                u.total
+                    .map(|t| format!(" / {}", human_size(t)))
+                    .unwrap_or_default(),
+                (r * 100.0) as u8
+            ),
+            " 校验通过才会替换文件，中途可取消。".to_string(),
+            r,
+            "【 取消下载 】",
+        )
+    } else {
+        let tag = u.applied_tag.clone().unwrap_or_default();
+        let live = app.slots.iter().filter(|s| s.session.is_some()).count();
+        (
+            format!(" 更新完成 · {tag} "),
+            format!(
+                " 新版本已就位，当前进程仍是 v{}",
+                crate::update::current_version()
+            ),
+            if live > 0 {
+                format!(" 重启会断开这 {live} 路会话；也可以先退出再运行 ells。")
+            } else {
+                " 重启后即为新版本；也可以先退出再运行 ells。".to_string()
+            },
+            1.0,
+            "【 立即重启 】",
+        )
+    };
+    f.buffer_mut().set_style(area, Style::default().bg(theme::bg()));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .title_style(Style::default().fg(theme::accent()).add_modifier(Modifier::BOLD));
+    f.render_widget(Clear, area);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(head, Style::default().fg(theme::text())))),
+        Rect { x: inner.x, y: inner.y, width: inner.width, height: 1 },
+    );
+    f.render_widget(
+        Gauge::default()
+            .ratio(ratio.clamp(0.0, 1.0))
+            .gauge_style(Style::default().fg(theme::accent()).bg(theme::band())),
+        Rect { x: inner.x, y: inner.y + 1, width: inner.width, height: 1 },
+    );
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(note, Style::default().fg(theme::dim())))),
+        Rect { x: inner.x, y: inner.y + 2, width: inner.width, height: 1 },
+    );
+    let style = |main: bool| {
+        Style::default()
+            .fg(if main { theme::on_accent() } else { theme::text() })
+            .bg(if main { theme::accent_bg() } else { theme::band() })
+            .add_modifier(Modifier::BOLD)
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(button, style(true)))),
+        buttons[0],
+    );
+    if !u.downloading {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled("【 稍 后 】", style(false)))),
+            buttons[1],
+        );
+    }
+}
+
+/// 进度比例：total 未知时按 0 画（Gauge 全空，至少不是假完成）。
+fn ratio_of(done: u64, total: Option<u64>) -> f64 {
+    match total {
+        Some(t) if t > 0 => done as f64 / t as f64,
+        _ => 0.0,
+    }
+}
+
 fn map_color(c: vt100::Color) -> Option<Color> {
     match c {
         vt100::Color::Default => None,
@@ -1880,17 +2055,53 @@ mod tests {
         let area = Rect::new(0, 0, 80, 24);
         let panel = settings_panel(area);
         let r = settings_hit_rects(area);
-        // 6 个可编辑项必须是连续的 6 行：加一行（主题）时鼠标命中不能错位
-        for i in 1..6 {
+        // 7 个可编辑项必须是连续的 7 行：加一行（检查更新）时鼠标命中不能错位
+        for i in 1..7 {
             assert_eq!(r[i].y, r[i - 1].y + 1, "第 {i} 行和上一行不挨着");
         }
-        assert_eq!(r[5].y, panel.y + 6);
-        // 按钮在操作提示（第 7 行）之下的同一行
-        assert_eq!(r[6].y, r[7].y);
-        assert_eq!(r[6].y, panel.y + 8);
+        assert_eq!(r[6].y, panel.y + 7);
+        // 按钮在操作提示行之下的同一行
+        assert_eq!(r[7].y, r[8].y);
+        assert_eq!(r[7].y, panel.y + 9);
         for (i, rect) in r.iter().enumerate() {
             assert!(rect.right() <= panel.right(), "第 {i} 行超出面板右边界");
             assert!(rect.bottom() <= panel.bottom(), "第 {i} 行超出面板下边界");
         }
+    }
+
+    #[test]
+    fn update_badge_never_overlaps_the_homepage_one() {
+        let label = "【v0.1.6 可更新】";
+        for area in [Rect::new(0, 0, 80, 24), Rect::new(0, 0, 40, 20), Rect::new(0, 0, 18, 10)] {
+            let badge = update_badge_rect(area, label);
+            assert_eq!(badge.y, area.y, "徽标必须留在第 0 行");
+            assert!(badge.height == 1);
+            assert!(
+                badge.right() <= homepage_rect(area).x,
+                "{area:?} 下徽标压到官网徽章了：{:?} vs {:?}",
+                badge,
+                homepage_rect(area)
+            );
+            assert!(badge.x >= area.x, "{area:?} 下徽标跑出了左边界");
+        }
+        // 宽度跟着文案走（CJK 括号各算 2 列），命中测试才画得准
+        assert_eq!(
+            update_badge_rect(Rect::new(0, 0, 80, 24), label).width,
+            display_width(label) as u16
+        );
+    }
+
+    #[test]
+    fn update_popup_buttons_stay_inside_the_panel() {
+        let area = Rect::new(0, 0, 80, 24);
+        let panel = update_popup_rect(area);
+        let [main, alt] = update_button_rects(area);
+        for (i, r) in [main, alt].iter().enumerate() {
+            assert!(r.right() <= panel.right(), "按钮 {i} 超出右边界");
+            assert!(r.bottom() <= panel.bottom(), "按钮 {i} 超出下边界");
+            assert!(r.x >= panel.x + 1);
+        }
+        // 两个按钮不许重叠，也没人能把它们和面板边框画到同一格
+        assert!(main.right() < alt.x);
     }
 }
