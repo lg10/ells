@@ -18,6 +18,7 @@ use std::io::stdout;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
+use zeroize::Zeroizing;
 
 use crate::events::{self, AppEvent};
 use crate::session::{SessionAction, SessionState, TermMode};
@@ -298,9 +299,10 @@ pub struct App {
     /// 设置弹窗中当前聚焦的选项行（0=高亮 1=保活 2=主密码开关 3=修改主密码 4=保存 5=取消）。
     pub settings_focus: usize,
     /// 本次运行解锁用过的明文主密码（改密/关闭保护时写入自动解锁凭据需要它）。
-    pub master_secret: Option<String>,
+    /// Zeroizing：这份密码要在整个运行期留着，drop 时必须抹掉，不能留在堆里。
+    pub master_secret: Option<Zeroizing<String>>,
     /// 自动解锁时暂存的凭据，解锁成功后转入 master_secret。
-    auto_master: Option<String>,
+    auto_master: Option<Zeroizing<String>>,
     pub mp_stage: MpStage,
     pub mp_buf: String,
     pub mp_busy: bool,
@@ -380,6 +382,8 @@ impl App {
         hostkey: HostKeyPolicy,
     ) -> Self {
         let settings = Settings::load();
+        // 保险库、known_hosts、自动解锁凭据都在 ~/.ells：先把它收紧到仅当前用户可读
+        ells_core::harden_config_dir();
         ells_core::ssh::set_keepalive_interval(settings.keepalive_secs);
         let base = Self {
             screen: ScreenKind::List,
@@ -447,8 +451,9 @@ impl App {
         if !app.settings.master_password_enabled && stage == UnlockStage::Open {
             if let Some(master) = crate::settings::read_master_backup() {
                 let tx = app.event_tx.clone();
-                app.auto_master = Some(master.clone());
+                app.auto_master = Some(Zeroizing::new(master.clone()));
                 app.unlock.busy = true;
+                let master = Zeroizing::new(master);
                 tokio::spawn(async move {
                     let res = tokio::task::spawn_blocking(move || vault::unlock_vault(&master))
                         .await
@@ -585,7 +590,8 @@ impl App {
                             self.vault_key = Some(k);
                             self.master_secret = match self.auto_master.take() {
                                 Some(m) => Some(m),
-                                None => Some(self.unlock.input.clone()),
+                                // take 而不是 clone：输入框里那份明文跟着一起清掉
+                                None => Some(Zeroizing::new(std::mem::take(&mut self.unlock.input))),
                             };
                             self.screen = ScreenKind::List;
                             self.pending_unlock_action = true;
@@ -612,7 +618,8 @@ impl App {
                         Ok(k) => {
                             self.vault = Vault::default();
                             self.vault_key = Some(k);
-                            self.master_secret = Some(self.unlock.input.clone());
+                            self.master_secret =
+                                Some(Zeroizing::new(std::mem::take(&mut self.unlock.input)));
                             self.screen = ScreenKind::List;
                             self.pending_unlock_action = true;
                         }
@@ -628,13 +635,14 @@ impl App {
                     self.mp_busy = false;
                     match res {
                         Ok((vk, new_master)) => {
+                            let new_master = Zeroizing::new(new_master);
                             self.vault_key = Some(vk);
-                            self.master_secret = Some(new_master.clone());
+                            self.master_secret = Some(Zeroizing::new((*new_master).clone()));
                             self.mp_stage = MpStage::Idle;
                             self.mp_buf.clear();
                             self.mp_first.clear();
                             if !self.settings.master_password_enabled {
-                                let _ = crate::settings::write_master_backup(&new_master);
+                                let _ = crate::settings::write_master_backup(new_master.as_str());
                             }
                             self.status = Some("主密码已修改，下次启动用新密码".to_string());
                         }
@@ -1614,7 +1622,7 @@ impl App {
         if self.settings.master_password_enabled {
             crate::settings::clear_master_backup();
         } else if let Some(master) = &self.master_secret {
-            if let Err(err) = crate::settings::write_master_backup(master) {
+            if let Err(err) = crate::settings::write_master_backup(master.as_str()) {
                 self.status = Some(format!("设置已保存，但免密凭据写入失败: {err}"));
                 self.settings_open = false;
                 self.reset_master_edit();
@@ -2317,6 +2325,7 @@ impl App {
             UnlockStage::Open => {
                 self.unlock.busy = true;
                 let tx = self.event_tx.clone();
+                let input = Zeroizing::new(input);
                 tokio::spawn(async move {
                     let res = tokio::task::spawn_blocking(move || vault::unlock_vault(&input))
                         .await
@@ -2335,9 +2344,13 @@ impl App {
                 self.unlock.input.clear();
             }
             UnlockStage::CreateConfirm => {
-                if self.unlock.pending_master.as_deref() == Some(input.as_str()) {
+                let matched = self.unlock.pending_master.as_deref() == Some(input.as_str());
+                // 比对完就抹掉暂存的这份明文：后面用不上了
+                self.unlock.pending_master = None;
+                if matched {
                     self.unlock.busy = true;
                     let tx = self.event_tx.clone();
+                    let input = Zeroizing::new(input);
                     tokio::spawn(async move {
                         let res = tokio::task::spawn_blocking(move || {
                             if vault::vault_exists() {
@@ -2355,7 +2368,6 @@ impl App {
                 } else {
                     self.unlock.error = Some("两次输入的主密码不一致".to_string());
                     self.unlock.stage = UnlockStage::CreateFirst;
-                    self.unlock.pending_master = None;
                     self.unlock.input.clear();
                 }
             }

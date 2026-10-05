@@ -47,6 +47,60 @@ pub fn vault_path() -> Result<PathBuf> {
     Ok(home.join(".ells").join("vault.bin"))
 }
 
+/// `~/.ells`：保险库、known_hosts、设置、自动解锁凭据都放这里。
+pub fn config_dir() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".ells"))
+}
+
+/// 把配置目录的访问权限收到"仅当前用户"。
+///
+/// 保险库里躺着所有主机凭据，目录默认权限（0755 / Windows 继承的 ACL）在同机
+/// 其他账号看来是可读的。best-effort：任何一步失败都只是少一层加固，
+/// 绝不能因此让程序起不来。
+#[cfg(unix)]
+pub fn harden_config_dir() {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(dir) = config_dir() else { return };
+    let _ = fs::create_dir_all(&dir);
+    let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
+}
+
+/// Windows 的 unix 权限位形同虚设，只能走 ACL：`icacls` 去掉继承项、只留给
+/// 当前用户（和 ssh-keygen 收紧私钥的写法一致）。
+#[cfg(windows)]
+pub fn harden_config_dir() {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let Some(dir) = config_dir() else { return };
+    let _ = fs::create_dir_all(&dir);
+
+    let mut cmd = std::process::Command::new("whoami");
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    let Ok(out) = cmd.output() else { return };
+    if !out.status.success() {
+        return;
+    }
+    let user = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if user.is_empty() {
+        return;
+    }
+    // (OI)(CI) = 对象与子容器继承，F = 完全控制：目录里以后的文件都跟着收紧
+    let mut icacls = std::process::Command::new("icacls");
+    icacls
+        .arg(&dir)
+        .arg("/inheritance:r")
+        .arg("/grant:r")
+        .arg(format!("{user}:(OI)(CI)F"))
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    match icacls.status() {
+        Ok(s) if s.success() => {}
+        Ok(s) => tracing::warn!(code = ?s.code(), "icacls 收紧 ~/.ells 权限未生效"),
+        Err(err) => tracing::warn!(%err, "icacls 无法执行，~/.ells 权限未收紧"),
+    }
+}
+
 pub fn vault_exists() -> bool {
     vault_path().map(|p| p.exists()).unwrap_or(false)
 }
@@ -56,9 +110,11 @@ fn derive_key(master: &str, salt: &[u8]) -> Result<[u8; KEY_LEN]> {
         .map_err(|err| anyhow!("argon2 params rejected: {err:?}"))?;
     let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
     let mut out = [0u8; KEY_LEN];
-    argon
-        .hash_password_into(master.as_bytes(), salt, &mut out)
-        .map_err(|err| anyhow!("argon2 KDF failed: {err:?}"))?;
+    if let Err(err) = argon.hash_password_into(master.as_bytes(), salt, &mut out) {
+        // 派生失败也可能已经写过 out：不留着一半密钥在栈上
+        out.zeroize_local();
+        return Err(anyhow!("argon2 KDF failed: {err:?}"));
+    }
     Ok(out)
 }
 
@@ -156,8 +212,15 @@ pub fn unlock_vault(master: &str) -> Result<(Vault, VaultKey)> {
     let bytes =
         fs::read(&path).with_context(|| format!("无法读取保险库 {}", path.display()))?;
     let (salt, _, _) = check_header(&bytes)?;
-    let key = derive_key(master, &salt)?;
-    let vault = decode_with_key(&bytes, &key)?;
+    let mut key = derive_key(master, &salt)?;
+    // 解不开（主密码错/文件损坏）也要把派生密钥抹掉：它和主密码等价
+    let vault = match decode_with_key(&bytes, &key) {
+        Ok(v) => v,
+        Err(err) => {
+            key.zeroize_local();
+            return Err(err);
+        }
+    };
     Ok((vault, VaultKey { salt, key }))
 }
 
@@ -182,8 +245,15 @@ pub fn store_vault(master: &str, path: &Path, vault: &Vault) -> Result<()> {
 
 pub fn decode_vault(master: &str, bytes: &[u8]) -> Result<Vault> {
     let (salt, _, _) = check_header(bytes)?;
-    let key = derive_key(master, &salt)?;
-    decode_with_key(bytes, &key)
+    let mut key = derive_key(master, &salt)?;
+    let vault = match decode_with_key(bytes, &key) {
+        Ok(v) => v,
+        Err(err) => {
+            key.zeroize_local();
+            return Err(err);
+        }
+    };
+    Ok(vault)
 }
 
 fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<()> {
