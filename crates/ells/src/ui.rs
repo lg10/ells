@@ -7,7 +7,7 @@ use ratatui::widgets::{
 };
 use ratatui::Frame;
 
-use crate::app::{App, Choice, FieldKind, Prompt, ScreenKind, UnlockStage};
+use crate::app::{App, Choice, FieldKind, Prompt, ScreenKind, Slot, UnlockStage};
 use crate::session::TermMode;
 
 pub fn draw(f: &mut Frame, app: &mut App) {
@@ -135,7 +135,11 @@ fn draw_list(f: &mut Frame, app: &mut App) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(format!(" ells · 主机  {}", version_tag()))
+        .title(format!(
+            " ells · 主机  {}{}",
+            version_tag(),
+            tab_counter(app)
+        ))
         .title_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
     let inner = block.inner(chunks[0]);
     f.render_widget(block, chunks[0]);
@@ -187,7 +191,7 @@ fn draw_list(f: &mut Frame, app: &mut App) {
         );
     }
 
-    let keys = " ↑↓ 选择 · Enter 连接 · a 新增 · e 编辑 · d 删除 · i 导入 · s 设置 · ? 帮助 · q 退出 ";
+    let keys = " ↑↓ 选择 · Enter 连接 · a 新增 · e 编辑 · d 删除 · i 导入 · s 设置 · F2 新标签 · ? 帮助 · q 退出 ";
     f.render_widget(
         Paragraph::new(keys).style(Style::default().fg(Color::DarkGray)),
         chunks[1],
@@ -313,9 +317,10 @@ fn draw_help(f: &mut Frame, area: Rect) {
             ),
         panel,
     );
-    let sections: [(&str, &str); 7] = [
+    let sections: [(&str, &str); 8] = [
         ("主机列表", "↑↓/jk 选择 · Enter 连接 · a 新增 · e 编辑 · d 删除（二次确认）· s 设置 · i 导入 ~/.ssh/config · ?/F1 帮助 · q/Ctrl-C 退出"),
-        ("会话终端", "直接打字即发往远端 · Ctrl-S 文件浏览器 · Ctrl-Q 内嵌/直通 · Ctrl-] 断开返回列表 · Ctrl-L 整屏重绘 · 滚轮回看 · 拖选复制（OSC 52）· F3 搜索历史输出（回看时按 / 同样可用，n/N 上下条）· F1 帮助"),
+        ("多标签会话", "F2 新建标签 · F5 下一个 · F6 上一个 · 鼠标点顶部标签条切换、点末尾 + 新建 · Ctrl-] 关闭当前标签（只剩一个时退回主机列表）· 每个标签是一路独立 SSH，后台标签的输出与传输继续跑"),
+        ("会话终端", "直接打字即发往远端 · Ctrl-S 文件浏览器 · Ctrl-Q 内嵌/直通 · Ctrl-] 关闭标签 · Ctrl-L 整屏重绘 · 滚轮回看 · 拖选复制（OSC 52）· F3 搜索历史输出（回看时按 / 同样可用，n/N 上下条）· F1 帮助"),
         ("文件浏览器", "↑↓/滚轮 选择 · Enter 进入目录或下载 · u 上传文件 · U 上传整个目录 · d 下载 · m 新建目录 · n 重命名 · D 删除（递归，先确认）· Ctrl-C 取消全部在途传输 · r 刷新 · Backspace 上级 · Esc 返回终端"),
         ("主机表单", "Tab/↓ 下一个字段 · ↑ 上一个 · ←→ 切换认证方式 · Ctrl-F 选私钥 · Ctrl-J 选跳板机 · Ctrl-C 清空当前字段 · Enter 在\"私钥路径/跳板机\"上直接打开选择器，保存要点【保 存】或聚焦后回车"),
         ("解锁保险库", "输入主密码后回车；首次使用会要求输入两遍。主密码不可找回，忘记只能删除 ~/.ells/vault.bin 重来。"),
@@ -716,7 +721,8 @@ pub fn browser_layout(area: Rect) -> std::rc::Rc<[Rect]> {
 fn draw_browser(f: &mut Frame, app: &mut App) {
     let chunks = browser_layout(f.area());
     let height = chunks[1].height.max(1) as usize;
-    let b = &mut app.browser;
+    let tabs = tab_counter(app);
+    let b = &mut app.slots[app.active].browser;
     // 键盘移动选择后，滚动窗口在绘制时统一夹住（滚轮/点击路径已自行维护）
     if b.selected >= b.scroll + height {
         b.scroll = b.selected - height + 1;
@@ -727,7 +733,7 @@ fn draw_browser(f: &mut Frame, app: &mut App) {
 
     let path_line = Line::from(vec![
         Span::styled(
-            format!(" 远端文件 · {} ", b.path),
+            format!(" 远端文件 · {tabs}{} ", b.path),
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         ),
         if b.loading {
@@ -818,14 +824,15 @@ fn is_wide(c: char) -> bool {
 }
 
 fn draw_session(f: &mut Frame, app: &mut App) {
-    if let Some(sg) = app.session.as_mut() {
+    let idx = app.active;
+    if let Some(sg) = app.slots[idx].session.as_mut() {
         let off = sg.scroll;
         sg.emu.set_scrollback(off);
     }
-    let Some(s) = &app.session else { return };
+    let Some(s) = &app.slots[idx].session else { return };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(1)])
+        .constraints([Constraint::Length(HEADER_ROWS), Constraint::Min(1)])
         .split(f.area());
 
     let mode_tag = match s.mode {
@@ -846,7 +853,7 @@ fn draw_session(f: &mut Frame, app: &mut App) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            "Ctrl-Q 切模式 · Ctrl-S 文件 · Ctrl-L 重绘 · F3 搜索 · Ctrl-] 返回",
+            "Ctrl-Q 切模式 · Ctrl-S 文件 · Ctrl-L 重绘 · F3 搜索 · F2 新标签 · F5/F6 切换 · Ctrl-] 关闭标签",
             Style::default().fg(Color::DarkGray),
         ),
     ]);
@@ -857,13 +864,17 @@ fn draw_session(f: &mut Frame, app: &mut App) {
         height: 1,
     };
     f.render_widget(Paragraph::new(header).style(Style::default().bg(Color::DarkGray)), title_row);
-    // 第 1 行右端：官网徽章（点击在浏览器打开 https://ells.cn）
+    // 第 0 行右端：官网徽章（点击在浏览器打开 https://ells.cn）
     draw_homepage_badge(f, f.area());
 
-    // Second header row: 一次性状态提示（连接/拦截/完成/取消）；空闲时给操作指引。
+    // 第 1 行：标签条（点标签切换，点 + 新建）
+    let titles: Vec<String> = app.slots.iter().map(Slot::title).collect();
+    draw_tab_bar(f, chunks[0], &titles, app.active);
+
+    // 第 2 行：一次性状态提示（连接/拦截/完成/取消）；空闲时给操作指引。
     let note_row = Rect {
         x: chunks[0].x,
-        y: chunks[0].y + 1,
+        y: chunks[0].y + 2,
         width: chunks[0].width,
         height: 1,
     };
@@ -871,7 +882,7 @@ fn draw_session(f: &mut Frame, app: &mut App) {
         Paragraph::new(Line::from("")).style(Style::default().bg(Color::Black)),
         note_row,
     );
-    if let Some(search) = &app.search {
+    if let Some(search) = &app.slots[idx].search {
         let line = Line::from(Span::styled(
             format!(
                 " 搜索「{}」：第 {}/{} 个命中 · n 下一个 · N 上一个 · Esc 退出",
@@ -888,7 +899,7 @@ fn draw_session(f: &mut Frame, app: &mut App) {
             Style::default().fg(Color::Magenta).bg(Color::Black),
         ));
         f.render_widget(Paragraph::new(line), note_row);
-    } else if let Some(note) = &app.status {
+    } else if let Some(note) = app.slots[idx].status.as_ref().or(app.status.as_ref()) {
         let line = Line::from(Span::styled(
             format!(" {note}"),
             Style::default().fg(Color::Yellow).bg(Color::Black),
@@ -988,7 +999,7 @@ fn draw_session(f: &mut Frame, app: &mut App) {
         }
     }
     // 搜索命中行整行压暗加粗：跳到哪一行必须一眼看得见
-    if let Some(search) = &app.search {
+    if let Some(search) = &app.slots[app.active].search {
         if search.view_row < rows {
             buf.set_style(
                 Rect {
@@ -1025,7 +1036,7 @@ fn draw_session(f: &mut Frame, app: &mut App) {
 /// 会话顶部第 3 行的可点击区域：【设置】【上传】【下载】 + 聚合进度条。
 /// 鼠标事件用它做命中测试，绘制用它摆位置，两者必须一致。
 pub fn header_button_rects(area: Rect) -> [Rect; 4] {
-    let y = area.y + 2;
+    let y = area.y + 3;
     let btn = |x: u16| Rect { x: area.x + x, y, width: 8, height: 1 };
     let settings = btn(1);
     let upload = btn(10);
@@ -1060,7 +1071,7 @@ fn draw_header_buttons(f: &mut Frame, app: &App) {
         );
     }
 
-    let transfers = &app.browser.transfers;
+    let transfers = &app.slots[app.active].browser.transfers;
     let total = transfers.len();
     let done = transfers.iter().filter(|t| t.done).count();
     let failed = transfers.iter().filter(|t| t.error.is_some()).count();
@@ -1119,10 +1130,110 @@ fn draw_header_buttons(f: &mut Frame, app: &App) {
 pub fn session_emu_rect(area: Rect) -> Rect {
     Rect {
         x: area.x,
-        y: area.y + 3,
+        y: area.y + HEADER_ROWS,
         width: area.width,
-        height: area.height.saturating_sub(3),
+        height: area.height.saturating_sub(HEADER_ROWS),
     }
+}
+
+/// 会话页顶部标题栏的行数：模式行 / 标签条 / 状态行 / 按钮行。
+/// `SessionState::header_rows` 必须与它一致，否则远端画面会被裁掉一行。
+pub const HEADER_ROWS: u16 = 4;
+/// 标签条在标题栏里的行号（0 起）。第 0 行留给模式行和官网徽章。
+pub const TAB_ROW: u16 = 1;
+/// 一个标签占的列宽（含左右空格）。
+const TAB_CELL: u16 = 14;
+
+/// 标签条几何：绘制与鼠标命中必须用同一份定义。
+pub fn tab_rects(area: Rect, count: usize) -> Vec<(usize, Rect)> {
+    let y = area.y + TAB_ROW;
+    (0..count)
+        .filter_map(|i| {
+            let x = area.x + 1 + (i as u16) * TAB_CELL;
+            (x + TAB_CELL <= area.x + area.width).then_some((
+                i,
+                Rect { x, y, width: TAB_CELL, height: 1 },
+            ))
+        })
+        .collect()
+}
+
+/// 标签条末尾的「+」：新建标签。
+pub fn tab_new_rect(area: Rect, count: usize) -> Rect {
+    Rect {
+        x: (area.x + 1 + (count as u16) * TAB_CELL).min(area.x + area.width.saturating_sub(3)),
+        y: area.y + TAB_ROW,
+        width: 3,
+        height: 1,
+    }
+}
+
+/// 没有标签条的页面（主机列表 / 文件浏览器）用一行小字提示当前在第几个标签。
+fn tab_counter(app: &App) -> String {
+    if app.slots.len() < 2 {
+        return String::new();
+    }
+    format!(" · 标签 {}/{} ", app.active + 1, app.slots.len())
+}
+
+/// 标签条：当前标签实心高亮，后台标签灰底，超出宽度的标签不画（F5/F6 仍能循环）。
+fn draw_tab_bar(f: &mut Frame, area: Rect, titles: &[String], active: usize) {
+    let y = area.y + TAB_ROW;
+    f.render_widget(
+        Paragraph::new(Line::from("")).style(Style::default().bg(Color::DarkGray)),
+        Rect { x: area.x, y, width: area.width, height: 1 },
+    );
+    for (idx, rect) in tab_rects(area, titles.len()) {
+        let title = clip_display(titles.get(idx).map(String::as_str).unwrap_or(""), 9);
+        let style = if idx == active {
+            Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White).bg(Color::Black)
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(format!(" {}:{}", idx + 1, title), style))),
+            rect,
+        );
+    }
+    let plus = tab_new_rect(area, titles.len());
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            " + ",
+            Style::default().fg(Color::Cyan).bg(Color::DarkGray),
+        ))),
+        plus,
+    );
+    let hint = " F2 新建 · F5/F6 切换 · Ctrl-] 关闭标签 ";
+    if display_width(hint) + 2 <= area.width.saturating_sub(plus.right()) as usize {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                hint,
+                Style::default().fg(Color::Gray).bg(Color::DarkGray),
+            ))),
+            Rect {
+                x: plus.right() + 1,
+                y,
+                width: area.x + area.width - (plus.right() + 1),
+                height: 1,
+            },
+        );
+    }
+}
+
+/// 按显示宽度截断（CJK 两列），用于标签名。
+fn clip_display(s: &str, width: usize) -> String {
+    let mut out = String::new();
+    let mut w = 0;
+    for c in s.chars() {
+        let cw = if is_wide(c) { 2 } else { 1 };
+        if w + cw > width.saturating_sub(1) {
+            out.push('…');
+            break;
+        }
+        w += cw;
+        out.push(c);
+    }
+    out
 }
 
 /// 设置弹窗的 6 个可点击行：高亮 / 保活 / 主密码开关 / 修改主密码 / 保存 / 取消。
@@ -1271,7 +1382,7 @@ fn draw_settings_overlay(f: &mut Frame, app: &App) {
 }
 
 fn draw_transfer_popup(f: &mut Frame, app: &App) {
-    let items: Vec<_> = app.browser.transfers.iter().rev().take(8).collect();
+    let items: Vec<_> = app.slots[app.active].browser.transfers.iter().rev().take(8).collect();
     let height = ((items.len() as u16) * 2 + 3)
         .min(f.area().height.saturating_sub(2))
         .max(5);

@@ -25,9 +25,10 @@ use crate::settings::Settings;
 use crate::term;
 use crate::ui;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum ScreenKind {
     Unlock,
+    #[default]
     List,
     Form,
     Session,
@@ -114,6 +115,7 @@ pub struct TransferItem {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Default)]
 pub struct BrowserState {
     pub path: String,
     pub entries: Vec<FileEntry>,
@@ -133,6 +135,71 @@ impl BrowserState {
         self.scroll = 0;
         self.loading = false;
         self.error = None;
+    }
+}
+
+/// 一个标签页 = 一路 SSH 会话，外加它自己的 SFTP 浏览器、zmodem 挂起态与搜索状态。
+/// 切标签只换 `App.active`：后台标签的远端输出继续进它自己的 vt100 缓冲，
+/// 在跑的传输也继续，进度/完成事件靠 `id` 找回自己所属的标签。
+#[derive(Default)]
+pub struct Slot {
+    pub id: u32,
+    pub session: Option<SessionState>,
+    pub sftp: Option<Arc<SftpSession>>,
+    pub browser: BrowserState,
+    /// 本标签要连（或已连上）的主机：标签名与断线重连都用它
+    pub host: Option<Host>,
+    /// 后台连接进行中
+    pub connecting: bool,
+    /// Tracked remote shell working directory (for hijacked sz/rz transfers).
+    pub remote_cwd: String,
+    /// sz files waiting for remote_cwd to resolve.
+    pub sz_pending: Vec<String>,
+    /// rz waiting for remote_cwd before opening the native picker.
+    pub rz_pending: bool,
+    /// Destination directory for the next upload (browser path or remote cwd).
+    pub upload_dest: Option<String>,
+    /// Browser was opened by an argument-less `sz` to pick a download target.
+    pub sz_pick_mode: bool,
+    /// Single-file `sz` waiting for remote_cwd before opening Save As.
+    pub sz_saveas_pending: bool,
+    /// ZMODEM event that arrived while a dialog was open; replayed after close.
+    pub pending_zmodem: Option<crate::zmodem::ZmodemEvent>,
+    /// Generation counter for the ZMODEM swallow-window timer (sliding).
+    pub zclear_seq: u64,
+    /// 历史输出搜索（内嵌终端专用，直通模式没有可回看的缓冲）
+    pub search: Option<SearchState>,
+    /// 本标签自己的页面（Session / Browser）：切回标签时恢复它当时看的东西。
+    /// 列表 / 表单是全局页面，不记在这里。
+    pub view: ScreenKind,
+    /// 本标签的状态行（会话/浏览器页第二行）；列表页用 `App.status`
+    pub status: Option<String>,
+    /// 本标签所有传输共享的取消位（Ctrl-C 一次停本标签）
+    pub cancel: Cancel,
+}
+
+impl Slot {
+    fn new(id: u32) -> Self {
+        Self {
+            id,
+            ..Default::default()
+        }
+    }
+
+    /// 空闲标签 = 既没连上也没在连（启动时那一个，以及连接失败后剩下的）
+    pub(crate) fn is_idle(&self) -> bool {
+        self.session.is_none() && !self.connecting
+    }
+
+    /// 标签条上的名字：优先用主机别名，退回会话标签。
+    pub(crate) fn title(&self) -> String {
+        if let Some(host) = &self.host {
+            return host.alias.clone();
+        }
+        self.session
+            .as_ref()
+            .map(|s| s.label.clone())
+            .unwrap_or_else(|| "空标签".to_string())
     }
 }
 
@@ -214,27 +281,17 @@ pub struct App {
     pub unlock: UnlockState,
     pub list: ListState,
     pub form: FormState,
-    pub browser: BrowserState,
-    pub session: Option<SessionState>,
-    pub sftp: Option<Arc<SftpSession>>,
-    /// Tracked remote shell working directory (for hijacked sz/rz transfers).
-    remote_cwd: String,
-    /// sz files waiting for remote_cwd to resolve.
-    sz_pending: Vec<String>,
-    /// rz waiting for remote_cwd before opening the native picker.
-    rz_pending: bool,
-    /// Destination directory for the next upload (browser path or remote cwd).
-    upload_dest: Option<String>,
-    /// Browser was opened by an argument-less `sz` to pick a download target.
-    sz_pick_mode: bool,
-    /// Single-file `sz` waiting for remote_cwd before opening Save As.
-    sz_saveas_pending: bool,
+    /// 标签页。`active` 恒在 `0..slots.len()` 内：启动即有一个空标签，
+    /// 关掉最后一个标签时也是替换而不是清空，所以下标取用不会越界。
+    pub slots: Vec<Slot>,
+    pub active: usize,
+    /// 当前正在被处理的标签：事件自带 id 时是它（可能是后台标签），
+    /// 键盘/鼠标来自界面时等于 `active`。所有会话级助手都读写 `slots[work]`，
+    /// 需要动全局界面（切屏/弹系统对话框）时先判 `work == active`。
+    work: usize,
+    next_slot_id: u32,
     /// A native file dialog is currently on screen (only one at a time).
     dialog_open: bool,
-    /// ZMODEM event that arrived while a dialog was open; replayed after close.
-    pending_zmodem: Option<crate::zmodem::ZmodemEvent>,
-    /// Generation counter for the ZMODEM swallow-window timer (sliding).
-    zclear_seq: u64,
     pub settings: Settings,
     /// 全局设置弹窗是否打开（会话界面顶部「设置」按钮触发）。
     pub settings_open: bool,
@@ -258,27 +315,24 @@ pub struct App {
     pub prompt: Option<Prompt>,
     /// 全键位帮助页（? / F1 打开，任意退出键关闭）。
     pub help_open: bool,
-    /// 历史输出搜索（内嵌终端专用，直通模式没有可回看的缓冲）。
-    pub search: Option<SearchState>,
     /// 主机密钥策略：连接任务用它发问，UI 用它的通道回答。
     hostkey: HostKeyPolicy,
-    /// 本次会话所有传输共享的取消位（Ctrl-C 一次停全部）。
-    cancel: Cancel,
     /// 传输详情弹窗是否打开（顶部聚合进度条触发）。
     pub transfer_popup: bool,
     /// 最近一次绘制的终端区域，用于把鼠标坐标映射到顶部按钮。
     pub last_area: Rect,
     pub vault: Vault,
     pub vault_key: Option<VaultKey>,
-    pub pending_connect: Option<Host>,
-    /// 当前会话对应的主机：非用户主动断开时用它提供"重连"。
-    last_host: Option<Host>,
-    /// 后台连接进行中显示的主机标签（连上之后作为会话名使用）。
-    pub connecting_label: Option<String>,
+    /// 待连接的主机 + 落到哪个标签下标（选标签的规则在 `start_connect` 里定）。
+    pub pending_connect: Option<(Host, usize)>,
     pub direct_alias: Option<String>,
     pub pending_unlock_action: bool,
     pub status: Option<String>,
     pub done: bool,
+    /// 退出二次确认：多标签后台还在传输时，第一次 q 只提示。
+    pub quit_confirm: bool,
+    /// 关闭标签二次确认（存待关标签的 id）：该标签还在传输时，第一次只提示。
+    pub close_tab_confirm: Option<u32>,
     /// 上一次写入终端标签名的文本（变化才重发 OSC 0）。
     term_title: Option<String>,
     event_tx: mpsc::UnboundedSender<AppEvent>,
@@ -338,26 +392,11 @@ impl App {
             },
             list: ListState { selected: 0 },
             form: FormState::blank(),
-            browser: BrowserState {
-                path: String::new(),
-                entries: Vec::new(),
-                selected: 0,
-                scroll: 0,
-                loading: false,
-                error: None,
-                transfers: Vec::new(),
-            },
-            session: None,
-            sftp: None,
-            remote_cwd: String::new(),
-            sz_pending: Vec::new(),
-            rz_pending: false,
-            upload_dest: None,
-            sz_pick_mode: false,
-            sz_saveas_pending: false,
+            slots: vec![Slot::new(0)],
+            active: 0,
+            work: 0,
+            next_slot_id: 1,
             dialog_open: false,
-            pending_zmodem: None,
-            zclear_seq: 0,
             settings,
             settings_open: false,
             settings_focus: 0,
@@ -372,20 +411,18 @@ impl App {
             choice: None,
             prompt: None,
             help_open: false,
-            search: None,
             hostkey,
-            cancel: Cancel::default(),
             transfer_popup: false,
             last_area: Rect::ZERO,
             vault: Vault::default(),
             vault_key: None,
             pending_connect: None,
-            last_host: None,
-            connecting_label: None,
             direct_alias: alias,
             pending_unlock_action: false,
             status: None,
             done: false,
+            quit_confirm: false,
+            close_tab_confirm: None,
             term_title: None,
             event_tx: tx,
             event_rx: rx,
@@ -429,39 +466,49 @@ impl App {
         terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     ) -> Result<()> {
         while !self.done {
+            // 界面（键盘/鼠标/绘制）永远作用于当前标签：先把手工作区切回来
+            self.work = self.active;
             self.sync_term_title();
             // `ells <别名>` / `s <别名>`：保险库就绪后一次性直连，不停在主机列表
             if std::mem::take(&mut self.pending_unlock_action) {
                 self.try_direct_connect();
             }
             let passthrough = self.screen == ScreenKind::Session
-                && self.session.as_ref().map(|s| s.mode) == Some(TermMode::Passthrough);
+                && self.slots[self.active].session.as_ref().map(|s| s.mode) == Some(TermMode::Passthrough);
             if !passthrough {
                 terminal.draw(|f| ui::draw(f, self))?;
             }
             // Connect only AFTER the "正在连接…" frame is on screen.
-            if let Some(host) = self.pending_connect.take() {
-                self.spawn_connect(host);
+            if let Some((host, idx)) = self.pending_connect.take() {
+                self.spawn_connect(host, idx);
             }
             let Some(ev) = self.event_rx.recv().await else {
                 break;
             };
+            // 后台标签的事件绝不落到当前标签上：找不到对应标签就直接丢弃
+            let Some(idx) = self.event_slot(&ev) else {
+                continue;
+            };
+            self.work = idx;
             match ev {
                 AppEvent::Key(key) => self.handle_key(key).await,
                 AppEvent::Paste(text) => self.handle_paste(&text),
                 AppEvent::Resize(cols, rows) => {
-                    if let Some(s) = &mut self.session {
-                        s.handle_resize(cols, rows);
+                    // 每个标签的终端都要跟着改尺寸，否则后台标签的换行会错位
+                    for slot in &mut self.slots {
+                        if let Some(s) = &mut slot.session {
+                            s.handle_resize(cols, rows);
+                        }
                     }
                 }
                 AppEvent::MousePress { column, row } => self.handle_mouse(column, row),
                 AppEvent::MouseDrag { column, row } => self.handle_mouse_drag(column, row),
                 AppEvent::MouseRelease { column, row } => self.handle_mouse_release(column, row),
                 AppEvent::MouseScroll { delta } => self.handle_scroll(delta),
-                AppEvent::RemoteData(bytes) => {
+                AppEvent::RemoteData { bytes, .. } => {
                     let mut zev = None;
                     let mut cmds = Vec::new();
-                    if let Some(s) = &mut self.session {
+                    if let Some(s) = &mut self.slots[self.work].session {
                         zev = s.handle_output(&bytes);
                         s.flush_pending_answers();
                         cmds = s.drain_commands();
@@ -474,39 +521,51 @@ impl App {
                     }
                     // Sliding swallow window: rz/sz retries ZRINIT every ~3s;
                     // keep hiding output (and re-aborting) while bytes keep coming.
-                    if self.session.as_ref().is_some_and(|s| s.is_intercepting()) {
+                    if self.slots[self.work].session.as_ref().is_some_and(|s| s.is_intercepting()) {
                         self.clear_zmodem_soon();
                     }
                 }
-                AppEvent::RemoteClosed => {
-                    if let Some(mut s) = self.session.take() {
+                AppEvent::RemoteClosed { .. } => {
+                    let label = if let Some(mut s) = self.slots[self.work].session.take() {
                         s.close();
-                        self.status = Some(format!("[{}] 会话已结束", s.label));
-                        self.screen = ScreenKind::List;
-                        self.list.selected = 0;
+                        Some(s.label.clone())
+                    } else {
+                        None
+                    };
+                    // Ctrl-] 主动断开会先把 host 清掉，那种情况不弹重连确认
+                    let reconnect = label.as_ref().map(|_| self.slots[self.work].host.clone()).flatten();
+                    let slot = &mut self.slots[self.work];
+                    slot.connecting = false;
+                    slot.sftp = None;
+                    slot.view = ScreenKind::List;
+                    slot.remote_cwd.clear();
+                    slot.sz_pending.clear();
+                    slot.rz_pending = false;
+                    slot.sz_pick_mode = false;
+                    slot.sz_saveas_pending = false;
+                    slot.pending_zmodem = None;
+                    slot.search = None;
+                    if let Some(label) = label {
+                        slot.status = Some(format!("[{label}] 会话已结束"));
                     }
-                    self.sftp = None;
-                    self.remote_cwd.clear();
-                    self.sz_pending.clear();
-                    self.rz_pending = false;
-                    self.sz_pick_mode = false;
-                    self.sz_saveas_pending = false;
-                    self.dialog_open = false;
-                    self.pending_zmodem = None;
-                    self.settings_open = false;
-                    self.transfer_popup = false;
-                    // 只有"非用户主动断开"才会走到这里（Ctrl-] 会先把 last_host 清掉）。
-                    // 已有弹窗时不再叠加：一次只弹一个，且会孤儿掉前一个的应答通道。
-                    if let Some(host) = self.last_host.clone() {
+                    if self.work == self.active {
+                        // 用户正在看这一路：回到列表并（非主动断开时）提供重连
+                        self.screen = ScreenKind::List;
+                        self.settings_open = false;
+                        self.transfer_popup = false;
+                        self.dialog_open = false;
+                    }
+                    if let (true, Some(host)) = (self.work == self.active, reconnect) {
+                        // 已有弹窗时不再叠加：一次只弹一个，且会孤儿掉前一个的应答通道
                         if self.choice.is_none() {
                             self.offer_reconnect(host);
                         }
                     }
                 }
                 AppEvent::HostKey(prompt) => self.ask_host_key(prompt),
-                AppEvent::Connected(res) => self.on_connected(res),
-                AppEvent::Reconnect(host) => self.start_connect(host),
-                AppEvent::Conflict(prompt) => self.ask_conflict(prompt),
+                AppEvent::Connected { res, .. } => self.on_connected(res),
+                AppEvent::Reconnect { host, .. } => self.start_connect(host, Some(self.work)),
+                AppEvent::Conflict { prompt, .. } => self.ask_conflict(prompt),
                 AppEvent::ImportHosts(hosts) => self.import_hosts(hosts),
                 AppEvent::PickedFile { field, path } => {
                     if self.screen == ScreenKind::Form {
@@ -584,143 +643,151 @@ impl App {
                         }
                     }
                 }
-                AppEvent::PickedUpload(path) => {
+                AppEvent::PickedUpload { path, .. } => {
                     self.dialog_open = false;
                     match path {
                         Some(p) => self.start_upload(PathBuf::from(p)),
                         None => {
-                            self.status = Some("已取消上传（未选择文件）".to_string());
-                            self.upload_dest = None;
+                            self.slots[self.work].status =
+                                Some("已取消上传（未选择文件）".to_string());
+                            self.slots[self.work].upload_dest = None;
                         }
                     }
-                    if let Some(pending) = self.pending_zmodem.take() {
-                        self.on_zmodem_event(pending);
-                    }
+                    self.replay_pending_zmodem();
                 }
-                AppEvent::PickedSave { entry, path } => {
+                AppEvent::PickedSave { entry, path, .. } => {
                     self.dialog_open = false;
                     match path {
                         Some(p) => {
-                            if self.sz_pick_mode {
-                                self.sz_pick_mode = false;
-                                self.screen = ScreenKind::Session;
+                            if self.slots[self.work].sz_pick_mode {
+                                self.slots[self.work].sz_pick_mode = false;
+                                self.leave_picker_to_session();
                             }
                             self.start_download_to(entry, PathBuf::from(p));
                         }
                         None => {
-                            self.status = Some("已取消下载（未选择保存位置）".to_string());
+                            self.slots[self.work].status =
+                                Some("已取消下载（未选择保存位置）".to_string());
                         }
                     }
-                    if let Some(pending) = self.pending_zmodem.take() {
-                        self.on_zmodem_event(pending);
-                    }
+                    self.replay_pending_zmodem();
                 }
-                AppEvent::PickedUploadDir(path) => {
+                AppEvent::PickedUploadDir { path, .. } => {
                     self.dialog_open = false;
                     match path {
                         Some(p) => self.start_upload(PathBuf::from(p)),
                         None => {
-                            self.status = Some("已取消上传（未选择目录）".to_string());
-                            self.upload_dest = None;
+                            self.slots[self.work].status =
+                                Some("已取消上传（未选择目录）".to_string());
+                            self.slots[self.work].upload_dest = None;
                         }
                     }
-                    if let Some(pending) = self.pending_zmodem.take() {
-                        self.on_zmodem_event(pending);
-                    }
+                    self.replay_pending_zmodem();
                 }
-                AppEvent::PickedSaveDir { entry, path } => {
+                AppEvent::PickedSaveDir { entry, path, .. } => {
                     self.dialog_open = false;
                     match path {
                         Some(p) => {
-                            if self.sz_pick_mode {
-                                self.sz_pick_mode = false;
-                                self.screen = ScreenKind::Session;
+                            if self.slots[self.work].sz_pick_mode {
+                                self.slots[self.work].sz_pick_mode = false;
+                                self.leave_picker_to_session();
                             }
                             self.start_download_dir(entry, PathBuf::from(p));
                         }
                         None => {
-                            self.status = Some("已取消下载（未选择保存目录）".to_string());
+                            self.slots[self.work].status =
+                                Some("已取消下载（未选择保存目录）".to_string());
                         }
                     }
-                    if let Some(pending) = self.pending_zmodem.take() {
-                        self.on_zmodem_event(pending);
-                    }
+                    self.replay_pending_zmodem();
                 }
-                AppEvent::SftpStarted { label, direction } => {
+                AppEvent::SftpStarted {
+                    label, direction, ..
+                } => {
                     self.register_transfer(label, direction);
                 }
-                AppEvent::SftpOp(res) => match res {
+                AppEvent::SftpOp { res, .. } => match res {
                     Ok(msg) => {
-                        self.status = Some(msg);
+                        self.slots[self.work].status = Some(msg);
                         // 目录内容变了：立刻重扫，否则用户看到的还是旧列表
-                        if self.screen == ScreenKind::Browser && !self.browser.loading {
-                            let path = self.browser.path.clone();
+                        if self.work == self.active
+                            && self.screen == ScreenKind::Browser
+                            && !self.slots[self.work].browser.loading
+                        {
+                            let path = self.slots[self.work].browser.path.clone();
                             self.start_listing(path);
                         }
                     }
-                    Err(err) => self.status = Some(err),
+                    Err(err) => self.slots[self.work].status = Some(err),
                 },
-                AppEvent::Search(value) => match value {
+                AppEvent::Search { value, .. } => match value {
                     Some(q) if !q.trim().is_empty() => self.run_search(q.trim()),
                     // 取消或空关键词：搜索态结束，视图回到实时底部
                     _ => self.clear_search(),
                 },
-                AppEvent::SftpCwd(Ok(dir)) => {
-                    self.remote_cwd = dir.clone();
-                    if self.rz_pending {
-                        self.rz_pending = false;
-                        self.open_upload_picker(dir.clone());
-                    }
-                    if !self.sz_pending.is_empty() {
-                        let files = std::mem::take(&mut self.sz_pending);
-                        if files.len() == 1 && std::mem::take(&mut self.sz_saveas_pending) {
-                            self.open_sz_save_as(&files[0], dir);
-                        } else {
-                            self.sz_saveas_pending = false;
-                            self.start_sz(files, dir);
+                AppEvent::SftpCwd { res, .. } => match res {
+                    Ok(dir) => {
+                        self.slots[self.work].remote_cwd = dir.clone();
+                        if self.slots[self.work].rz_pending {
+                            self.slots[self.work].rz_pending = false;
+                            self.open_upload_picker(dir.clone());
+                        }
+                        if !self.slots[self.work].sz_pending.is_empty() {
+                            let files = std::mem::take(&mut self.slots[self.work].sz_pending);
+                            if files.len() == 1
+                                && std::mem::take(&mut self.slots[self.work].sz_saveas_pending)
+                            {
+                                self.open_sz_save_as(&files[0], dir);
+                            } else {
+                                self.slots[self.work].sz_saveas_pending = false;
+                                self.start_sz(files, dir);
+                            }
                         }
                     }
-                }
-                AppEvent::SftpCwd(Err(err)) => {
-                    self.status = Some(format!("无法解析远端目录: {err}"));
-                    // 目录拿不到就别让 pending 状态过夜，否则会串到下一次 sz/rz
-                    self.rz_pending = false;
-                    self.sz_pending.clear();
-                    self.sz_saveas_pending = false;
-                }
-                AppEvent::ZmodemClear(seq) => {
-                    if seq == self.zclear_seq {
+                    Err(err) => {
+                        self.slots[self.work].status =
+                            Some(format!("无法解析远端目录: {err}"));
+                        // 目录拿不到就别让 pending 状态过夜，否则会串到下一次 sz/rz
+                        self.slots[self.work].rz_pending = false;
+                        self.slots[self.work].sz_pending.clear();
+                        self.slots[self.work].sz_saveas_pending = false;
+                    }
+                },
+                AppEvent::ZmodemClear { seq, .. } => {
+                    if seq == self.slots[self.work].zclear_seq {
                         // 无条件复位：裸 sz 只触发检测不进入吞流，但 watcher 的
                         // fired 状态同样需要清掉，否则下次 sz/rz 不会被检测。
-                        if let Some(s) = &mut self.session {
+                        if let Some(s) = &mut self.slots[self.work].session {
                             s.end_intercept();
                         }
                     }
                 }
-                AppEvent::SftpHome(res) => {
-                    match res {
-                        Ok(dir) => self.start_listing(dir),
-                        Err(err) => {
-                            self.browser.loading = false;
-                            self.browser.error = Some(err);
-                        }
+                AppEvent::SftpHome { res, .. } => match res {
+                    Ok(dir) => self.start_listing(dir),
+                    Err(err) => {
+                        self.slots[self.work].browser.loading = false;
+                        self.slots[self.work].browser.error = Some(err);
                     }
-                }
-                AppEvent::SftpListed(res) => {
-                    self.browser.loading = false;
+                },
+                AppEvent::SftpListed { res, .. } => {
+                    let slot = &mut self.slots[self.work];
+                    slot.browser.loading = false;
                     match res {
                         Ok(entries) => {
-                            self.browser.entries = entries;
-                            self.browser.selected =
-                                self.browser.selected.min(self.browser.entries.len().saturating_sub(1));
-                            self.browser.scroll = self.browser.scroll.min(self.browser.selected);
-                            self.browser.error = None;
+                            slot.browser.entries = entries;
+                            slot.browser.selected = slot
+                                .browser
+                                .selected
+                                .min(slot.browser.entries.len().saturating_sub(1));
+                            slot.browser.scroll = slot.browser.scroll.min(slot.browser.selected);
+                            slot.browser.error = None;
                         }
-                        Err(err) => self.browser.error = Some(err),
+                        Err(err) => slot.browser.error = Some(err),
                     }
                 }
-                AppEvent::SftpProgress(pr) => {
-                    if let Some(item) = self
+                AppEvent::SftpProgress { pr, .. } => {
+                    let slot = &mut self.slots[self.work];
+                    if let Some(item) = slot
                         .browser
                         .transfers
                         .iter_mut()
@@ -729,7 +796,7 @@ impl App {
                         item.progress = Some(pr);
                     } else {
                         let label = pr.label.clone();
-                        self.browser.transfers.push(TransferItem {
+                        slot.browser.transfers.push(TransferItem {
                             label,
                             direction: "?",
                             progress: Some(pr),
@@ -738,37 +805,45 @@ impl App {
                         });
                     }
                 }
-                AppEvent::SftpDone(res) => match res {
-                    Ok(label) => {
-                        let dir = if let Some(item) = self
-                            .browser
-                            .transfers
-                            .iter_mut()
-                            .find(|t| t.label == label && !t.done)
-                        {
-                            item.done = true;
-                            item.direction.to_string()
-                        } else {
-                            "传输".to_string()
-                        };
-                        self.status = Some(format!("{dir}完成：{label}"));
-                        if self.screen == ScreenKind::Browser && !self.browser.loading {
-                            self.start_listing(self.browser.path.clone());
+                AppEvent::SftpDone { res, .. } => {
+                    let slot = &mut self.slots[self.work];
+                    match res {
+                        Ok(label) => {
+                            let dir = if let Some(item) = slot
+                                .browser
+                                .transfers
+                                .iter_mut()
+                                .find(|t| t.label == label && !t.done)
+                            {
+                                item.done = true;
+                                item.direction.to_string()
+                            } else {
+                                "传输".to_string()
+                            };
+                            slot.status = Some(format!("{dir}完成：{label}"));
+                        }
+                        Err((label, msg)) => {
+                            if let Some(item) = slot
+                                .browser
+                                .transfers
+                                .iter_mut()
+                                .find(|t| t.label == label && !t.done)
+                            {
+                                item.done = true;
+                                item.error = Some(msg.clone());
+                            }
+                            slot.status = Some(msg);
                         }
                     }
-                    Err((label, msg)) => {
-                        if let Some(item) = self
-                            .browser
-                            .transfers
-                            .iter_mut()
-                            .find(|t| t.label == label && !t.done)
-                        {
-                            item.done = true;
-                            item.error = Some(msg.clone());
-                        }
-                        self.status = Some(msg);
+                    // 只重扫当前标签：后台标签回到它的浏览器时自然会重新列
+                    if self.work == self.active
+                        && self.screen == ScreenKind::Browser
+                        && !self.slots[self.work].browser.loading
+                    {
+                        let path = self.slots[self.work].browser.path.clone();
+                        self.start_listing(path);
                     }
-                },
+                }
             }
         }
         Ok(())
@@ -829,6 +904,27 @@ impl App {
             self.handle_delete_confirm_key(&key);
             return;
         }
+        // 标签页控制在列表/会话/浏览器页都可用；弹窗、帮助页和表单里不抢键
+        match key.code {
+            KeyCode::F(2) => {
+                self.new_tab();
+                return;
+            }
+            KeyCode::F(5) => {
+                self.cycle_tab(true);
+                return;
+            }
+            KeyCode::F(6) => {
+                self.cycle_tab(false);
+                return;
+            }
+            _ => {}
+        }
+        if ctrl && matches!(key.code, KeyCode::Char(']')) && self.screen == ScreenKind::Browser {
+            self.slots[self.work].sz_pick_mode = false;
+            self.detach_or_close_tab();
+            return;
+        }
         match self.screen {
             ScreenKind::Session => self.handle_session_key(&key, ctrl).await,
             ScreenKind::Unlock => self.handle_unlock_key(&key, ctrl),
@@ -848,14 +944,14 @@ impl App {
         // 会话页不能占用 `?`（那是远端的字符），帮助只用 F1；
         // 直通模式不绘制 ells 界面，此时开帮助只会把按键吞进空气里。
         if matches!(key.code, KeyCode::F(1))
-            && self.session.as_ref().map(|s| s.mode) != Some(TermMode::Passthrough)
+            && self.slots[self.work].session.as_ref().map(|s| s.mode) != Some(TermMode::Passthrough)
         {
             self.help_open = true;
             return;
         }
         // 搜索态只占用 n/N/Esc：其它按键先退出搜索，再原样交给远端
-        if self.search.is_some() {
-            let scrolled = self.session.as_ref().is_some_and(|s| s.scroll > 0);
+        if self.slots[self.work].search.is_some() {
+            let scrolled = self.slots[self.work].session.as_ref().is_some_and(|s| s.scroll > 0);
             match key.code {
                 KeyCode::Esc => self.clear_search(),
                 KeyCode::Char('n') if scrolled => self.step_search(true),
@@ -868,8 +964,8 @@ impl App {
             return;
         }
         // F3 = 搜索；`/` 仅在已回看历史时可用（平时它是远端的路径字符）。
-        let embedded = self.session.as_ref().map(|s| s.mode) == Some(TermMode::Embedded);
-        let scrolled = self.session.as_ref().is_some_and(|s| s.scroll > 0);
+        let embedded = self.slots[self.work].session.as_ref().map(|s| s.mode) == Some(TermMode::Embedded);
+        let scrolled = self.slots[self.work].session.as_ref().is_some_and(|s| s.scroll > 0);
         if embedded && (matches!(key.code, KeyCode::F(3)) || (scrolled && matches!(key.code, KeyCode::Char('/')))) {
             self.open_search();
             return;
@@ -878,18 +974,19 @@ impl App {
     }
 
     fn forward_to_remote(&mut self, key: &KeyEvent) {
-        let action = match &mut self.session {
+        let action = match &mut self.slots[self.work].session {
             Some(s) => s.handle_key(key),
             None => SessionAction::Keep,
         };
         if action == SessionAction::Detach {
-            self.detach_session("已返回列表");
+            self.detach_or_close_tab();
         }
     }
 
     /// F3：搜索已回看的终端输出（内嵌模式专有）。
     fn open_search(&mut self) {
-        let buffer = self.search.as_ref().map(|s| s.query.clone()).unwrap_or_default();
+        let slot_id = self.slots[self.work].id;
+        let buffer = self.slots[self.work].search.as_ref().map(|s| s.query.clone()).unwrap_or_default();
         let tx = self.event_tx.clone();
         self.prompt = Some(Prompt {
             title: "搜索历史输出".to_string(),
@@ -899,14 +996,15 @@ impl App {
             hint: Some("回车跳到首个命中 · n/N 下一条/上一条 · Esc 退出"),
             allow_empty: true,
             on_done: Box::new(move |value| {
-                let _ = tx.send(AppEvent::Search(value));
+                let _ = tx.send(AppEvent::Search { slot: slot_id, value });
             }),
         });
     }
 
     fn run_search(&mut self, query: &str) {
-        let Some(s) = self.session.as_mut() else {
-            self.search = None;
+        let slot = &mut self.slots[self.work];
+        let Some(s) = slot.session.as_mut() else {
+            slot.search = None;
             return;
         };
         let (max, lines) = s.history_lines();
@@ -918,16 +1016,16 @@ impl App {
             .map(|(i, _)| i)
             .collect();
         if hits.is_empty() {
-            self.search = None;
-            self.status = Some(format!("历史输出里没有「{query}」（共 {} 行）", lines.len()));
+            slot.search = None;
+            slot.status = Some(format!("历史输出里没有「{query}」（共 {} 行）", lines.len()));
             return;
         }
         // 从当前视图往下找第一个命中，到底了再回头（与 less 的 / 一致）
         let top = max.saturating_sub(s.scroll);
         let cursor = hits.iter().position(|i| *i > top).unwrap_or(0);
         let view_row = s.jump_history(max, hits[cursor]);
-        self.status = None;
-        self.search = Some(SearchState {
+        slot.status = None;
+        slot.search = Some(SearchState {
             query: query.to_string(),
             hits,
             cursor,
@@ -937,7 +1035,8 @@ impl App {
     }
 
     fn step_search(&mut self, next: bool) {
-        let (Some(search), Some(s)) = (self.search.as_mut(), self.session.as_mut()) else {
+        let slot = &mut self.slots[self.work];
+        let (Some(search), Some(s)) = (slot.search.as_mut(), slot.session.as_mut()) else {
             return;
         };
         let count = search.hits.len();
@@ -954,12 +1053,192 @@ impl App {
     }
 
     fn clear_search(&mut self) {
-        if self.search.take().is_none() {
+        if self.slots[self.work].search.take().is_none() {
             return;
         }
-        if let Some(s) = self.session.as_mut() {
+        if let Some(s) = self.slots[self.work].session.as_mut() {
             s.emu.set_scrollback(0);
             s.scroll = 0;
+        }
+    }
+
+    /// 事件属于哪个标签。会话级事件自带 id；那个标签已经被关掉就返回 None，
+    /// 事件直接丢弃——后台标签的回复绝不能落到用户正在看的标签上。
+    fn event_slot(&self, ev: &AppEvent) -> Option<usize> {
+        let id = match ev {
+            AppEvent::RemoteData { slot, .. }
+            | AppEvent::RemoteClosed { slot }
+            | AppEvent::Connected { slot, .. }
+            | AppEvent::Reconnect { slot, .. }
+            | AppEvent::Conflict { slot, .. }
+            | AppEvent::SftpCwd { slot, .. }
+            | AppEvent::ZmodemClear { slot, .. }
+            | AppEvent::PickedUpload { slot, .. }
+            | AppEvent::PickedSave { slot, .. }
+            | AppEvent::PickedUploadDir { slot, .. }
+            | AppEvent::PickedSaveDir { slot, .. }
+            | AppEvent::SftpStarted { slot, .. }
+            | AppEvent::SftpOp { slot, .. }
+            | AppEvent::Search { slot, .. }
+            | AppEvent::SftpHome { slot, .. }
+            | AppEvent::SftpListed { slot, .. }
+            | AppEvent::SftpProgress { slot, .. }
+            | AppEvent::SftpDone { slot, .. } => *slot,
+            _ => return Some(self.active),
+        };
+        self.slots.iter().position(|s| s.id == id)
+    }
+
+    /// 当前处理中的标签 id：派后台任务时带上，回调才找得到自己那一路。
+    fn slot_id(&self) -> u32 {
+        self.slots[self.work].id
+    }
+
+    /// 切换当前标签的页面。会话/浏览器页记在标签上，切回标签时恢复原样。
+    fn set_view(&mut self, view: ScreenKind) {
+        self.screen = view;
+        self.slots[self.work].view = view;
+    }
+
+    /// 标签当时看的页面：会话没了就只能回列表。
+    fn slot_view(&self, idx: usize) -> ScreenKind {
+        let slot = &self.slots[idx];
+        match slot.view {
+            ScreenKind::Session | ScreenKind::Browser if slot.session.is_some() => slot.view,
+            _ => ScreenKind::List,
+        }
+    }
+
+    /// 弹窗、系统对话框、表单开着时不允许换标签：挂在那里的回调会落到错误的标签上。
+    fn tabs_locked(&self) -> bool {
+        self.screen == ScreenKind::Form
+            || self.screen == ScreenKind::Unlock
+            || self.choice.is_some()
+            || self.prompt.is_some()
+            || self.dialog_open
+            || self.help_open
+    }
+
+    /// 追加一个空标签，返回它的下标。
+    fn push_tab(&mut self) -> usize {
+        let id = self.next_slot_id;
+        self.next_slot_id = self.next_slot_id.wrapping_add(1);
+        self.slots.push(Slot::new(id));
+        self.slots.len() - 1
+    }
+
+    /// 切到某个标签：页面跟着它自己走，全局弹窗与状态行一律清掉。
+    fn focus_tab(&mut self, idx: usize) {
+        if idx >= self.slots.len() || idx == self.active || self.tabs_locked() {
+            return;
+        }
+        self.active = idx;
+        self.work = idx;
+        self.screen = self.slot_view(idx);
+        self.settings_open = false;
+        self.transfer_popup = false;
+        self.status = None;
+        // 后台标签的目录可能已经被它自己的传输改过：切回来先重扫一次
+        let slot = &self.slots[idx];
+        if self.screen == ScreenKind::Browser
+            && slot.sftp.is_some()
+            && !slot.browser.loading
+            && !slot.browser.path.is_empty()
+        {
+            let path = slot.browser.path.clone();
+            self.start_listing(path);
+        }
+    }
+
+    /// F2：新建标签。已经有空标签就直接复用它，一路狂加空页没有意义。
+    fn new_tab(&mut self) {
+        if self.tabs_locked() {
+            return;
+        }
+        let idx = match self.slots.iter().position(Slot::is_idle) {
+            Some(idx) => idx,
+            None => self.push_tab(),
+        };
+        self.active = idx;
+        self.work = idx;
+        self.screen = ScreenKind::List;
+        self.settings_open = false;
+        self.transfer_popup = false;
+        self.status = None;
+    }
+
+    /// F5 / F6：在标签间循环。
+    fn cycle_tab(&mut self, next: bool) {
+        if self.tabs_locked() || self.slots.len() < 2 {
+            return;
+        }
+        let len = self.slots.len();
+        let idx = if next {
+            (self.active + 1) % len
+        } else {
+            (self.active + len - 1) % len
+        };
+        self.focus_tab(idx);
+    }
+
+    /// 关掉当前标签（断开它的会话）。关掉最后一个时换一个空标签，
+    /// 保证界面上永远有可停留的页面，`active` 也不会越界。
+    fn close_tab(&mut self) {
+        if self.tabs_locked() {
+            return;
+        }
+        if let Some(mut s) = self.slots[self.active].session.take() {
+            s.close();
+        }
+        self.slots.remove(self.active);
+        if self.slots.is_empty() {
+            self.push_tab();
+        }
+        self.active = self.active.min(self.slots.len() - 1);
+        self.work = self.active;
+        self.screen = self.slot_view(self.active);
+        self.settings_open = false;
+        self.transfer_popup = false;
+        self.status = None;
+    }
+
+    /// Ctrl-]：结束这一路会话。标签不止一个时关掉这个，只剩一个才退回列表。
+    fn detach_or_close_tab(&mut self) {
+        // 断开会话等于掐掉它手上的传输，第一次只提示；用标签 id 做键，
+        // 切到别的标签或隔了一次别的操作就不会误当成"第二次确认"。
+        let busy = self.slots[self.active]
+            .browser
+            .transfers
+            .iter()
+            .any(|t| !t.done);
+        let id = self.slots[self.active].id;
+        if busy && self.close_tab_confirm != Some(id) {
+            self.close_tab_confirm = Some(id);
+            self.status = Some("该标签还在传输，再按一次 Ctrl-] 确认断开".to_string());
+            return;
+        }
+        self.close_tab_confirm = None;
+        if self.slots.len() > 1 {
+            self.close_tab();
+        } else {
+            self.detach_session("已返回列表");
+        }
+    }
+
+    /// 系统弹窗关掉后，把期间挂起的 zmodem 检测继续走完。
+    fn replay_pending_zmodem(&mut self) {
+        let Some(ev) = self.slots[self.work].pending_zmodem.take() else {
+            return;
+        };
+        self.on_zmodem_event(ev);
+    }
+
+    /// 无参数 `sz` 把浏览器借去当"挑一个要下载的文件"，选完就回会话页。
+    fn leave_picker_to_session(&mut self) {
+        if self.work == self.active {
+            self.set_view(ScreenKind::Session);
+        } else {
+            self.slots[self.work].view = ScreenKind::Session;
         }
     }
 
@@ -1034,6 +1313,19 @@ impl App {
                     self.open_homepage();
                     return;
                 }
+                // 标签条：点标签切过去，点末尾的 + 新建一个
+                let count = self.slots.len();
+                if hit(ui::tab_new_rect(self.last_area, count), column, row) {
+                    self.new_tab();
+                    return;
+                }
+                if let Some((idx, _)) = ui::tab_rects(self.last_area, count)
+                    .into_iter()
+                    .find(|(_, r)| hit(*r, column, row))
+                {
+                    self.focus_tab(idx);
+                    return;
+                }
                 let [settings_r, upload_r, download_r, progress_r] =
                     ui::header_button_rects(self.last_area);
                 if hit(settings_r, column, row) {
@@ -1043,11 +1335,11 @@ impl App {
                     self.trigger_upload();
                 } else if hit(download_r, column, row) {
                     self.trigger_download();
-                } else if hit(progress_r, column, row) && !self.browser.transfers.is_empty() {
+                } else if hit(progress_r, column, row) && !self.slots[self.work].browser.transfers.is_empty() {
                     self.transfer_popup = true;
                 } else if hit(ui::session_emu_rect(self.last_area), column, row) {
                     // 终端区按下 = 开始拖选（鼠标捕获后原生选择失效，由 ells 自绘）
-                    if let Some(s) = &mut self.session {
+                    if let Some(s) = &mut self.slots[self.work].session {
                         s.begin_selection(column, row);
                     }
                 }
@@ -1055,9 +1347,9 @@ impl App {
             ScreenKind::Browser => {
                 let list = ui::browser_layout(self.last_area)[1];
                 if row >= list.y && row < list.y.saturating_add(list.height) {
-                    let idx = (row - list.y) as usize + self.browser.scroll;
-                    if idx < self.browser.entries.len() {
-                        self.browser.selected = idx;
+                    let idx = (row - list.y) as usize + self.slots[self.work].browser.scroll;
+                    if idx < self.slots[self.work].browser.entries.len() {
+                        self.slots[self.work].browser.selected = idx;
                     }
                 }
             }
@@ -1099,7 +1391,7 @@ impl App {
         if self.screen != ScreenKind::Session {
             return;
         }
-        if let Some(s) = &mut self.session {
+        if let Some(s) = &mut self.slots[self.work].session {
             s.update_selection(column, row);
         }
     }
@@ -1109,7 +1401,7 @@ impl App {
             return;
         }
         let area = ui::session_emu_rect(self.last_area);
-        let text = match &mut self.session {
+        let text = match &mut self.slots[self.work].session {
             Some(s) => {
                 s.update_selection(column, row);
                 s.selected_text(area)
@@ -1119,7 +1411,7 @@ impl App {
         if !text.is_empty() {
             term::copy_osc52(&text);
             let n = text.chars().count();
-            self.status = Some(format!("已复制 {n} 个字符（OSC 52 剪贴板）"));
+            self.slots[self.work].status = Some(format!("已复制 {n} 个字符（OSC 52 剪贴板）"));
         }
     }
 
@@ -1127,22 +1419,22 @@ impl App {
     fn handle_scroll(&mut self, delta: i8) {
         match self.screen {
             ScreenKind::Session => {
-                if let Some(s) = &mut self.session {
+                if let Some(s) = &mut self.slots[self.work].session {
                     s.handle_wheel(delta);
                 }
             }
             ScreenKind::Browser => {
-                if self.browser.entries.is_empty() {
+                if self.slots[self.work].browser.entries.is_empty() {
                     return;
                 }
                 let height = ui::browser_layout(self.last_area)[1].height.max(1) as usize;
-                let len = self.browser.entries.len();
+                let len = self.slots[self.work].browser.entries.len();
                 if delta > 0 {
-                    self.browser.selected = (self.browser.selected + 1).min(len - 1);
+                    self.slots[self.work].browser.selected = (self.slots[self.work].browser.selected + 1).min(len - 1);
                 } else {
-                    self.browser.selected = self.browser.selected.saturating_sub(1);
+                    self.slots[self.work].browser.selected = self.slots[self.work].browser.selected.saturating_sub(1);
                 }
-                let b = &mut self.browser;
+                let b = &mut self.slots[self.work].browser;
                 if b.selected >= b.scroll + height {
                     b.scroll = b.selected - height + 1;
                 }
@@ -1156,26 +1448,26 @@ impl App {
 
     /// 顶部「上传」按钮 = rz 功能：解析远端当前目录后弹系统文件选择框。
     fn trigger_upload(&mut self) {
-        if self.sftp.is_none() {
-            self.status = Some("该服务器不支持 SFTP 文件传输".to_string());
+        if self.slots[self.work].sftp.is_none() {
+            self.slots[self.work].status = Some("该服务器不支持 SFTP 文件传输".to_string());
             return;
         }
-        if self.remote_cwd.is_empty() {
-            self.rz_pending = true;
+        if self.slots[self.work].remote_cwd.is_empty() {
+            self.slots[self.work].rz_pending = true;
             self.refresh_remote_cwd();
         } else {
-            let dir = self.remote_cwd.clone();
+            let dir = self.slots[self.work].remote_cwd.clone();
             self.open_upload_picker(dir);
         }
     }
 
     /// 顶部「下载」按钮 = sz 功能：打开远端文件浏览器选择下载目标。
     fn trigger_download(&mut self) {
-        if self.sftp.is_none() {
-            self.status = Some("该服务器不支持 SFTP 文件传输".to_string());
+        if self.slots[self.work].sftp.is_none() {
+            self.slots[self.work].status = Some("该服务器不支持 SFTP 文件传输".to_string());
             return;
         }
-        self.sz_pick_mode = true;
+        self.slots[self.work].sz_pick_mode = true;
         self.open_browser();
     }
 
@@ -1350,17 +1642,29 @@ impl App {
 
     fn detach_session(&mut self, status: &str) {
         // 主动断开：不给"连接已断开 / 重连"弹窗，这条会话到此为止
-        self.last_host = None;
-        if let Some(mut s) = self.session.take() {
+        let label = if let Some(mut s) = self.slots[self.work].session.take() {
             s.close();
-            self.status = Some(format!("[{}] {status}", s.label));
+            Some(s.label.clone())
+        } else {
+            None
+        };
+        let slot = &mut self.slots[self.work];
+        slot.host = None;
+        slot.connecting = false;
+        slot.sftp = None;
+        slot.browser.reset();
+        slot.browser.transfers.clear();
+        slot.remote_cwd.clear();
+        slot.sz_pending.clear();
+        slot.rz_pending = false;
+        slot.sz_pick_mode = false;
+        slot.sz_saveas_pending = false;
+        slot.pending_zmodem = None;
+        slot.search = None;
+        slot.view = ScreenKind::List;
+        if let Some(label) = label {
+            slot.status = Some(format!("[{label}] {status}"));
         }
-        self.sftp = None;
-        self.remote_cwd.clear();
-        self.sz_pending.clear();
-        self.rz_pending = false;
-        self.sz_pick_mode = false;
-        self.sz_saveas_pending = false;
         self.settings_open = false;
         self.transfer_popup = false;
         self.screen = ScreenKind::List;
@@ -1368,46 +1672,49 @@ impl App {
     }
 
     fn open_browser(&mut self) {
-        let Some(sftp) = self.sftp.clone() else {
-            self.status = Some("该服务器不支持 SFTP 文件传输".to_string());
+        let Some(sftp) = self.slots[self.work].sftp.clone() else {
+            self.slots[self.work].status = Some("该服务器不支持 SFTP 文件传输".to_string());
             return;
         };
-        self.browser.reset();
-        self.browser.loading = true;
-        self.screen = ScreenKind::Browser;
+        self.slots[self.work].browser.reset();
+        self.slots[self.work].browser.loading = true;
+        self.set_view(ScreenKind::Browser);
         let tx = self.event_tx.clone();
+        let slot = self.slot_id();
         tokio::spawn(async move {
             let res = sftp
                 .canonicalize(".")
                 .await
                 .map_err(|e| format!("无法解析远端目录: {e}"));
-            let _ = tx.send(AppEvent::SftpHome(res));
+            let _ = tx.send(AppEvent::SftpHome { slot, res });
         });
     }
 
     fn start_listing(&mut self, dir: String) {
-        let Some(sftp) = self.sftp.clone() else {
+        let Some(sftp) = self.slots[self.work].sftp.clone() else {
             return;
         };
-        self.browser.path = dir.clone();
-        self.browser.loading = true;
-        self.browser.error = None;
+        self.slots[self.work].browser.path = dir.clone();
+        self.slots[self.work].browser.loading = true;
+        self.slots[self.work].browser.error = None;
         let tx = self.event_tx.clone();
+        let slot = self.slot_id();
         tokio::spawn(async move {
             let res = ells_transfer::list(&sftp, &dir)
                 .await
                 .map_err(|e| format!("{e:#}"));
-            let _ = tx.send(AppEvent::SftpListed(res));
+            let _ = tx.send(AppEvent::SftpListed { slot, res });
         });
     }
 
     fn open_upload_picker(&mut self, dest: String) {
-        if self.sftp.is_none() {
+        if self.slots[self.work].sftp.is_none() {
             return;
         }
         self.dialog_open = true;
-        self.upload_dest = Some(dest);
+        self.slots[self.work].upload_dest = Some(dest);
         let tx = self.event_tx.clone();
+        let slot = self.slot_id();
         tokio::spawn(async move {
             let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
             let path = tokio::task::spawn_blocking(move || {
@@ -1416,18 +1723,19 @@ impl App {
             .await
             .ok()
             .flatten();
-            let _ = tx.send(AppEvent::PickedUpload(path));
+            let _ = tx.send(AppEvent::PickedUpload { slot, path });
         });
     }
 
     /// 递归上传整个目录（浏览器 `U`）。
     fn open_upload_dir_picker(&mut self, dest: String) {
-        if self.sftp.is_none() {
+        if self.slots[self.work].sftp.is_none() {
             return;
         }
         self.dialog_open = true;
-        self.upload_dest = Some(dest);
+        self.slots[self.work].upload_dest = Some(dest);
         let tx = self.event_tx.clone();
+        let slot = self.slot_id();
         tokio::spawn(async move {
             let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
             let path = tokio::task::spawn_blocking(move || {
@@ -1436,37 +1744,38 @@ impl App {
             .await
             .ok()
             .flatten();
-            let _ = tx.send(AppEvent::PickedUploadDir(path));
+            let _ = tx.send(AppEvent::PickedUploadDir { slot, path });
         });
     }
 
     /// 上传本地文件或目录（目录自动走递归上传）。目标目录取 upload_dest，其次当前浏览目录。
     fn start_upload(&mut self, local: PathBuf) {
-        let Some(sftp) = self.sftp.clone() else {
-            self.status = Some("上传失败：该连接没有 SFTP 通道".to_string());
+        let Some(sftp) = self.slots[self.work].sftp.clone() else {
+            self.slots[self.work].status = Some("上传失败：该连接没有 SFTP 通道".to_string());
             return;
         };
         let Some(name) = local.file_name().map(|s| s.to_string_lossy().into_owned()) else {
-            self.status = Some("无法解析所选文件名".to_string());
+            self.slots[self.work].status = Some("无法解析所选文件名".to_string());
             return;
         };
-        let dest = self.upload_dest.take().unwrap_or_default();
+        let dest = self.slots[self.work].upload_dest.take().unwrap_or_default();
         if dest.is_empty() {
-            self.status = Some("上传失败：还不知道要传到哪个远端目录".to_string());
+            self.slots[self.work].status = Some("上传失败：还不知道要传到哪个远端目录".to_string());
             return;
         }
         let tx = self.event_tx.clone();
+        let slot = self.slot_id();
         let cancel = self.fresh_cancel();
         tokio::spawn(async move {
             let (ptx, mut prx) = mpsc::unbounded_channel::<Progress>();
             let pump_tx = tx.clone();
             let pump = tokio::spawn(async move {
                 while let Some(pr) = prx.recv().await {
-                    let _ = pump_tx.send(AppEvent::SftpProgress(pr));
+                    let _ = pump_tx.send(AppEvent::SftpProgress { slot, pr });
                 }
             });
-            let res = run_upload(sftp, local, dest, name, ptx, &tx, &cancel).await;
-            let _ = tx.send(AppEvent::SftpDone(res));
+            let res = run_upload(sftp, local, dest, name, ptx, &tx, slot, &cancel).await;
+            let _ = tx.send(AppEvent::SftpDone { slot, res });
             let _ = pump.await;
         });
     }
@@ -1501,25 +1810,26 @@ impl App {
         rename: Option<String>,
         confirm_overwrite: bool,
     ) {
-        let Some(sftp) = self.sftp.clone() else {
-            self.status = Some("该服务器不支持 SFTP 文件传输".to_string());
+        let Some(sftp) = self.slots[self.work].sftp.clone() else {
+            self.slots[self.work].status = Some("该服务器不支持 SFTP 文件传输".to_string());
             return;
         };
         let label = entry.name.clone();
         let name = rename.unwrap_or(label.clone());
         let tx = self.event_tx.clone();
+        let slot = self.slot_id();
         let cancel = self.fresh_cancel();
         tokio::spawn(async move {
             let (ptx, mut prx) = mpsc::unbounded_channel::<Progress>();
             let pump_tx = tx.clone();
             let pump = tokio::spawn(async move {
                 while let Some(pr) = prx.recv().await {
-                    let _ = pump_tx.send(AppEvent::SftpProgress(pr));
+                    let _ = pump_tx.send(AppEvent::SftpProgress { slot, pr });
                 }
             });
-            let res = run_download(sftp, entry, dest_dir, name, confirm_overwrite, ptx, &tx, &cancel)
+            let res = run_download(sftp, entry, dest_dir, name, confirm_overwrite, ptx, &tx, slot, &cancel)
                 .await;
-            let _ = tx.send(AppEvent::SftpDone(res));
+            let _ = tx.send(AppEvent::SftpDone { slot, res });
             let _ = pump.await;
         });
     }
@@ -1543,12 +1853,13 @@ impl App {
     /// 为一次下载选落点：目录→系统目录选择框，文件→系统另存为。
     /// 类型未知时（sz 只给了路径）先在后台查一次远端元数据。
     fn open_pick_target(&mut self, entry: FileEntry) {
-        let Some(sftp) = self.sftp.clone() else {
-            self.status = Some("该服务器不支持 SFTP 文件传输".to_string());
+        let Some(sftp) = self.slots[self.work].sftp.clone() else {
+            self.slots[self.work].status = Some("该服务器不支持 SFTP 文件传输".to_string());
             return;
         };
         self.dialog_open = true;
         let tx = self.event_tx.clone();
+        let slot = self.slot_id();
         tokio::spawn(async move {
             let mut entry = entry;
             if entry.size == 0 {
@@ -1571,9 +1882,9 @@ impl App {
             .ok()
             .flatten();
             let _ = tx.send(if is_dir {
-                AppEvent::PickedSaveDir { entry, path }
+                AppEvent::PickedSaveDir { slot, entry, path }
             } else {
-                AppEvent::PickedSave { entry, path }
+                AppEvent::PickedSave { slot, entry, path }
             });
         });
     }
@@ -1584,42 +1895,44 @@ impl App {
 
     /// 每次新传输领一个干净的取消位（上一次 Ctrl-C 之后必须还能继续传）。
     fn fresh_cancel(&mut self) -> Cancel {
-        if self.cancel.is_cancelled() {
-            self.cancel = Cancel::default();
+        if self.slots[self.work].cancel.is_cancelled() {
+            self.slots[self.work].cancel = Cancel::default();
         }
-        self.cancel.clone()
+        self.slots[self.work].cancel.clone()
     }
 
-    /// Ctrl-C：取消本次会话全部进行中的传输。已写入的部分不会被自动删除。
+    /// Ctrl-C：取消本标签全部进行中的传输。已写入的部分不会被自动删除。
     fn cancel_transfers(&mut self) {
-        let active = self
+        let active = self.slots[self.work]
             .browser
             .transfers
             .iter()
             .filter(|t| !t.done)
             .count();
         if active == 0 {
-            self.status = Some("没有进行中的传输（Ctrl-C 用于取消传输）".to_string());
+            self.slots[self.work].status =
+                Some("没有进行中的传输（Ctrl-C 用于取消传输）".to_string());
             return;
         }
         // 覆盖确认弹窗挂在那里时先替用户答"取消"，否则任务会一直等
         if self.choice.is_some() {
             self.answer_choice(None);
         }
-        self.cancel.cancel();
-        self.status = Some(format!(
+        self.slots[self.work].cancel.cancel();
+        self.slots[self.work].status = Some(format!(
             "已请求取消 {active} 个传输（已下载的部分文件不会自动删除）"
         ));
     }
 
     /// m：在当前远端目录下新建子目录。
     fn prompt_mkdir(&mut self) {
-        let Some(sftp) = self.sftp.clone() else {
-            self.status = Some("该服务器不支持 SFTP 文件传输".to_string());
+        let Some(sftp) = self.slots[self.work].sftp.clone() else {
+            self.slots[self.work].status = Some("该服务器不支持 SFTP 文件传输".to_string());
             return;
         };
-        let dir = self.browser.path.clone();
+        let dir = self.slots[self.work].browser.path.clone();
         let tx = self.event_tx.clone();
+        let slot = self.slot_id();
         self.prompt = Some(Prompt {
             title: "新建目录".to_string(),
             label: "目录名",
@@ -1635,7 +1948,7 @@ impl App {
                         .await
                         .map(|_| format!("已创建目录 {path}"))
                         .map_err(|e| format!("{e:#}"));
-                    let _ = tx.send(AppEvent::SftpOp(res));
+                    let _ = tx.send(AppEvent::SftpOp { slot, res });
                 });
             }),
         });
@@ -1643,16 +1956,17 @@ impl App {
 
     /// n：重命名选中项（仍在原目录内，改名 = 移到同目录的新名字）。
     fn prompt_rename(&mut self) {
-        let Some(sftp) = self.sftp.clone() else {
-            self.status = Some("该服务器不支持 SFTP 文件传输".to_string());
+        let Some(sftp) = self.slots[self.work].sftp.clone() else {
+            self.slots[self.work].status = Some("该服务器不支持 SFTP 文件传输".to_string());
             return;
         };
-        let Some(entry) = self.browser.entries.get(self.browser.selected).cloned() else {
-            self.status = Some("请先选中要重命名的项".to_string());
+        let Some(entry) = self.slots[self.work].browser.entries.get(self.slots[self.work].browser.selected).cloned() else {
+            self.slots[self.work].status = Some("请先选中要重命名的项".to_string());
             return;
         };
         let parent = ells_transfer::remote_parent(&entry.path);
         let tx = self.event_tx.clone();
+        let slot = self.slot_id();
         self.prompt = Some(Prompt {
             title: format!("重命名 {}", entry.name),
             label: "新名字",
@@ -1664,7 +1978,10 @@ impl App {
                 let Some(name) = name else { return };
                 let to = ells_transfer::remote_join(&parent, &name);
                 if to == entry.path {
-                    let _ = tx.send(AppEvent::SftpOp(Ok("名字没变，未做改动".to_string())));
+                    let _ = tx.send(AppEvent::SftpOp {
+                        slot,
+                        res: Ok("名字没变，未做改动".to_string()),
+                    });
                     return;
                 }
                 let from = entry.path.clone();
@@ -1673,7 +1990,7 @@ impl App {
                         .await
                         .map(|_| format!("已重命名 {from} → {to}"))
                         .map_err(|e| format!("{e:#}"));
-                    let _ = tx.send(AppEvent::SftpOp(res));
+                    let _ = tx.send(AppEvent::SftpOp { slot, res });
                 });
             }),
         });
@@ -1681,15 +1998,16 @@ impl App {
 
     /// D：删除选中项。目录会递归删除且不可恢复，因此永远先问一次。
     fn ask_delete_entry(&mut self) {
-        let Some(sftp) = self.sftp.clone() else {
-            self.status = Some("该服务器不支持 SFTP 文件传输".to_string());
+        let Some(sftp) = self.slots[self.work].sftp.clone() else {
+            self.slots[self.work].status = Some("该服务器不支持 SFTP 文件传输".to_string());
             return;
         };
-        let Some(entry) = self.browser.entries.get(self.browser.selected).cloned() else {
-            self.status = Some("请先选中要删除的项".to_string());
+        let Some(entry) = self.slots[self.work].browser.entries.get(self.slots[self.work].browser.selected).cloned() else {
+            self.slots[self.work].status = Some("请先选中要删除的项".to_string());
             return;
         };
         let tx = self.event_tx.clone();
+        let slot = self.slot_id();
         let cancel = self.fresh_cancel();
         self.choice = Some(Choice {
             title: "删除确认".to_string(),
@@ -1718,7 +2036,7 @@ impl App {
                         .await
                         .map(|n| format!("已删除 {path}（{n} 项）"))
                         .map_err(|e| format!("{e:#}"));
-                    let _ = tx.send(AppEvent::SftpOp(res));
+                    let _ = tx.send(AppEvent::SftpOp { slot, res });
                 });
             }),
         });
@@ -1727,13 +2045,13 @@ impl App {
     fn register_transfer(&mut self, label: String, direction: &'static str) {
         // 完成的传输保留在本次会话里（顶部"传输进度 x/x"要统计总数），
         // 只在异常多时裁掉最旧的，防止长会话内存无限增长
-        while self.browser.transfers.iter().filter(|t| t.done).count() >= 50 {
-            let Some(idx) = self.browser.transfers.iter().position(|t| t.done) else {
+        while self.slots[self.work].browser.transfers.iter().filter(|t| t.done).count() >= 50 {
+            let Some(idx) = self.slots[self.work].browser.transfers.iter().position(|t| t.done) else {
                 break;
             };
-            self.browser.transfers.remove(idx);
+            self.slots[self.work].browser.transfers.remove(idx);
         }
-        self.browser.transfers.push(TransferItem {
+        self.slots[self.work].browser.transfers.push(TransferItem {
             label,
             direction,
             progress: None,
@@ -1744,81 +2062,92 @@ impl App {
 
     fn on_zmodem_event(&mut self, ev: crate::zmodem::ZmodemEvent) {
         use crate::zmodem::ZmodemEvent as Z;
-        if !matches!(ev, Z::Missing { .. }) && self.dialog_open {
+        // 系统对话框一次只能开一个，而且不该在用户没看的那个标签上抢焦点：
+        // 后台标签先挂起，切回该标签或关掉当前弹窗后再继续。
+        let background = self.work != self.active;
+        if !matches!(ev, Z::Missing { .. }) && (self.dialog_open || background) {
             let name = match &ev {
                 Z::Send { .. } => "sz",
                 Z::Receive => "rz",
                 _ => "zmodem",
             };
-            self.status = Some(format!("已拦截 {name}：请先完成当前弹窗，完成后会自动继续"));
-            self.pending_zmodem = Some(ev);
+            self.slots[self.work].status = Some(if background {
+                format!("已拦截 {name}：切回该标签后继续")
+            } else {
+                format!("已拦截 {name}：请先完成当前弹窗，完成后会自动继续")
+            });
+            self.slots[self.work].pending_zmodem = Some(ev);
             return;
         }
         match ev {
             Z::Missing { sz } => {
                 let cmd = if sz { "sz" } else { "rz" };
-                self.status = Some(format!(
+                self.slots[self.work].status = Some(format!(
                     "远端没有 {cmd}：ells 的 sz/rz 转换需要服务器安装 lrzsz（apt/yum install lrzsz）"
                 ));
             }
             Z::Send { files } => {
                 self.clear_zmodem_soon();
-                if self.sftp.is_none() {
-                    self.status = Some("已拦截 sz，但该连接没有 SFTP 通道".to_string());
+                if self.slots[self.work].sftp.is_none() {
+                    self.slots[self.work].status = Some("已拦截 sz，但该连接没有 SFTP 通道".to_string());
                     return;
                 }
                 // 新的 sz 意图取代可能残留的 rz 等待，避免 SftpCwd 回来时先弹上传框
-                self.rz_pending = false;
+                self.slots[self.work].rz_pending = false;
                 if files.is_empty() {
-                    self.status =
+                    self.slots[self.work].status =
                         Some("已拦截 sz：请在文件浏览器中选择要下载的文件".to_string());
-                    self.sz_pick_mode = true;
+                    self.slots[self.work].sz_pick_mode = true;
                     self.open_browser();
                     return;
                 }
                 if files.len() == 1 {
                     // 单文件 sz：直接弹系统「另存为」
-                    self.status = Some("已拦截 sz：请在弹出窗口选择保存位置".to_string());
+                    self.slots[self.work].status =
+                        Some("已拦截 sz：请在弹出窗口选择保存位置".to_string());
                     let f = files[0].clone();
-                    if self.remote_cwd.is_empty() {
-                        self.sz_saveas_pending = true;
-                        self.sz_pending = files;
+                    if self.slots[self.work].remote_cwd.is_empty() {
+                        self.slots[self.work].sz_saveas_pending = true;
+                        self.slots[self.work].sz_pending = files;
                         self.refresh_remote_cwd();
                     } else {
-                        let cwd = self.remote_cwd.clone();
+                        let cwd = self.slots[self.work].remote_cwd.clone();
                         self.open_sz_save_as(&f, cwd);
                     }
                     return;
                 }
-                self.status = Some(format!("已拦截 sz：{} 个文件改走 SFTP 下载", files.len()));
-                if self.remote_cwd.is_empty() {
-                    self.sz_pending = files;
+                self.slots[self.work].status =
+                    Some(format!("已拦截 sz：{} 个文件改走 SFTP 下载", files.len()));
+                if self.slots[self.work].remote_cwd.is_empty() {
+                    self.slots[self.work].sz_pending = files;
                     self.refresh_remote_cwd();
                 } else {
-                    let cwd = self.remote_cwd.clone();
+                    let cwd = self.slots[self.work].remote_cwd.clone();
                     self.start_sz(files, cwd);
                 }
             }
             Z::Receive => {
                 self.clear_zmodem_soon();
-                if self.sftp.is_none() {
-                    self.status = Some("已拦截 rz，但该连接没有 SFTP 通道".to_string());
+                if self.slots[self.work].sftp.is_none() {
+                    self.slots[self.work].status = Some("已拦截 rz，但该连接没有 SFTP 通道".to_string());
                     return;
                 }
-                self.sz_pending.clear();
-                self.sz_saveas_pending = false;
-                self.status = Some("已拦截 rz：请在弹出窗口选择要上传的本地文件".to_string());
-                if self.remote_cwd.is_empty() {
-                    self.rz_pending = true;
+                self.slots[self.work].sz_pending.clear();
+                self.slots[self.work].sz_saveas_pending = false;
+                self.slots[self.work].status =
+                    Some("已拦截 rz：请在弹出窗口选择要上传的本地文件".to_string());
+                if self.slots[self.work].remote_cwd.is_empty() {
+                    self.slots[self.work].rz_pending = true;
                     self.refresh_remote_cwd();
                 } else {
-                    let cwd = self.remote_cwd.clone();
+                    let cwd = self.slots[self.work].remote_cwd.clone();
                     self.open_upload_picker(cwd);
                 }
             }
             Z::Unknown => {
                 self.clear_zmodem_soon();
-                self.status = Some("检测到 ZMODEM 握手但无法判定方向，已中止远端传输".to_string());
+                self.slots[self.work].status =
+                    Some("检测到 ZMODEM 握手但无法判定方向，已中止远端传输".to_string());
             }
         }
     }
@@ -1841,21 +2170,23 @@ impl App {
     }
 
     fn refresh_remote_cwd(&mut self) {
-        let Some(sftp) = self.sftp.clone() else { return };
+        let Some(sftp) = self.slots[self.work].sftp.clone() else { return };
         let tx = self.event_tx.clone();
+        let slot = self.slot_id();
         tokio::spawn(async move {
             let res = sftp.canonicalize(".").await.map_err(|e| e.to_string());
-            let _ = tx.send(AppEvent::SftpCwd(res));
+            let _ = tx.send(AppEvent::SftpCwd { slot, res });
         });
     }
 
     fn clear_zmodem_soon(&mut self) {
-        self.zclear_seq += 1;
-        let seq = self.zclear_seq;
+        self.slots[self.work].zclear_seq += 1;
+        let seq = self.slots[self.work].zclear_seq;
         let tx = self.event_tx.clone();
+        let slot = self.slot_id();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(4000)).await;
-            let _ = tx.send(AppEvent::ZmodemClear(seq));
+            let _ = tx.send(AppEvent::ZmodemClear { slot, seq });
         });
     }
 
@@ -1868,7 +2199,7 @@ impl App {
         match cmd.len() {
             1 => {
                 // bare `cd` → home; ask SFTP to resolve it.
-                self.remote_cwd.clear();
+                self.slots[self.work].remote_cwd.clear();
                 self.refresh_remote_cwd();
             }
             2 => {
@@ -1879,16 +2210,16 @@ impl App {
                     return;
                 }
                 if arg.starts_with('/') {
-                    self.remote_cwd = arg.clone();
+                    self.slots[self.work].remote_cwd = arg.clone();
                     return;
                 }
-                if self.remote_cwd.is_empty() {
+                if self.slots[self.work].remote_cwd.is_empty() {
                     return;
                 }
-                self.remote_cwd = if arg == ".." {
-                    ells_transfer::remote_parent(&self.remote_cwd)
+                self.slots[self.work].remote_cwd = if arg == ".." {
+                    ells_transfer::remote_parent(&self.slots[self.work].remote_cwd)
                 } else {
-                    ells_transfer::remote_join(&self.remote_cwd, arg.trim_start_matches("./"))
+                    ells_transfer::remote_join(&self.slots[self.work].remote_cwd, arg.trim_start_matches("./"))
                 };
             }
             _ => {}
@@ -1902,22 +2233,22 @@ impl App {
         }
         match key.code {
             KeyCode::Esc => {
-                self.sz_pick_mode = false;
+                self.slots[self.work].sz_pick_mode = false;
                 self.screen = ScreenKind::Session;
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                self.browser.selected = self.browser.selected.saturating_sub(1);
+                self.slots[self.work].browser.selected = self.slots[self.work].browser.selected.saturating_sub(1);
             }
             KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
-                if self.browser.selected + 1 < self.browser.entries.len() {
-                    self.browser.selected += 1;
+                if self.slots[self.work].browser.selected + 1 < self.slots[self.work].browser.entries.len() {
+                    self.slots[self.work].browser.selected += 1;
                 }
             }
             KeyCode::Enter => {
-                if let Some(entry) = self.browser.entries.get(self.browser.selected).cloned() {
+                if let Some(entry) = self.slots[self.work].browser.entries.get(self.slots[self.work].browser.selected).cloned() {
                     if entry.is_dir {
                         self.start_listing(entry.path);
-                    } else if self.sz_pick_mode {
+                    } else if self.slots[self.work].sz_pick_mode {
                         self.open_save_as(entry);
                     } else {
                         self.start_download(entry);
@@ -1925,22 +2256,22 @@ impl App {
                 }
             }
             KeyCode::Backspace | KeyCode::Char('h') => {
-                if self.browser.path != "/" {
-                    let parent = ells_transfer::remote_parent(&self.browser.path);
+                if self.slots[self.work].browser.path != "/" {
+                    let parent = ells_transfer::remote_parent(&self.slots[self.work].browser.path);
                     self.start_listing(parent);
                 }
             }
             KeyCode::Char('u') => {
-                let path = self.browser.path.clone();
+                let path = self.slots[self.work].browser.path.clone();
                 self.open_upload_picker(path)
             }
             KeyCode::Char('U') => {
-                let path = self.browser.path.clone();
+                let path = self.slots[self.work].browser.path.clone();
                 self.open_upload_dir_picker(path)
             }
             KeyCode::Char('d') => {
-                if let Some(entry) = self.browser.entries.get(self.browser.selected).cloned() {
-                    if self.sz_pick_mode || entry.is_dir {
+                if let Some(entry) = self.slots[self.work].browser.entries.get(self.slots[self.work].browser.selected).cloned() {
+                    if self.slots[self.work].sz_pick_mode || entry.is_dir {
                         self.open_save_as(entry);
                     } else {
                         self.start_download(entry);
@@ -1948,7 +2279,7 @@ impl App {
                 }
             }
             KeyCode::Char('r') => {
-                let path = self.browser.path.clone();
+                let path = self.slots[self.work].browser.path.clone();
                 self.start_listing(path);
             }
             KeyCode::Char('m') => self.prompt_mkdir(),
@@ -2112,10 +2443,26 @@ impl App {
 
     fn handle_list_key(&mut self, key: &KeyEvent, ctrl: bool) {
         let len = self.vault.hosts.len();
+        if matches!(key.code, KeyCode::Esc | KeyCode::Char('q'))
+            || (ctrl && matches!(key.code, KeyCode::Char('c')))
+        {
+            // 后台标签还在传输：先问一句，别让半截文件被当成完整的
+            let busy = self
+                .slots
+                .iter()
+                .filter(|s| s.browser.transfers.iter().any(|t| !t.done))
+                .count();
+            if busy > 0 && !self.quit_confirm {
+                self.quit_confirm = true;
+                self.status =
+                    Some(format!("还有 {busy} 个标签在传输中，再按一次 q 仍然退出"));
+                return;
+            }
+            self.done = true;
+            return;
+        }
+        self.quit_confirm = false;
         match key.code {
-            KeyCode::Esc => self.done = true,
-            KeyCode::Char('q') => self.done = true,
-            KeyCode::Char('c') if ctrl => self.done = true,
             KeyCode::Up | KeyCode::Char('k') => {
                 self.list.selected = self.list.selected.saturating_sub(1);
             }
@@ -2149,7 +2496,7 @@ impl App {
             KeyCode::Char('?') | KeyCode::F(1) => self.help_open = true,
             KeyCode::Enter => {
                 if let Some(host) = self.vault.hosts.get(self.list.selected).cloned() {
-                    self.start_connect(host);
+                    self.start_connect(host, None);
                 }
             }
             _ => {}
@@ -2203,7 +2550,7 @@ impl App {
                     "ells-新增主机".to_string()
                 }
             }
-            ScreenKind::Session => match &self.session {
+            ScreenKind::Session => match &self.slots[self.active].session {
                 // label 形如 `别名 · user@host:port`，标签页只需要别名
                 Some(s) => {
                     format!("ells-{}", s.label.split(" · ").next().unwrap_or("会话"))
@@ -2218,9 +2565,27 @@ impl App {
         }
     }
 
-    fn start_connect(&mut self, host: Host) {
+    /// 开始连接。`target` = 落到哪个标签；None = 当前标签空着就用它，否则新开一个。
+    fn start_connect(&mut self, host: Host, target: Option<usize>) {
+        let idx = match target {
+            Some(idx) => idx.min(self.slots.len() - 1),
+            None if self.slots[self.active].is_idle() => self.active,
+            None => self.push_tab(),
+        };
+        {
+            let slot = &mut self.slots[idx];
+            slot.host = Some(host.clone());
+            slot.connecting = true;
+            slot.view = ScreenKind::List;
+            slot.status = Some(format!("正在连接 {}…", host.alias));
+        }
+        self.active = idx;
+        self.work = idx;
+        self.screen = ScreenKind::List;
+        self.settings_open = false;
+        self.transfer_popup = false;
         self.status = Some(format!("正在连接 {}…", host.alias));
-        self.pending_connect = Some(host);
+        self.pending_connect = Some((host, idx));
     }
 
     /// `ells <别名>` / `s <别名>`：解锁后按别名直连，只尝试一次。
@@ -2236,16 +2601,14 @@ impl App {
             .find(|h| h.alias == alias || h.alias.to_lowercase() == lower)
             .cloned();
         match host {
-            Some(host) => self.start_connect(host),
+            Some(host) => self.start_connect(host, None),
             None => self.status = Some(format!("找不到别名为 `{alias}` 的主机")),
         }
     }
 
     /// 连接放到后台任务：主机密钥确认要求事件环一直能响应按键。
-    fn spawn_connect(&mut self, host: Host) {
-        self.connecting_label = Some(format!("{} · {}", host.alias, host.target()));
-        // 记住当前主机：意外断开时用它提供重连（主动断开会清掉）
-        self.last_host = Some(host.clone());
+    fn spawn_connect(&mut self, host: Host, idx: usize) {
+        let id = self.slots[idx].id;
         let vault = self.vault.clone();
         let policy = self.hostkey.clone();
         let (cols, rows) = term_size();
@@ -2254,7 +2617,7 @@ impl App {
             let res = RemoteSession::connect(&host, &vault, cols, rows.max(2) - 1, &policy)
                 .await
                 .map_err(|e| format!("{e:#}"));
-            let _ = tx.send(AppEvent::Connected(res));
+            let _ = tx.send(AppEvent::Connected { slot: id, res });
         });
     }
 
@@ -2264,6 +2627,7 @@ impl App {
             self.list.selected = idx;
         }
         let tx = self.event_tx.clone();
+        let slot = self.slot_id();
         self.choice = Some(Choice {
             title: "连接已断开".to_string(),
             lines: vec![
@@ -2276,42 +2640,61 @@ impl App {
             danger: false,
             on_pick: Box::new(move |idx| {
                 if matches!(idx, Some(0)) {
-                    let _ = tx.send(AppEvent::Reconnect(host));
+                    let _ = tx.send(AppEvent::Reconnect { slot, host });
                 }
             }),
         });
     }
 
     fn on_connected(&mut self, res: std::result::Result<RemoteSession, String>) {
+        let event_tx = self.event_tx.clone();
+        let idx = self.work;
+        // 后台标签连上了不该抢界面：用户可能正在另一路上打字
+        let foreground = idx == self.active;
+        let mut connected = false;
         match res {
             Ok(mut session) => {
-                if let Some(rx) = session.take_output() {
-                    events::spawn_remote_pump(rx, self.event_tx.clone());
-                }
-                let label = self
-                    .connecting_label
-                    .take()
+                let slot = &mut self.slots[idx];
+                slot.connecting = false;
+                let id = slot.id;
+                // 会话标题直接用主机别名，重连/多标签下都比旧的全局缓存可靠
+                let label = slot
+                    .host
+                    .as_ref()
+                    .map(|h| format!("{} · {}", h.alias, h.target()))
                     .unwrap_or_else(|| "会话".to_string());
-                self.sftp = session.sftp();
+                if let Some(rx) = session.take_output() {
+                    events::spawn_remote_pump(rx, event_tx, id);
+                }
+                slot.sftp = session.sftp();
                 let (cols, rows) = term_size();
-                let state = SessionState::new(label, session, rows, cols);
-                self.session = Some(state);
-                self.screen = ScreenKind::Session;
-                self.status = None;
-                self.remote_cwd.clear();
-                self.sz_pending.clear();
-                self.rz_pending = false;
+                slot.session = Some(SessionState::new(label, session, rows, cols));
+                slot.remote_cwd.clear();
+                slot.sz_pending.clear();
+                slot.rz_pending = false;
+                slot.search = None;
                 // 新连接从零开始：清掉上一个会话的传输记录
-                self.browser.transfers.clear();
-                self.transfer_popup = false;
-                self.cancel = Cancel::default();
-                self.refresh_remote_cwd();
+                slot.browser.transfers.clear();
+                slot.cancel = Cancel::default();
+                slot.status = None;
+                slot.view = ScreenKind::Session;
+                connected = true;
             }
             Err(err) => {
-                self.connecting_label = None;
-                self.status = Some(format!("连接失败: {err}"));
+                let msg = format!("连接失败: {err}");
+                let slot = &mut self.slots[idx];
+                slot.connecting = false;
+                slot.host = None;
+                slot.status = Some(msg.clone());
+                self.status = Some(msg);
             }
         }
+        if foreground && connected {
+            self.screen = ScreenKind::Session;
+            self.status = None;
+            self.transfer_popup = false;
+        }
+        self.refresh_remote_cwd();
     }
 
     /// 首次见到 / 密钥变更：把决策交给用户，连接任务在等这把密钥的回答。
@@ -2353,6 +2736,10 @@ impl App {
             format!("文件：{}", prompt.name),
             format!("目标：{}", prompt.target),
         ];
+        // 冲突也可能来自后台标签：不说清楚用户会以为弹窗是凭空出现的
+        if self.work != self.active {
+            lines.insert(0, format!("标签：{}", self.slots[self.work].title()));
+        }
         if let Some(size) = prompt.size {
             lines.push(format!("已存在：{}", ui::human_size(size)));
         }
@@ -2476,7 +2863,7 @@ impl App {
         }
         if self.screen == ScreenKind::Session {
             if !text.is_empty() {
-                if let Some(s) = &mut self.session {
+                if let Some(s) = &mut self.slots[self.work].session {
                     s.handle_paste(text);
                 }
             }
@@ -3064,6 +3451,7 @@ fn local_taken(dir: &Path, fallback: &str) -> std::collections::HashSet<String> 
 /// None = 用户放弃。UI 不回答（比如会话断了）也按放弃处理，绝不默默覆盖。
 async fn ask_overwrite<T: Fn(&str) -> bool>(
     tx: &mpsc::UnboundedSender<AppEvent>,
+    slot: u32,
     location: &'static str,
     name: &str,
     target: &str,
@@ -3072,13 +3460,16 @@ async fn ask_overwrite<T: Fn(&str) -> bool>(
 ) -> Option<String> {
     let (responder, answer) = oneshot::channel();
     if tx
-        .send(AppEvent::Conflict(ConflictPrompt {
-            location,
-            name: name.to_string(),
-            target: target.to_string(),
-            size,
-            responder,
-        }))
+        .send(AppEvent::Conflict {
+            slot,
+            prompt: ConflictPrompt {
+                location,
+                name: name.to_string(),
+                target: target.to_string(),
+                size,
+                responder,
+            },
+        })
         .is_err()
     {
         return None;
@@ -3098,6 +3489,7 @@ async fn run_upload(
     name: String,
     ptx: mpsc::UnboundedSender<Progress>,
     tx: &mpsc::UnboundedSender<AppEvent>,
+    slot: u32,
     cancel: &Cancel,
 ) -> std::result::Result<String, (String, String)> {
     let is_dir = match std::fs::metadata(&local) {
@@ -3112,7 +3504,7 @@ async fn run_upload(
         Ok(Some(meta)) => {
             let taken = remote_taken(&sftp, &dest, &name).await;
             let chosen =
-                ask_overwrite(tx, "远端", &name, &target, Some(meta.size), |c| {
+                ask_overwrite(tx, slot, "远端", &name, &target, Some(meta.size), |c| {
                     taken.contains(c)
                 })
                 .await;
@@ -3128,6 +3520,7 @@ async fn run_upload(
         Err(err) => return Err((name, format!("{err:#}"))),
     }
     let _ = tx.send(AppEvent::SftpStarted {
+        slot,
         label: final_name.clone(),
         direction: "上传",
     });
@@ -3155,6 +3548,7 @@ async fn run_download(
     confirm_overwrite: bool,
     ptx: mpsc::UnboundedSender<Progress>,
     tx: &mpsc::UnboundedSender<AppEvent>,
+    slot: u32,
     cancel: &Cancel,
 ) -> std::result::Result<String, (String, String)> {
     let label = entry.name.clone();
@@ -3173,7 +3567,7 @@ async fn run_download(
         let shown = target.display().to_string();
         let taken = local_taken(&dest_dir, &name);
         let chosen =
-            ask_overwrite(tx, "本地", &name, &shown, size, |c| taken.contains(c)).await;
+            ask_overwrite(tx, slot, "本地", &name, &shown, size, |c| taken.contains(c)).await;
         match chosen {
             Some(n) => final_name = n,
             None => {
@@ -3183,6 +3577,7 @@ async fn run_download(
         }
     }
     let _ = tx.send(AppEvent::SftpStarted {
+        slot,
         label: final_name.clone(),
         direction: "下载",
     });

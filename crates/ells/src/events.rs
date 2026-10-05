@@ -21,16 +21,21 @@ pub enum AppEvent {
     MouseRelease { column: u16, row: u16 },
     /// Mouse wheel: -1 = up, +1 = down (file browser / scrollback).
     MouseScroll { delta: i8 },
-    RemoteData(Vec<u8>),
-    RemoteClosed,
+    /// 以下带 `slot` 的事件属于某个标签页（多会话）：标签可能已被关掉，
+    /// 收到找不到对应 id 的事件就直接丢弃，绝不能落到"当前标签"上。
+    RemoteData { slot: u32, bytes: Vec<u8> },
+    RemoteClosed { slot: u32 },
     /// 主机密钥待确认：由 UI 弹窗回答，连接任务在等待这个回答。
     HostKey(HostKeyPrompt),
     /// 后台连接（含认证与主机密钥确认）结束。
-    Connected(std::result::Result<RemoteSession, String>),
+    Connected {
+        slot: u32,
+        res: std::result::Result<RemoteSession, String>,
+    },
     /// 用户在"连接已断开"弹窗里点了重连。
-    Reconnect(Host),
+    Reconnect { slot: u32, host: Host },
     /// 传输目标已存在，等用户选择覆盖 / 改名 / 取消。
-    Conflict(ConflictPrompt),
+    Conflict { slot: u32, prompt: ConflictPrompt },
     /// 用户在导入确认框里点了"导入"（空列表 = 取消）。
     ImportHosts(Vec<Host>),
     /// Result of the native file dialog: path selected for a form field
@@ -43,33 +48,57 @@ pub enum AppEvent {
     /// 主密码修改完成：新密钥 + 新密码明文（供自动解锁凭据同步）。
     MasterRotated(std::result::Result<(VaultKey, String), String>),
     /// Remote working directory resolved (for sz/rz SFTP rerouting).
-    SftpCwd(std::result::Result<String, String>),
+    SftpCwd {
+        slot: u32,
+        res: std::result::Result<String, String>,
+    },
     /// End the ZMODEM output-swallow window. Carries a generation counter so
     /// stale timers from an earlier window are ignored (the window slides
     /// forward whenever more protocol bytes arrive).
-    ZmodemClear(u64),
+    ZmodemClear { slot: u32, seq: u64 },
     /// Native dialog result for an SFTP upload (browser screen).
-    PickedUpload(Option<String>),
+    PickedUpload { slot: u32, path: Option<String> },
     /// Native "Save As" dialog result for a download (sz interception flow).
-    PickedSave { entry: FileEntry, path: Option<String> },
+    PickedSave {
+        slot: u32,
+        entry: FileEntry,
+        path: Option<String>,
+    },
     /// 目录上传：系统目录选择框的结果（递归上传整个目录）。
-    PickedUploadDir(Option<String>),
+    PickedUploadDir { slot: u32, path: Option<String> },
     /// 目录下载：本地落点目录（sz 传目录 / 浏览器下载目录）。
-    PickedSaveDir { entry: FileEntry, path: Option<String> },
+    PickedSaveDir {
+        slot: u32,
+        entry: FileEntry,
+        path: Option<String>,
+    },
     /// 传输通过覆盖确认、真正开跑：UI 这时才登记进度条目。
-    SftpStarted { label: String, direction: &'static str },
+    SftpStarted {
+        slot: u32,
+        label: String,
+        direction: &'static str,
+    },
     /// 远端改名/新建/删除完成（Ok 给状态行文案）。
-    SftpOp(std::result::Result<String, String>),
+    SftpOp { slot: u32, res: std::result::Result<String, String> },
     /// 历史搜索框的回答：None = 取消，Some("") = 清空即退出搜索。
-    Search(Option<String>),
+    Search { slot: u32, value: Option<String> },
     /// Resolved remote home directory for the browser.
-    SftpHome(std::result::Result<String, String>),
+    SftpHome {
+        slot: u32,
+        res: std::result::Result<String, String>,
+    },
     /// Directory listing for the browser.
-    SftpListed(std::result::Result<Vec<FileEntry>, String>),
+    SftpListed {
+        slot: u32,
+        res: std::result::Result<Vec<FileEntry>, String>,
+    },
     /// Progress tick of an in-flight transfer.
-    SftpProgress(Progress),
+    SftpProgress { slot: u32, pr: Progress },
     /// A transfer finished (Err carries the failure message).
-    SftpDone(std::result::Result<String, (String, String)>),
+    SftpDone {
+        slot: u32,
+        res: std::result::Result<String, (String, String)>,
+    },
 }
 
 pub fn spawn_input_stream(tx: mpsc::UnboundedSender<AppEvent>) {
@@ -127,18 +156,22 @@ pub fn spawn_input_stream(tx: mpsc::UnboundedSender<AppEvent>) {
     });
 }
 
-/// Pump SSH channel output into the single UI event queue so the main loop
-/// only ever selects on one receiver.
-pub fn spawn_remote_pump(mut rx: mpsc::UnboundedReceiver<RemoteEvent>, tx: mpsc::UnboundedSender<AppEvent>) {
+/// 把 SSH 通道的输出灌进唯一的 UI 事件队列，主循环只 select 一个接收端。
+/// `slot` 给每条事件盖上所属标签的 id：后台标签的输出绝不能画进用户正在看的标签。
+pub fn spawn_remote_pump(
+    mut rx: mpsc::UnboundedReceiver<RemoteEvent>,
+    tx: mpsc::UnboundedSender<AppEvent>,
+    slot: u32,
+) {
     tokio::spawn(async move {
         while let Some(ev) = rx.recv().await {
             let app_ev = match ev {
-                RemoteEvent::Data(bytes) => AppEvent::RemoteData(bytes),
+                RemoteEvent::Data(bytes) => AppEvent::RemoteData { slot, bytes },
                 RemoteEvent::Closed(res) => {
                     if let Err(err) = res {
                         tracing::warn!(%err, "remote session error");
                     }
-                    AppEvent::RemoteClosed
+                    AppEvent::RemoteClosed { slot }
                 }
             };
             if tx.send(app_ev).is_err() {

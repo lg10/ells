@@ -39,7 +39,8 @@ pub enum SessionAction {
 
 impl SessionState {
     pub fn new(label: String, session: RemoteSession, rows: u16, cols: u16) -> Self {
-        let header_rows = 3;
+        // 与会话页顶部标题栏的行数保持一致（见 ui::HEADER_ROWS）
+        let header_rows = crate::ui::HEADER_ROWS;
         let cols = cols.max(20);
         let term_rows = rows.saturating_sub(header_rows).max(1);
         let emu = Emulator::new(term_rows, cols);
