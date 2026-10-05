@@ -60,14 +60,14 @@ irm https://raw.githubusercontent.com/lg10/ells/main/install.ps1 | iex
 macOS / Linux：
 
 ```bash
-ELLS_VERSION=v0.1.5 curl -fsSL https://raw.githubusercontent.com/lg10/ells/main/install.sh | sh
+ELLS_VERSION=v0.1.6 curl -fsSL https://raw.githubusercontent.com/lg10/ells/main/install.sh | sh
 ELLS_INSTALL_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/lg10/ells/main/install.sh | sh
 ```
 
 Windows PowerShell：
 
 ```powershell
-$env:ELLS_VERSION='v0.1.5'; irm https://raw.githubusercontent.com/lg10/ells/main/install.ps1 | iex
+$env:ELLS_VERSION='v0.1.6'; irm https://raw.githubusercontent.com/lg10/ells/main/install.ps1 | iex
 $env:ELLS_INSTALL_DIR="$env:USERPROFILE\bin"; irm https://raw.githubusercontent.com/lg10/ells/main/install.ps1 | iex
 ```
 
@@ -75,7 +75,7 @@ $env:ELLS_INSTALL_DIR="$env:USERPROFILE\bin"; irm https://raw.githubusercontent.
 
 ### 应用内更新
 
-装好之后一般不用再跑安装脚本。ells **每次启动**都在后台问一次"有没有新版本"——只发一个 HEAD 请求、从 GitHub 的重定向地址读版本号，不下载任何内容，也不占匿名 API 限额。有新版本时主机列表顶部会出现 `【v0.1.6 可更新】` 徽标，点它（或进设置把光标移到「自动更新」按 Enter）弹确认框，确认后按顺序做四件事：
+装好之后一般不用再跑安装脚本。ells **每次启动**都在后台问一次"有没有新版本"——只发一个 HEAD 请求、从 GitHub 的重定向地址读版本号，不下载任何内容，也不占匿名 API 限额。有新版本时主机列表顶部会出现 `【vX.Y.Z 可更新】` 徽标，点它（或进设置把光标移到「自动更新」按 Enter）弹确认框，确认后按顺序做四件事：
 
 1. 下载本平台对应的发布资产（`ells-linux-x86_64` / `ells-macos-universal` / `ells-windows-x86_64.exe`）到 ells 所在目录的临时文件；
 2. **边下边算 SHA256**，和发布里的 `SHA256SUMS.txt` 比对，校验不过（或没下完）就直接删掉临时文件，**绝不替换**；

@@ -60,14 +60,14 @@ Reopen your terminal afterwards, and both `ells` and the short command `s` are r
 macOS / Linux:
 
 ```bash
-ELLS_VERSION=v0.1.5 curl -fsSL https://raw.githubusercontent.com/lg10/ells/main/install.sh | sh
+ELLS_VERSION=v0.1.6 curl -fsSL https://raw.githubusercontent.com/lg10/ells/main/install.sh | sh
 ELLS_INSTALL_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/lg10/ells/main/install.sh | sh
 ```
 
 Windows PowerShell:
 
 ```powershell
-$env:ELLS_VERSION="v0.1.5"; irm https://raw.githubusercontent.com/lg10/ells/main/install.ps1 | iex
+$env:ELLS_VERSION="v0.1.6"; irm https://raw.githubusercontent.com/lg10/ells/main/install.ps1 | iex
 $env:ELLS_INSTALL_DIR="$env:USERPROFILE\bin"; irm https://raw.githubusercontent.com/lg10/ells/main/install.ps1 | iex
 ```
 
@@ -75,7 +75,7 @@ $env:ELLS_INSTALL_DIR="$env:USERPROFILE\bin"; irm https://raw.githubusercontent.
 
 ### Updating in place
 
-Once installed you rarely need the installer again. ells asks GitHub for a newer release in the background on **every start** — a single HEAD request whose redirected URL carries the version, so nothing is downloaded and no anonymous API quota is spent. When there is something newer, the host list grows a `【v0.1.6 可更新】` badge; click it (or press Enter on the 「自动更新」 row in settings) and the confirm dialog then does four things:
+Once installed you rarely need the installer again. ells asks GitHub for a newer release in the background on **every start** — a single HEAD request whose redirected URL carries the version, so nothing is downloaded and no anonymous API quota is spent. When there is something newer, the host list grows a `【vX.Y.Z 可更新】` badge; click it (or press Enter on the 「自动更新」 row in settings) and the confirm dialog then does four things:
 
 1. downloads the asset for your platform (`ells-linux-x86_64` / `ells-macos-universal` / `ells-windows-x86_64.exe`) into a temp file next to ells;
 2. hashes it with SHA256 **while streaming**, and compares against the release's `SHA256SUMS.txt` — on a mismatch, or a short body, the temp file is deleted and **nothing is replaced**;
