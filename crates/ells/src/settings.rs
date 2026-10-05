@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 use crate::keybinds::{Action, Chord, KeyBinds};
+use crate::theme;
 
 #[derive(Debug, Clone)]
 pub struct Settings {
@@ -14,6 +15,8 @@ pub struct Settings {
     pub master_password_enabled: bool,
     /// 界面快捷键（设置里可改，改完即时写盘）
     pub keybinds: KeyBinds,
+    /// 界面配色主题：设置里循环切换，预览即时生效，点【保 存】才写盘
+    pub theme: theme::Theme,
 }
 
 impl Default for Settings {
@@ -23,6 +26,7 @@ impl Default for Settings {
             keepalive_secs: 30,
             master_password_enabled: true,
             keybinds: KeyBinds::default(),
+            theme: theme::Theme::platform_default(),
         }
     }
 }
@@ -69,7 +73,14 @@ pub fn clear_master_backup() {
 }
 
 impl Settings {
+    /// 读盘并把全局调色板对齐到盘上的主题（包括"根本没有配置文件"的首启）。
     pub fn load() -> Self {
+        let s = Self::read_from_disk();
+        theme::apply(s.theme);
+        s
+    }
+
+    fn read_from_disk() -> Self {
         let Some(path) = settings_path() else { return Self::default() };
         let Ok(text) = std::fs::read_to_string(&path) else { return Self::default() };
         let mut s = Self::default();
@@ -85,6 +96,12 @@ impl Settings {
                 }
                 "master_password_enabled" => {
                     s.master_password_enabled = v.trim() != "false"
+                }
+                "theme" => {
+                    // 写错的值忽略，留着默认（按平台）的那套
+                    if let Some(t) = theme::Theme::parse(v) {
+                        s.theme = t;
+                    }
                 }
                 _ => {
                     // key_new_tab=F2 之类：非法/未知键名直接忽略，保留默认值
@@ -105,12 +122,16 @@ impl Settings {
             let _ = std::fs::create_dir_all(dir);
         }
         let mut text = format!(
-            "highlight={}\nkeepalive_secs={}\nmaster_password_enabled={}\n",
-            self.highlight, self.keepalive_secs, self.master_password_enabled
+            "highlight={}\nkeepalive_secs={}\nmaster_password_enabled={}\ntheme={}\n",
+            self.highlight,
+            self.keepalive_secs,
+            self.master_password_enabled,
+            self.theme.ini_value()
         );
         for action in Action::ALL {
             text.push_str(&format!("{}={}\n", action.ini_key(), self.keybinds.display(action)));
         }
         let _ = std::fs::write(&path, text);
+        theme::apply(self.theme);
     }
 }

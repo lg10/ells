@@ -9,6 +9,17 @@ use ratatui::Frame;
 
 use crate::app::{App, Choice, FieldKind, Prompt, ScreenKind, Slot, UnlockStage};
 use crate::session::TermMode;
+use crate::theme;
+
+/// "这一行是当前行"的样式：画底色的主题用灰条，不画底色的主题（跟随终端 / 高对比 / 浅色底）
+/// 只剩粗体几乎认不出来，所以改用反显——和设置面板的聚焦行同一套写法。
+fn select_style() -> Style {
+    let mut s = Style::default().bg(theme::band()).add_modifier(Modifier::BOLD);
+    if theme::band() == Color::Reset {
+        s = s.add_modifier(Modifier::REVERSED);
+    }
+    s
+}
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     app.last_area = f.area();
@@ -60,8 +71,8 @@ fn draw_homepage_badge(f: &mut Frame, area: Rect) {
         Paragraph::new(Line::from(Span::styled(
             "官网(ells.cn)",
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::White)
+                .fg(theme::on_accent())
+                .bg(theme::select_bg())
                 .add_modifier(Modifier::BOLD),
         ))),
         homepage_rect(area),
@@ -84,7 +95,7 @@ fn draw_unlock(f: &mut Frame, app: &mut App) {
     // 首次设主密码要多几行"不可找回"警示：框子跟着长高、边框换黄色，
     // 让用户一眼看出这是"正在定规矩"而不是"输入密码"。
     let area = centered(if creating { 56 } else { 50 }, if creating { 11 } else { 9 }, f.area());
-    f.buffer_mut().set_style(area, Style::default().bg(Color::Black));
+    f.buffer_mut().set_style(area, Style::default().bg(theme::bg()));
     let u = &app.unlock;
     let stage_name = match u.stage {
         UnlockStage::Open => "解锁保险库",
@@ -92,13 +103,13 @@ fn draw_unlock(f: &mut Frame, app: &mut App) {
         UnlockStage::CreateConfirm => "确认主密码",
     };
     let title = format!(" ells · {stage_name} · {} ", version_tag());
-    let accent = if creating { Color::Yellow } else { Color::White };
+    let accent = if creating { theme::warn() } else { theme::text() };
     let block = Block::default()
         .borders(Borders::ALL)
         .title(title)
         .border_style(Style::default().fg(accent))
         .title_style(Style::default().fg(accent).add_modifier(Modifier::BOLD))
-        .style(Style::default().fg(Color::White));
+        .style(Style::default().fg(theme::text()));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -118,15 +129,15 @@ fn draw_unlock(f: &mut Frame, app: &mut App) {
         let warn = Paragraph::new(vec![
             Line::from(Span::styled(
                 " ! 主密码忘记后无法找回，ells 不做任何找回。",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                Style::default().fg(theme::err()).add_modifier(Modifier::BOLD),
             )),
             Line::from(Span::styled(
                 "   只能重置保险库重来：主机与凭据都要重填。",
-                Style::default().fg(Color::Red),
+                Style::default().fg(theme::err()),
             )),
             Line::from(Span::styled(
                 "   主密码只加密本机保险库，不会发往任何服务器。",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme::dim()),
             )),
         ]);
         f.render_widget(warn, chunks[0]);
@@ -134,17 +145,17 @@ fn draw_unlock(f: &mut Frame, app: &mut App) {
     let first_line = if u.busy {
         Span::styled(
             "正在解密/创建保险库，请稍候（约 1 秒）…",
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default().fg(theme::warn()).add_modifier(Modifier::BOLD),
         )
     } else {
-        Span::styled(format!("主密码：{masked}"), Style::default().fg(Color::Cyan))
+        Span::styled(format!("主密码：{masked}"), Style::default().fg(theme::accent()))
     };
     f.render_widget(Paragraph::new(Line::from(first_line)), chunks[1]);
     if let Some(err) = &u.error {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 err.clone(),
-                Style::default().fg(Color::Red),
+                Style::default().fg(theme::err()),
             ))),
             chunks[2],
         );
@@ -185,13 +196,13 @@ fn live_mark(app: &App, alias: &str) -> (char, Color) {
             continue;
         }
         if slot.session.is_some() {
-            return ('●', Color::Green);
+            return ('●', theme::ok());
         }
         if slot.connecting {
-            return ('○', Color::Yellow);
+            return ('○', theme::warn());
         }
     }
-    ('·', Color::DarkGray)
+    ('·', theme::dim())
 }
 
 fn draw_list(f: &mut Frame, app: &mut App) {
@@ -203,11 +214,11 @@ fn draw_list(f: &mut Frame, app: &mut App) {
         Paragraph::new(Line::from(vec![
             Span::styled(
                 " ells ",
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                Style::default().fg(theme::accent()).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(format!("主机列表 · {}", version_tag()), Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("主机列表 · {}", version_tag()), Style::default().fg(theme::dim())),
         ]))
-        .style(Style::default().bg(Color::Black)),
+        .style(Style::default().bg(theme::bg())),
         chunks[0],
     );
     // 第 1 行：标签条（与会话页同一份几何）
@@ -224,7 +235,7 @@ fn draw_list(f: &mut Frame, app: &mut App) {
                 format!("({} 台)", app.vault.hosts.len())
             }
         ))
-        .title_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+        .title_style(Style::default().fg(theme::accent()).add_modifier(Modifier::BOLD));
     let inner = block.inner(chunks[2]);
     f.render_widget(block, chunks[2]);
 
@@ -232,7 +243,7 @@ fn draw_list(f: &mut Frame, app: &mut App) {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 " 还没有主机 — 按 a 新增",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme::dim()),
             ))),
             inner,
         );
@@ -250,18 +261,18 @@ fn draw_list(f: &mut Frame, app: &mut App) {
                     ),
                     Span::styled(
                         format!("{:<14}", h.alias),
-                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                        Style::default().fg(theme::warn()).add_modifier(Modifier::BOLD),
                     ),
                     Span::raw(h.target()),
                     Span::styled(
                         format!("  [{}]", h.auth_label()),
-                        Style::default().fg(Color::Gray),
+                        Style::default().fg(theme::muted()),
                     ),
                 ];
                 if let Some(j) = &h.jump {
                     spans.push(Span::styled(
                         format!(" 经 {j}"),
-                        Style::default().fg(Color::Magenta),
+                        Style::default().fg(theme::alt()),
                     ));
                 }
                 ListItem::new(Line::from(spans))
@@ -270,11 +281,7 @@ fn draw_list(f: &mut Frame, app: &mut App) {
         let mut ls = RtListState::default();
         ls.select(Some(app.list.selected.min(app.vault.hosts.len() - 1)));
         f.render_stateful_widget(
-            List::new(items).highlight_style(
-                Style::default()
-                    .bg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD),
-            ),
+            List::new(items).highlight_style(select_style()),
             inner,
             &mut ls,
         );
@@ -287,7 +294,7 @@ fn draw_list(f: &mut Frame, app: &mut App) {
         app.settings.keybinds.display(crate::keybinds::Action::PrevTab),
     );
     f.render_widget(
-        Paragraph::new(keys).style(Style::default().fg(Color::DarkGray)),
+        Paragraph::new(keys).style(Style::default().fg(theme::dim())),
         chunks[3],
     );
     // 键位行右端：【设置】按钮（实心青底，与会话页按钮同风格）
@@ -295,15 +302,15 @@ fn draw_list(f: &mut Frame, app: &mut App) {
         Paragraph::new(Line::from(Span::styled(
             "【设置】",
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
+                .fg(theme::on_accent())
+                .bg(theme::accent_bg())
                 .add_modifier(Modifier::BOLD),
         ))),
         list_settings_rect(f.area()),
     );
     match &app.status {
         Some(status) => f.render_widget(
-            Paragraph::new(status.clone()).style(Style::default().fg(Color::Green)),
+            Paragraph::new(status.clone()).style(Style::default().fg(theme::ok())),
             chunks[4],
         ),
         // 空闲时用状态行讲清标记的含义，省得用户以为 ● 是装饰
@@ -315,7 +322,7 @@ fn draw_list(f: &mut Frame, app: &mut App) {
             f.render_widget(
                 Paragraph::new(Line::from(Span::styled(
                     legend,
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(theme::dim()),
                 ))),
                 chunks[4],
             );
@@ -349,11 +356,11 @@ pub fn delete_confirm_rects(area: Rect) -> [Rect; 2] {
 fn draw_delete_confirm(f: &mut Frame, confirm_index: usize, alias: &str) {
     let rects = delete_confirm_rects(f.area());
     let panel = centered(44, 7, f.area());
-    f.buffer_mut().set_style(panel, Style::default().bg(Color::Black));
+    f.buffer_mut().set_style(panel, Style::default().bg(theme::bg()));
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" 删除确认 ")
-        .title_style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD));
+        .title_style(Style::default().fg(theme::err()).add_modifier(Modifier::BOLD));
     f.render_widget(Clear, panel);
     f.render_widget(block, panel);
     let inner_x = panel.x + 1;
@@ -361,14 +368,14 @@ fn draw_delete_confirm(f: &mut Frame, confirm_index: usize, alias: &str) {
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             format!(" 确定删除主机 “{alias}” 吗？"),
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(theme::warn()),
         ))),
         Rect { x: inner_x, y: panel.y + 1, width: inner_w, height: 1 },
     );
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             " 此操作不可恢复。",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme::dim()),
         ))),
         Rect { x: inner_x, y: panel.y + 2, width: inner_w, height: 1 },
     );
@@ -376,8 +383,8 @@ fn draw_delete_confirm(f: &mut Frame, confirm_index: usize, alias: &str) {
         Paragraph::new(Line::from(Span::styled(
             "【 保 留 】",
             Style::default()
-                .fg(Color::White)
-                .bg(Color::DarkGray)
+                .fg(theme::text())
+                .bg(theme::band())
                 .add_modifier(if confirm_index == 0 { Modifier::BOLD } else { Modifier::empty() })
                 .add_modifier(if confirm_index == 0 {
                     Modifier::UNDERLINED
@@ -391,8 +398,8 @@ fn draw_delete_confirm(f: &mut Frame, confirm_index: usize, alias: &str) {
         Paragraph::new(Line::from(Span::styled(
             "【 删 除 】",
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Red)
+                .fg(theme::on_accent())
+                .bg(theme::err())
                 .add_modifier(if confirm_index == 1 { Modifier::BOLD } else { Modifier::empty() })
                 .add_modifier(if confirm_index == 1 {
                     Modifier::UNDERLINED
@@ -405,7 +412,7 @@ fn draw_delete_confirm(f: &mut Frame, confirm_index: usize, alias: &str) {
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             " ←→/Tab 切换 · Enter 确认 · Esc 取消 · y 删 n 留",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme::dim()),
         ))),
         Rect { x: inner_x, y: panel.y + panel.height.saturating_sub(2), width: inner_w, height: 1 },
     );
@@ -421,7 +428,7 @@ fn draw_help(f: &mut Frame, area: Rect, binds: &crate::keybinds::KeyBinds) {
             .title(" ells 快捷键 ")
             .title_style(
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(theme::accent())
                     .add_modifier(Modifier::BOLD),
             ),
         panel,
@@ -445,7 +452,7 @@ fn draw_help(f: &mut Frame, area: Rect, binds: &crate::keybinds::KeyBinds) {
         binds.display(Action::Search),
         binds.display(Action::HostList),
     );
-    let sections: [(&str, std::borrow::Cow<str>); 9] = [
+    let sections: [(&str, std::borrow::Cow<str>); 10] = [
         ("主机列表", std::borrow::Cow::Owned(list_body)),
         ("多标签会话", std::borrow::Cow::Owned(tab_body)),
         ("会话终端", std::borrow::Cow::Owned(term_body)),
@@ -453,6 +460,7 @@ fn draw_help(f: &mut Frame, area: Rect, binds: &crate::keybinds::KeyBinds) {
             "会话与标签页按键可在「设置 → 快捷键设置」里自定义（列表页按 s、会话页按顶部【设置】）：Enter 选中某项后按下新按键即可绑定，只接受 F2–F9 或带 Ctrl/Alt 的组合键（F1 留给帮助页，F10–F12 常被终端或系统吃掉），改完即时写入 ~/.ells/settings.ini；撞到已占用的键会自动互换，【恢复默认】一键还原。跨平台：mac/Linux 终端把 Ctrl-] 这类组合发成与 Ctrl-5 同一个字节，已自动归一，默认键在三个平台都能触发；本机注意点——{}",
             crate::keybinds::platform_note(),
         ))),
+        ("外观主题", std::borrow::Cow::Borrowed("设置页「界面主题」按 Enter 或 ←→ 循环四套：深色（画死黑底灰条，Windows 最贴）· 跟随终端（一处底色都不画，全用终端自己的主题，mac 终端/iTerm2/WezTerm 推荐，也是 mac 默认）· 高对比（去掉灰色小字，靠粗体与反显分层）· 浅色底（白底终端用深字）。切换即时预览，【保 存】才写入 settings.ini 的 theme=，【取消】还原。")),
         ("文件浏览器", std::borrow::Cow::Borrowed("↑↓/滚轮 选择 · Enter 进入目录或下载 · u 上传文件 · U 上传整个目录 · d 下载 · m 新建目录 · n 重命名 · D 删除（递归，先确认）· Ctrl-C 取消全部在途传输 · r 刷新 · Backspace 上级 · Esc 返回终端")),
         ("主机表单", std::borrow::Cow::Borrowed("Tab/↓ 下一个字段 · ↑ 上一个 · ←→ 切换认证方式 · Ctrl-F 选私钥 · Ctrl-J 选跳板机 · Ctrl-C 清空当前字段 · Enter 在\"私钥路径/跳板机\"上直接打开选择器，保存要点【保 存】或聚焦后回车")),
         ("解锁保险库", std::borrow::Cow::Borrowed("输入主密码后回车；首次使用会要求输入两遍。主密码不可找回，忘记只能删除 ~/.ells/vault.bin 重来。")),
@@ -464,18 +472,18 @@ fn draw_help(f: &mut Frame, area: Rect, binds: &crate::keybinds::KeyBinds) {
         lines.push(Line::from(Span::styled(
             format!("【{title}】"),
             Style::default()
-                .fg(Color::Yellow)
+                .fg(theme::warn())
                 .add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::from(Span::styled(
             body.into_owned(),
-            Style::default().fg(Color::Gray),
+            Style::default().fg(theme::muted()),
         )));
         lines.push(Line::from(""));
     }
     lines.push(Line::from(Span::styled(
         " Esc / q / ? / F1 关闭",
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(theme::dim()),
     )));
     f.render_widget(
         Paragraph::new(lines).wrap(Wrap { trim: false }),
@@ -503,7 +511,7 @@ fn draw_prompt(f: &mut Frame, prompt: &Prompt) {
             .title(format!(" {} ", prompt.title))
             .title_style(
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(theme::accent())
                     .add_modifier(Modifier::BOLD),
             ),
         panel,
@@ -519,12 +527,12 @@ fn draw_prompt(f: &mut Frame, prompt: &Prompt) {
     tail.reverse();
     let shown: String = tail.into_iter().collect();
     let text = Line::from(vec![
-        Span::styled(prefix, Style::default().fg(Color::DarkGray)),
-        Span::styled(shown, Style::default().fg(Color::White)),
+        Span::styled(prefix, Style::default().fg(theme::dim())),
+        Span::styled(shown, Style::default().fg(theme::text())),
         Span::styled(
             "▏",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(theme::accent())
                 .add_modifier(Modifier::BOLD),
         ),
     ]);
@@ -533,14 +541,14 @@ fn draw_prompt(f: &mut Frame, prompt: &Prompt) {
         Rect { x: inner_x, y: panel.y + 1, width: inner_w, height: 1 },
     );
     let note = match &prompt.error {
-        Some(err) => (format!(" {err}"), Color::Yellow),
+        Some(err) => (format!(" {err}"), theme::warn()),
         None => {
             let mut hint = " Enter 确认 · Esc 取消".to_string();
             if let Some(extra) = prompt.hint {
                 hint.push_str(" · ");
                 hint.push_str(extra);
             }
-            (hint, Color::DarkGray)
+            (hint, theme::dim())
         }
     };
     f.render_widget(
@@ -571,7 +579,7 @@ fn draw_choice(f: &mut Frame, choice: &Choice) {
     let (panel, buttons) = choice_rects(area, choice.lines.len(), choice.options.len());
     f.render_widget(Clear, panel);
     let danger = choice.danger;
-    let title_color = if danger { Color::Red } else { Color::Cyan };
+    let title_color = if danger { theme::err() } else { theme::accent() };
     f.render_widget(
         Block::default()
             .borders(Borders::ALL)
@@ -595,7 +603,7 @@ fn draw_choice(f: &mut Frame, choice: &Choice) {
         .map(|l| {
             Line::from(Span::styled(
                 l.clone(),
-                Style::default().fg(if danger { Color::Yellow } else { Color::Gray }),
+                Style::default().fg(if danger { theme::warn() } else { theme::muted() }),
             ))
         })
         .collect();
@@ -609,13 +617,13 @@ fn draw_choice(f: &mut Frame, choice: &Choice) {
         let accept_risky = danger && i > 0;
         let style = Style::default()
             .fg(if selected {
-                Color::Black
+                theme::on_accent()
             } else if accept_risky {
-                Color::Red
+                theme::err()
             } else {
-                Color::Gray
+                theme::muted()
             })
-            .bg(if selected { Color::White } else { Color::Reset })
+            .bg(if selected { theme::select_bg() } else { Color::Reset })
             .add_modifier(if selected {
                 Modifier::BOLD
             } else {
@@ -629,7 +637,7 @@ fn draw_choice(f: &mut Frame, choice: &Choice) {
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             " ←→/Tab 切换 · Enter 确认 · Esc 取消",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme::dim()),
         ))),
         Rect {
             x: panel.x + 1,
@@ -669,7 +677,7 @@ fn draw_form(f: &mut Frame, app: &mut App) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" 主机 ")
-        .title_style(Style::default().fg(Color::Cyan));
+        .title_style(Style::default().fg(theme::accent()));
     let inner = block.inner(area);
     f.render_widget(Clear, area);
     f.render_widget(block, area);
@@ -704,7 +712,7 @@ fn draw_form(f: &mut Frame, app: &mut App) {
             } else {
                 full
             };
-            let label_style = Style::default().fg(if focused { Color::Cyan } else { Color::White });
+            let label_style = Style::default().fg(if focused { theme::accent() } else { theme::text() });
             Line::from(vec![
                 Span::styled(pad_display(field.label, LABEL_W), label_style),
                 Span::styled(
@@ -714,7 +722,7 @@ fn draw_form(f: &mut Frame, app: &mut App) {
                         shown
                     },
                     Style::default()
-                        .fg(if focused { Color::Yellow } else { Color::Gray })
+                        .fg(if focused { theme::warn() } else { theme::muted() })
                         .add_modifier(if focused {
                             Modifier::REVERSED
                         } else {
@@ -732,7 +740,7 @@ fn draw_form(f: &mut Frame, app: &mut App) {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 err.clone(),
-                Style::default().fg(Color::Red),
+                Style::default().fg(theme::err()),
             ))),
             Rect { x: inner.x, y: inner.y + n as u16, width: inner.width, height: 1 },
         );
@@ -745,8 +753,8 @@ fn draw_form(f: &mut Frame, app: &mut App) {
         Paragraph::new(Line::from(Span::styled(
             "【 保 存 】",
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
+                .fg(theme::on_accent())
+                .bg(theme::accent_bg())
                 .add_modifier(if footer == Some(0) { Modifier::BOLD } else { Modifier::empty() })
                 .add_modifier(if footer == Some(0) {
                     Modifier::UNDERLINED
@@ -760,8 +768,8 @@ fn draw_form(f: &mut Frame, app: &mut App) {
         Paragraph::new(Line::from(Span::styled(
             "【 取 消 】",
             Style::default()
-                .fg(Color::White)
-                .bg(Color::DarkGray)
+                .fg(theme::text())
+                .bg(theme::band())
                 .add_modifier(if footer == Some(1) { Modifier::BOLD } else { Modifier::empty() })
                 .add_modifier(if footer == Some(1) {
                     Modifier::UNDERLINED
@@ -776,11 +784,11 @@ fn draw_form(f: &mut Frame, app: &mut App) {
         Paragraph::new(vec![
             Line::from(Span::styled(
                 " Tab/↓ 移项 · Enter 选私钥/跳板机 · ←/→ 换认证",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme::dim()),
             )),
             Line::from(Span::styled(
                 " 鼠标点击定位 · 按钮 Enter/点击 保存 · 私钥口令仅加密私钥才填",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme::dim()),
             )),
         ]),
         Rect { x: inner.x, y: inner.y + (n as u16) + 3, width: inner.width, height: 2 },
@@ -792,7 +800,7 @@ fn draw_form(f: &mut Frame, app: &mut App) {
         let block = Block::default()
             .borders(Borders::ALL)
             .title(" 选择跳板机 · ↑↓ 选择 · Enter 确认 · Esc 关闭 ")
-            .title_style(Style::default().fg(Color::Cyan));
+            .title_style(Style::default().fg(theme::accent()));
         let pinner = block.inner(area);
         f.render_widget(Clear, area);
         f.render_widget(block, area);
@@ -802,9 +810,9 @@ fn draw_form(f: &mut Frame, app: &mut App) {
             .enumerate()
             .map(|(i, (_, label))| {
                 let style = if i == picker.selected {
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::REVERSED)
+                    Style::default().fg(theme::warn()).add_modifier(Modifier::REVERSED)
                 } else {
-                    Style::default().fg(Color::Gray)
+                    Style::default().fg(theme::muted())
                 };
                 ListItem::new(Line::from(Span::styled(format!(" {label}"), style)))
             })
@@ -871,19 +879,19 @@ fn draw_browser(f: &mut Frame, app: &mut App) {
     let path_line = Line::from(vec![
         Span::styled(
             format!(" 远端文件 {} ", b.path),
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default().fg(theme::accent()).add_modifier(Modifier::BOLD),
         ),
         if b.loading {
-            Span::styled("加载中…", Style::default().fg(Color::Yellow))
+            Span::styled("加载中…", Style::default().fg(theme::warn()))
         } else {
             Span::styled(
                 format!("{} 项", b.entries.len()),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme::dim()),
             )
         },
     ]);
     f.render_widget(
-        Paragraph::new(path_line).style(Style::default().bg(Color::DarkGray)),
+        Paragraph::new(path_line).style(Style::default().bg(theme::band())),
         chunks[0],
     );
     // 第 1 行：标签条（列表页/会话页/浏览器页同一套几何，点标签就切过去）
@@ -902,15 +910,11 @@ fn draw_browser(f: &mut Frame, app: &mut App) {
             let label = format!("{}{}", e.name, kind);
             ListItem::new(Line::from(vec![Span::styled(
                 format!("{:<44}{}", label, size),
-                Style::default().fg(if e.is_dir { Color::Cyan } else { Color::White }),
+                Style::default().fg(if e.is_dir { theme::accent() } else { theme::text() }),
             )]))
         })
         .collect();
-    let list = List::new(items).highlight_style(
-        Style::default()
-            .bg(Color::DarkGray)
-            .add_modifier(Modifier::BOLD),
-    );
+    let list = List::new(items).highlight_style(select_style());
     let mut ls = RtListState::default().with_offset(b.scroll);
     ls.select(if b.entries.is_empty() {
         None
@@ -922,14 +926,14 @@ fn draw_browser(f: &mut Frame, app: &mut App) {
     // 传输进度不再占用浏览器界面：统一在会话顶部的聚合条/详情弹窗查看
     if let Some(err) = &b.error {
         f.render_widget(
-            Paragraph::new(format!(" {err}")).style(Style::default().fg(Color::Red)),
+            Paragraph::new(format!(" {err}")).style(Style::default().fg(theme::err())),
             chunks[3],
         );
     } else {
         let keys =
             " ↑↓/滚轮 选择 · Enter 进入/下载 · u 上传文件 · U 上传目录 · d 下载 · m 新建目录 · n 重命名 · D 删除 · Ctrl-C 取消传输 · r 刷新 · Esc 返回终端 ";
         f.render_widget(
-            Paragraph::new(keys).style(Style::default().fg(Color::DarkGray)),
+            Paragraph::new(keys).style(Style::default().fg(theme::dim())),
             chunks[3],
         );
     }
@@ -994,19 +998,19 @@ fn draw_session(f: &mut Frame, app: &mut App) {
         binds.display(Action::HostList),
     );
     let header = Line::from(vec![
-        Span::styled(" ells ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        Span::styled(format!("● {} ", s.label), Style::default().fg(Color::Yellow)),
+        Span::styled(" ells ", Style::default().fg(theme::accent()).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("● {} ", s.label), Style::default().fg(theme::warn())),
         Span::styled(
             format!("● {mode_tag} "),
             Style::default()
                 .fg(if s.mode == TermMode::Passthrough {
-                    Color::Red
+                    theme::err()
                 } else {
-                    Color::Green
+                    theme::ok()
                 })
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(key_hint, Style::default().fg(Color::DarkGray)),
+        Span::styled(key_hint, Style::default().fg(theme::dim())),
     ]);
     let title_row = Rect {
         x: chunks[0].x,
@@ -1014,7 +1018,7 @@ fn draw_session(f: &mut Frame, app: &mut App) {
         width: chunks[0].width,
         height: 1,
     };
-    f.render_widget(Paragraph::new(header).style(Style::default().bg(Color::DarkGray)), title_row);
+    f.render_widget(Paragraph::new(header).style(Style::default().bg(theme::band())), title_row);
     // 第 0 行右端：官网徽章（点击在浏览器打开 https://ells.cn）
     draw_homepage_badge(f, f.area());
 
@@ -1030,7 +1034,7 @@ fn draw_session(f: &mut Frame, app: &mut App) {
         height: 1,
     };
     f.render_widget(
-        Paragraph::new(Line::from("")).style(Style::default().bg(Color::Black)),
+        Paragraph::new(Line::from("")).style(Style::default().bg(theme::bg())),
         note_row,
     );
     if let Some(search) = &app.slots[idx].search {
@@ -1041,25 +1045,25 @@ fn draw_session(f: &mut Frame, app: &mut App) {
                 search.cursor + 1,
                 search.hits.len()
             ),
-            Style::default().fg(Color::Cyan).bg(Color::Black),
+            Style::default().fg(theme::accent()).bg(theme::bg()),
         ));
         f.render_widget(Paragraph::new(line), note_row);
     } else if s.scroll > 0 {
         let line = Line::from(Span::styled(
             format!(" 回看历史：已向上 {n} 行 · 滚轮回底部 · 任意按键回到实时", n = s.scroll),
-            Style::default().fg(Color::Magenta).bg(Color::Black),
+            Style::default().fg(theme::alt()).bg(theme::bg()),
         ));
         f.render_widget(Paragraph::new(line), note_row);
     } else if let Some(note) = app.slots[idx].status.as_ref().or(app.status.as_ref()) {
         let line = Line::from(Span::styled(
             format!(" {note}"),
-            Style::default().fg(Color::Yellow).bg(Color::Black),
+            Style::default().fg(theme::warn()).bg(theme::bg()),
         ));
         f.render_widget(Paragraph::new(line), note_row);
     } else {
         let line = Line::from(Span::styled(
             " 点击上方按钮或输入 sz/rz 传输文件 · 滚轮回看输出 · 拖选复制",
-            Style::default().fg(Color::DarkGray).bg(Color::Black),
+            Style::default().fg(theme::dim()).bg(theme::bg()),
         ));
         f.render_widget(Paragraph::new(line), note_row);
     }
@@ -1159,9 +1163,7 @@ fn draw_session(f: &mut Frame, app: &mut App) {
                     width: area.width,
                     height: 1,
                 },
-                Style::default()
-                    .bg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD),
+                select_style(),
             );
         }
     }
@@ -1211,13 +1213,13 @@ fn draw_header_buttons(f: &mut Frame, app: &App) {
     let [settings, upload, download, host_list, progress] = header_button_rects(area);
     // 整行黑底，和上方提示行连成一块"标题栏"
     f.render_widget(
-        Paragraph::new(Line::from("")).style(Style::default().bg(Color::Black)),
+        Paragraph::new(Line::from("")).style(Style::default().bg(theme::bg())),
         Rect { x: area.x, y: settings.y, width: area.width, height: 1 },
     );
     // 实心青底黑字，视觉上像可点击的按钮
     let btn_style = Style::default()
-        .fg(Color::Black)
-        .bg(Color::Cyan)
+        .fg(theme::on_accent())
+        .bg(theme::accent_bg())
         .add_modifier(Modifier::BOLD);
     for (rect, label) in [(settings, "设置"), (upload, "上传"), (download, "下载"), (host_list, "列表")] {
         f.render_widget(
@@ -1259,14 +1261,14 @@ fn draw_header_buttons(f: &mut Frame, app: &App) {
             Gauge::default()
                 .ratio(ratio)
                 .label(label)
-                .gauge_style(Style::default().fg(Color::Yellow).bg(Color::Black)),
+                .gauge_style(Style::default().fg(theme::warn()).bg(theme::bg())),
             progress,
         );
     } else if total > 0 && failed > 0 {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 format!(" {counter} · {failed} 个失败 · 点击查看 "),
-                Style::default().fg(Color::Red).bg(Color::Black),
+                Style::default().fg(theme::err()).bg(theme::bg()),
             ))),
             progress,
         );
@@ -1274,7 +1276,7 @@ fn draw_header_buttons(f: &mut Frame, app: &App) {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 format!(" {counter} · 点击查看 "),
-                Style::default().fg(Color::Green).bg(Color::Black),
+                Style::default().fg(theme::ok()).bg(theme::bg()),
             ))),
             progress,
         );
@@ -1350,16 +1352,16 @@ fn draw_tab_bar(
 ) {
     let y = area.y + TAB_ROW;
     f.render_widget(
-        Paragraph::new(Line::from("")).style(Style::default().bg(Color::DarkGray)),
+        Paragraph::new(Line::from("")).style(Style::default().bg(theme::band())),
         Rect { x: area.x, y, width: area.width, height: 1 },
     );
     let rects = tab_rects(area, titles);
     for (i, (idx, rect)) in rects.iter().enumerate() {
         let title = clip_display(titles.get(*idx).map(String::as_str).unwrap_or(""), TAB_TITLE_MAX);
         let style = if *idx == active {
-            Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+            Style::default().fg(theme::on_accent()).bg(theme::accent_bg()).add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::White).bg(Color::Black)
+            Style::default().fg(theme::text()).bg(theme::bg())
         };
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
@@ -1373,7 +1375,7 @@ fn draw_tab_bar(
             f.render_widget(
                 Paragraph::new(Line::from(Span::styled(
                     "│",
-                    Style::default().fg(Color::Black).bg(Color::DarkGray),
+                    Style::default().fg(theme::rule()).bg(theme::band()),
                 ))),
                 Rect { x: rect.right(), y, width: TAB_GAP, height: 1 },
             );
@@ -1383,7 +1385,7 @@ fn draw_tab_bar(
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             " + ",
-            Style::default().fg(Color::Cyan).bg(Color::DarkGray),
+            Style::default().fg(theme::accent()).bg(theme::band()),
         ))),
         plus,
     );
@@ -1398,7 +1400,7 @@ fn draw_tab_bar(
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 hint,
-                Style::default().fg(Color::Gray).bg(Color::DarkGray),
+                Style::default().fg(theme::muted()).bg(theme::band()),
             ))),
             Rect {
                 x: plus.right() + 1,
@@ -1426,10 +1428,15 @@ fn clip_display(s: &str, width: usize) -> String {
     out
 }
 
-/// 设置弹窗的 7 个可点击行：高亮 / 保活 / 主密码开关 / 修改主密码 / 快捷键 / 保存 / 取消。
+/// 设置弹窗面板。命中测试与绘制必须同源，加一行只改这一处。
+fn settings_panel(area: Rect) -> Rect {
+    centered(56, 12, area)
+}
+
+/// 设置弹窗的 8 个可点击行：高亮 / 保活 / 主密码开关 / 修改主密码 / 快捷键 / 主题 / 保存 / 取消。
 /// 必须与 draw_settings_overlay 的几何完全一致。
-pub fn settings_hit_rects(area: Rect) -> [Rect; 7] {
-    let p = centered(56, 11, area);
+pub fn settings_hit_rects(area: Rect) -> [Rect; 8] {
+    let p = settings_panel(area);
     let ix = p.x + 1;
     let iy = p.y + 1;
     let iw = p.width.saturating_sub(2);
@@ -1439,8 +1446,9 @@ pub fn settings_hit_rects(area: Rect) -> [Rect; 7] {
         Rect { x: ix, y: iy + 2, width: iw, height: 1 },
         Rect { x: ix, y: iy + 3, width: iw, height: 1 },
         Rect { x: ix, y: iy + 4, width: iw, height: 1 },
-        Rect { x: ix.saturating_add(iw / 2).saturating_sub(16), y: iy + 6, width: 14, height: 1 },
-        Rect { x: ix.saturating_add(iw / 2).saturating_add(2), y: iy + 6, width: 14, height: 1 },
+        Rect { x: ix, y: iy + 5, width: iw, height: 1 },
+        Rect { x: ix.saturating_add(iw / 2).saturating_sub(16), y: iy + 7, width: 14, height: 1 },
+        Rect { x: ix.saturating_add(iw / 2).saturating_add(2), y: iy + 7, width: 14, height: 1 },
     ]
 }
 
@@ -1468,25 +1476,25 @@ pub fn keybinds_hit_rects(area: Rect) -> [Rect; crate::keybinds::Action::ALL.len
 
 fn draw_settings_overlay(f: &mut Frame, app: &App) {
     let rects = settings_hit_rects(f.area());
-    let panel = centered(56, 11, f.area());
-    f.buffer_mut().set_style(panel, Style::default().bg(Color::Black));
+    let panel = settings_panel(f.area());
+    f.buffer_mut().set_style(panel, Style::default().bg(theme::bg()));
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" 全局设置 ")
-        .title_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+        .title_style(Style::default().fg(theme::accent()).add_modifier(Modifier::BOLD));
     f.render_widget(Clear, panel);
     f.render_widget(block, panel);
     let st = &app.settings;
     let focus = app.settings_focus;
     let row_base = |focused: bool| {
-        let mut s = Style::default().fg(Color::White).bg(Color::Black);
+        let mut s = Style::default().fg(theme::text()).bg(theme::bg());
         if focused {
             s = s.add_modifier(Modifier::REVERSED);
         }
         s
     };
     // 行 0：高亮开关
-    let hl_color = if st.highlight { Color::Green } else { Color::Red };
+    let hl_color = if st.highlight { theme::ok() } else { theme::err() };
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(" 终端输出高亮（docker / 日志级别）：", row_base(focus == 0)),
@@ -1504,15 +1512,15 @@ fn draw_settings_overlay(f: &mut Frame, app: &App) {
             Span::styled(
                 format!(" {} 秒 ", st.keepalive_secs),
                 row_base(focus == 1)
-                    .fg(Color::Cyan)
+                    .fg(theme::accent())
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled("（15/30/60/120/300）", row_base(focus == 1).fg(Color::DarkGray)),
+            Span::styled("（15/30/60/120/300）", row_base(focus == 1).fg(theme::dim())),
         ])),
         rects[1],
     );
     // 行 2：主密码保护开关
-    let mp_color = if st.master_password_enabled { Color::Green } else { Color::Yellow };
+    let mp_color = if st.master_password_enabled { theme::ok() } else { theme::warn() };
     let mp_note = if st.master_password_enabled {
         " 开 · 启动需输入主密码 "
     } else {
@@ -1538,7 +1546,7 @@ fn draw_settings_overlay(f: &mut Frame, app: &App) {
                 } else {
                     " 开发模式无主密码 "
                 },
-                row_base(focus == 3).fg(Color::DarkGray),
+                row_base(focus == 3).fg(theme::dim()),
             ),
         ]),
         _ => {
@@ -1555,8 +1563,8 @@ fn draw_settings_overlay(f: &mut Frame, app: &App) {
             };
             Line::from(vec![
                 Span::styled(prompt, row_base(true)),
-                Span::styled(masked, row_base(true).fg(Color::Yellow)),
-                Span::styled(tail, row_base(false).fg(Color::DarkGray)),
+                Span::styled(masked, row_base(true).fg(theme::warn())),
+                Span::styled(tail, row_base(false).fg(theme::dim())),
             ])
         }
     };
@@ -1570,41 +1578,56 @@ fn draw_settings_overlay(f: &mut Frame, app: &App) {
                     " {} 项可改 · Enter/点击 打开 ",
                     crate::keybinds::Action::ALL.len()
                 ),
-                row_base(focus == 4).fg(Color::DarkGray),
+                row_base(focus == 4).fg(theme::dim()),
             ),
         ])),
         rects[4],
     );
-    // 行 5：操作提示
+    // 行 5：界面主题（改完立即预览，保存才落盘）
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(" 界面主题：", row_base(focus == 5)),
+            Span::styled(
+                format!(" {} ", st.theme.label()),
+                row_base(focus == 5).fg(theme::accent()).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "←→/Enter 切换",
+                row_base(focus == 5).fg(theme::dim()),
+            ),
+        ])),
+        rects[5],
+    );
+    // 行 6：操作提示
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             " ↑↓ 选择 · Enter/点击 修改 · ←→ 微调 · Esc 取消",
-            Style::default().fg(Color::DarkGray).bg(Color::Black),
+            Style::default().fg(theme::dim()).bg(theme::bg()),
         ))),
-        Rect { x: rects[0].x, y: rects[0].y + 5, width: rects[0].width, height: 1 },
+        Rect { x: rects[0].x, y: rects[0].y + 6, width: rects[0].width, height: 1 },
     );
-    // 行 6：保存 / 取消按钮
+    // 行 7：保存 / 取消按钮
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             "【 保 存 】",
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(if focus == 5 { Modifier::BOLD } else { Modifier::empty() })
-                .add_modifier(if focus == 5 { Modifier::UNDERLINED } else { Modifier::empty() }),
+                .fg(theme::on_accent())
+                .bg(theme::accent_bg())
+                .add_modifier(if focus == 6 { Modifier::BOLD } else { Modifier::empty() })
+                .add_modifier(if focus == 6 { Modifier::UNDERLINED } else { Modifier::empty() }),
         ))),
-        rects[5],
+        rects[6],
     );
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             "【 取 消 】",
             Style::default()
-                .fg(Color::White)
-                .bg(Color::DarkGray)
-                .add_modifier(if focus == 6 { Modifier::BOLD } else { Modifier::empty() })
-                .add_modifier(if focus == 6 { Modifier::UNDERLINED } else { Modifier::empty() }),
+                .fg(theme::text())
+                .bg(theme::band())
+                .add_modifier(if focus == 7 { Modifier::BOLD } else { Modifier::empty() })
+                .add_modifier(if focus == 7 { Modifier::UNDERLINED } else { Modifier::empty() }),
         ))),
-        rects[6],
+        rects[7],
     );
 }
 
@@ -1612,16 +1635,16 @@ fn draw_keybinds_overlay(f: &mut Frame, app: &App) {
     let n = crate::keybinds::Action::ALL.len();
     let rects = keybinds_hit_rects(f.area());
     let panel = centered(60, n as u16 + 7, f.area());
-    f.buffer_mut().set_style(panel, Style::default().bg(Color::Black));
+    f.buffer_mut().set_style(panel, Style::default().bg(theme::bg()));
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" 快捷键设置 ")
-        .title_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+        .title_style(Style::default().fg(theme::accent()).add_modifier(Modifier::BOLD));
     f.render_widget(Clear, panel);
     f.render_widget(block, panel);
     let binds = &app.settings.keybinds;
     let row_base = |focused: bool| {
-        let mut s = Style::default().fg(Color::White).bg(Color::Black);
+        let mut s = Style::default().fg(theme::text()).bg(theme::bg());
         if focused {
             s = s.add_modifier(Modifier::REVERSED);
         }
@@ -1636,9 +1659,9 @@ fn draw_keybinds_overlay(f: &mut Frame, app: &App) {
             format!(" {} ", binds.display(*action))
         };
         let badge_style = if recording {
-            row_base(focused).fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            row_base(focused).fg(theme::warn()).add_modifier(Modifier::BOLD)
         } else {
-            row_base(focused).fg(Color::Cyan).add_modifier(Modifier::BOLD)
+            row_base(focused).fg(theme::accent()).add_modifier(Modifier::BOLD)
         };
         f.render_widget(
             Paragraph::new(Line::from(vec![
@@ -1652,14 +1675,14 @@ fn draw_keybinds_overlay(f: &mut Frame, app: &App) {
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             " ↑↓ 选择 · Enter/点击 改键 · 只能绑 F2–F9 或 Ctrl/Alt 组合键",
-            Style::default().fg(Color::DarkGray).bg(Color::Black),
+            Style::default().fg(theme::dim()).bg(theme::bg()),
         ))),
         Rect { x: rects[0].x, y: rects[0].y + n as u16, width: rects[0].width, height: 1 },
     );
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             format!(" {}", clip_display(crate::keybinds::platform_note(), rects[0].width as usize - 2)),
-            Style::default().fg(Color::Yellow).bg(Color::Black),
+            Style::default().fg(theme::warn()).bg(theme::bg()),
         ))),
         Rect { x: rects[0].x, y: rects[0].y + n as u16 + 1, width: rects[0].width, height: 1 },
     );
@@ -1671,8 +1694,8 @@ fn draw_keybinds_overlay(f: &mut Frame, app: &App) {
         Paragraph::new(Line::from(Span::styled(
             format!(" {}", clip_display(&msg, rects[0].width as usize - 2)),
             Style::default()
-                .fg(if app.keybinds_msg.is_some() { Color::Green } else { Color::DarkGray })
-                .bg(Color::Black),
+                .fg(if app.keybinds_msg.is_some() { theme::ok() } else { theme::dim() })
+                .bg(theme::bg()),
         ))),
         Rect { x: rects[0].x, y: rects[0].y + n as u16 + 2, width: rects[0].width, height: 1 },
     );
@@ -1680,8 +1703,8 @@ fn draw_keybinds_overlay(f: &mut Frame, app: &App) {
         Paragraph::new(Line::from(Span::styled(
             "【恢复默认】",
             Style::default()
-                .fg(Color::White)
-                .bg(Color::DarkGray)
+                .fg(theme::text())
+                .bg(theme::band())
                 .add_modifier(if app.keybinds_focus == n { Modifier::BOLD } else { Modifier::empty() }),
         ))),
         rects[n],
@@ -1690,8 +1713,8 @@ fn draw_keybinds_overlay(f: &mut Frame, app: &App) {
         Paragraph::new(Line::from(Span::styled(
             "【 返 回 】",
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
+                .fg(theme::on_accent())
+                .bg(theme::accent_bg())
                 .add_modifier(if app.keybinds_focus == n + 1 { Modifier::BOLD } else { Modifier::empty() }),
         ))),
         rects[n + 1],
@@ -1715,11 +1738,11 @@ fn draw_transfer_popup(f: &mut Frame, app: &App) {
         .min(f.area().height.saturating_sub(2))
         .max(5);
     let area = centered(64, height, f.area());
-    f.buffer_mut().set_style(area, Style::default().bg(Color::Black));
+    f.buffer_mut().set_style(area, Style::default().bg(theme::bg()));
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" 传输详情 · 点击或按键关闭 ")
-        .title_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+        .title_style(Style::default().fg(theme::accent()).add_modifier(Modifier::BOLD));
     let inner = block.inner(area);
     f.render_widget(Clear, area);
     f.render_widget(block, area);
@@ -1744,11 +1767,11 @@ fn draw_transfer_popup(f: &mut Frame, app: &App) {
             }
         };
         let color = if item.error.is_some() {
-            Color::Red
+            theme::err()
         } else if item.done {
-            Color::Green
+            theme::ok()
         } else {
-            Color::Yellow
+            theme::warn()
         };
         let text = Rect { x: inner.x, y: row, width: inner.width, height: 1 };
         f.render_widget(
@@ -1773,7 +1796,7 @@ fn draw_transfer_popup(f: &mut Frame, app: &App) {
         f.render_widget(
             Gauge::default()
                 .ratio(ratio)
-                .gauge_style(Style::default().fg(color).bg(Color::Black)),
+                .gauge_style(Style::default().fg(color).bg(theme::bg())),
             bar,
         );
     }
@@ -1850,5 +1873,24 @@ mod tests {
         }
         assert!(rects.last().unwrap().1.right() <= 24);
         assert!(tab_rects(Rect::new(0, 0, 8, 24), &titles).len() < titles.len());
+    }
+
+    #[test]
+    fn settings_rows_stay_in_order_with_the_buttons_last() {
+        let area = Rect::new(0, 0, 80, 24);
+        let panel = settings_panel(area);
+        let r = settings_hit_rects(area);
+        // 6 个可编辑项必须是连续的 6 行：加一行（主题）时鼠标命中不能错位
+        for i in 1..6 {
+            assert_eq!(r[i].y, r[i - 1].y + 1, "第 {i} 行和上一行不挨着");
+        }
+        assert_eq!(r[5].y, panel.y + 6);
+        // 按钮在操作提示（第 7 行）之下的同一行
+        assert_eq!(r[6].y, r[7].y);
+        assert_eq!(r[6].y, panel.y + 8);
+        for (i, rect) in r.iter().enumerate() {
+            assert!(rect.right() <= panel.right(), "第 {i} 行超出面板右边界");
+            assert!(rect.bottom() <= panel.bottom(), "第 {i} 行超出面板下边界");
+        }
     }
 }

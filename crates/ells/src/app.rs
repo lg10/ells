@@ -25,6 +25,7 @@ use crate::keybinds::{Action, Chord};
 use crate::session::{SessionAction, SessionState, TermMode};
 use crate::settings::Settings;
 use crate::term;
+use crate::theme;
 use crate::ui;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -1436,7 +1437,7 @@ impl App {
                 }
                 return;
             }
-            let [hl_r, ka_r, mp_r, change_r, kb_r, save_r, cancel_r] =
+            let [hl_r, ka_r, mp_r, change_r, kb_r, theme_r, save_r, cancel_r] =
                 ui::settings_hit_rects(self.last_area);
             if hit(hl_r, column, row) {
                 self.settings_focus = 0;
@@ -1450,6 +1451,9 @@ impl App {
                 self.begin_master_change();
             } else if hit(kb_r, column, row) {
                 self.open_keybinds();
+            } else if hit(theme_r, column, row) {
+                self.settings_focus = 5;
+                self.step_theme(false);
             } else if hit(save_r, column, row) {
                 self.save_settings();
             } else if hit(cancel_r, column, row) {
@@ -1641,7 +1645,7 @@ impl App {
                 self.settings_focus = self.settings_focus.saturating_sub(1);
             }
             KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
-                self.settings_focus = (self.settings_focus + 1).min(6);
+                self.settings_focus = (self.settings_focus + 1).min(7);
             }
             KeyCode::Enter | KeyCode::Char(' ') => self.apply_settings_focus(),
             KeyCode::Left => match self.settings_focus {
@@ -1651,6 +1655,7 @@ impl App {
                         step_keepalive(self.settings.keepalive_secs, false);
                 }
                 2 => self.toggle_master_setting(),
+                5 => self.step_theme(true),
                 _ => {}
             },
             KeyCode::Right => match self.settings_focus {
@@ -1660,6 +1665,7 @@ impl App {
                         step_keepalive(self.settings.keepalive_secs, true);
                 }
                 2 => self.toggle_master_setting(),
+                5 => self.step_theme(false),
                 _ => {}
             },
             KeyCode::Char('h') => self.settings.highlight = !self.settings.highlight,
@@ -1753,7 +1759,8 @@ impl App {
     }
 
     /// Enter/空格/点击 对当前聚焦项生效：0 切换高亮、1 循环保活档位、
-    /// 2 主密码保护开关、3 进入修改主密码输入、4 打开快捷键面板、5 保存、6 取消
+    /// 2 主密码保护开关、3 进入修改主密码输入、4 打开快捷键面板、5 下一套主题、
+    /// 6 保存、其余取消
     fn apply_settings_focus(&mut self) {
         match self.settings_focus {
             0 => self.settings.highlight = !self.settings.highlight,
@@ -1763,9 +1770,17 @@ impl App {
             2 => self.toggle_master_setting(),
             3 => self.begin_master_change(),
             4 => self.open_keybinds(),
-            5 => self.save_settings(),
+            5 => self.step_theme(false),
+            6 => self.save_settings(),
             _ => self.cancel_settings(),
         }
+    }
+
+    /// 换主题：只改内存里的草稿并立刻重绘，所以能当场看到效果；
+    /// 按【保存】才写盘，按【取消】会走 Settings::load() 把主题一起回滚。
+    fn step_theme(&mut self, backwards: bool) {
+        self.settings.theme = self.settings.theme.shift(backwards);
+        theme::apply(self.settings.theme);
     }
 
     fn open_settings(&mut self) {

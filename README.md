@@ -143,6 +143,13 @@ on Windows, macOS and Linux alike. `Ctrl+digits`, `Ctrl+Space` and `Ctrl-/` are 
 with other bytes or with Windows Terminal's own shortcuts, and the panel footer prints the caveats for the
 platform you are running on.
 
+Colors are a setting too: the host list `s` → settings → 「界面主题」 cycles four palettes with `Enter` or `←→` —
+**dark** (painted black/dark-gray backgrounds, the look on Windows), **跟随终端 / follow-terminal** (ells paints
+no background at all and reuses your terminal's own theme — recommended for macOS Terminal, iTerm2 and WezTerm,
+and the default on macOS), **高对比 / high contrast** (no small gray text; hierarchy comes from bold and
+reverse) and **浅色底 / light** (dark text for light-background terminals). A switch previews immediately and is
+only written to `theme=` in `~/.ells/settings.ini` when you hit 【保 存】; 【取 消】 reverts the preview.
+
 ## Building from source
 
 Requires **Rust 1.85+** (edition 2024).

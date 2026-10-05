@@ -6,6 +6,7 @@ mod keybinds;
 mod session;
 mod settings;
 mod term;
+mod theme;
 mod ui;
 mod zmodem;
 
