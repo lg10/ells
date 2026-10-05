@@ -27,6 +27,8 @@ pub enum AppEvent {
     HostKey(HostKeyPrompt),
     /// 后台连接（含认证与主机密钥确认）结束。
     Connected(std::result::Result<RemoteSession, String>),
+    /// 用户在"连接已断开"弹窗里点了重连。
+    Reconnect(Host),
     /// 传输目标已存在，等用户选择覆盖 / 改名 / 取消。
     Conflict(ConflictPrompt),
     /// 用户在导入确认框里点了"导入"（空列表 = 取消）。
@@ -58,6 +60,8 @@ pub enum AppEvent {
     SftpStarted { label: String, direction: &'static str },
     /// 远端改名/新建/删除完成（Ok 给状态行文案）。
     SftpOp(std::result::Result<String, String>),
+    /// 历史搜索框的回答：None = 取消，Some("") = 清空即退出搜索。
+    Search(Option<String>),
     /// Resolved remote home directory for the browser.
     SftpHome(std::result::Result<String, String>),
     /// Directory listing for the browser.

@@ -97,6 +97,39 @@ impl Emulator {
         self.parser.screen().scrollback()
     }
 
+    /// 采集"全部历史 + 实时屏"的纯文本，返回 `(最大回看偏移, 由旧到新的行)`。
+    ///
+    /// vt100 只暴露滚动后的可视区，所以这里逐偏移取视图首行来覆盖 scrollback，
+    /// 最后在不滚动的位置取整屏。第 `i` 行的定位方式：
+    /// `i < max` → `set_scrollback(max - i)` 后的第 0 行；
+    /// `i >= max` → `set_scrollback(0)` 后的第 `i - max` 行。
+    /// 采集结束会恢复调用前的回看偏移。
+    pub fn history_lines(&mut self) -> (usize, Vec<String>) {
+        let (rows, cols) = self.size();
+        let saved = self.parser.screen().scrollback();
+        // set_scrollback 自带钳制，读回来即为实际可回看行数
+        self.parser.screen_mut().set_scrollback(usize::MAX / 4);
+        let max = self.parser.screen().scrollback();
+        let mut lines: Vec<String> = Vec::with_capacity(max + rows as usize + 1);
+        for offset in (1..=max).rev() {
+            self.parser.screen_mut().set_scrollback(offset);
+            lines.push(
+                self.parser
+                    .screen()
+                    .rows(0, cols)
+                    .next()
+                    .unwrap_or_default(),
+            );
+        }
+        self.parser.screen_mut().set_scrollback(0);
+        // 不滚动时只取真实行数：vt100 在极窄终端上可能返回更多可视行
+        for line in self.parser.screen().rows(0, cols).take(rows as usize) {
+            lines.push(line);
+        }
+        self.parser.screen_mut().set_scrollback(saved);
+        (max, lines)
+    }
+
     pub fn title(&self) -> Option<&str> {
         self.parser.callbacks().title.as_deref()
     }
@@ -117,5 +150,41 @@ impl Emulator {
     pub fn reset_screen(&mut self) {
         let (rows, cols) = (self.rows, self.cols);
         self.parser = Parser::new_with_callbacks(rows, cols, 2000, TerminalEvents::default());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Emulator;
+
+    /// 搜索要靠 `history_lines` 的下标跳回视图，所以"下标 → (回看偏移, 视图行)"
+    /// 的换算必须逐行成立；这里把每一行都定位一遍。
+    #[test]
+    fn history_lines_indices_map_back_to_the_view() {
+        let mut emu = Emulator::new(3, 20);
+        for i in 0..12 {
+            emu.process(format!("row-{i:02}\r\n").as_bytes());
+        }
+        let (max, lines) = emu.history_lines();
+        assert_eq!(lines.len(), max + 3, "快照应=历史行+整屏行");
+        for (idx, text) in lines.iter().enumerate() {
+            let text = text.trim_end();
+            if text.is_empty() {
+                continue;
+            }
+            let (offset, row) = if idx < max { (max - idx, 0) } else { (0, idx - max) };
+            emu.set_scrollback(offset);
+            let got = emu
+                .screen()
+                .rows(0, 20)
+                .nth(row)
+                .unwrap_or_default()
+                .trim_end()
+                .to_string();
+            assert_eq!(got, text, "第 {idx} 行定位失败");
+        }
+        let all: Vec<String> = lines.iter().map(|l| l.trim_end().to_string()).collect();
+        assert!(all.contains(&"row-00".to_string()), "最早一行应被采到");
+        assert!(all.contains(&"row-11".to_string()), "最新一行应被采到");
     }
 }

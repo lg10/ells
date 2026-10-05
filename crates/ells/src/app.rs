@@ -180,6 +180,20 @@ impl std::fmt::Debug for ConflictPrompt {
     }
 }
 
+/// 历史输出搜索的常驻状态（F3，或回看历史时按 `/` 打开；Esc / 任意其它按键退出）。
+#[derive(Debug)]
+pub struct SearchState {
+    pub query: String,
+    /// 命中行在历史快照里的下标（由旧到新）
+    pub hits: Vec<usize>,
+    /// 当前停在 `hits` 的第几个
+    pub cursor: usize,
+    /// 快照对应的最大回看偏移（把下标换算成滚动量要用）
+    pub max: usize,
+    /// 当前命中行在终端视图里的行号（高亮带）
+    pub view_row: u16,
+}
+
 /// 通用文本输入弹窗：远端新建目录 / 重命名 / 会话内搜索共用一套。
 /// 回调在 UI 事件环里执行，只能靠自己捕获的克隆句柄干活（不能碰 App）。
 pub struct Prompt {
@@ -244,6 +258,8 @@ pub struct App {
     pub prompt: Option<Prompt>,
     /// 全键位帮助页（? / F1 打开，任意退出键关闭）。
     pub help_open: bool,
+    /// 历史输出搜索（内嵌终端专用，直通模式没有可回看的缓冲）。
+    pub search: Option<SearchState>,
     /// 主机密钥策略：连接任务用它发问，UI 用它的通道回答。
     hostkey: HostKeyPolicy,
     /// 本次会话所有传输共享的取消位（Ctrl-C 一次停全部）。
@@ -255,6 +271,8 @@ pub struct App {
     pub vault: Vault,
     pub vault_key: Option<VaultKey>,
     pub pending_connect: Option<Host>,
+    /// 当前会话对应的主机：非用户主动断开时用它提供"重连"。
+    last_host: Option<Host>,
     /// 后台连接进行中显示的主机标签（连上之后作为会话名使用）。
     pub connecting_label: Option<String>,
     pub direct_alias: Option<String>,
@@ -354,6 +372,7 @@ impl App {
             choice: None,
             prompt: None,
             help_open: false,
+            search: None,
             hostkey,
             cancel: Cancel::default(),
             transfer_popup: false,
@@ -361,6 +380,7 @@ impl App {
             vault: Vault::default(),
             vault_key: None,
             pending_connect: None,
+            last_host: None,
             connecting_label: None,
             direct_alias: alias,
             pending_unlock_action: false,
@@ -475,9 +495,17 @@ impl App {
                     self.pending_zmodem = None;
                     self.settings_open = false;
                     self.transfer_popup = false;
+                    // 只有"非用户主动断开"才会走到这里（Ctrl-] 会先把 last_host 清掉）。
+                    // 已有弹窗时不再叠加：一次只弹一个，且会孤儿掉前一个的应答通道。
+                    if let Some(host) = self.last_host.clone() {
+                        if self.choice.is_none() {
+                            self.offer_reconnect(host);
+                        }
+                    }
                 }
                 AppEvent::HostKey(prompt) => self.ask_host_key(prompt),
                 AppEvent::Connected(res) => self.on_connected(res),
+                AppEvent::Reconnect(host) => self.start_connect(host),
                 AppEvent::Conflict(prompt) => self.ask_conflict(prompt),
                 AppEvent::ImportHosts(hosts) => self.import_hosts(hosts),
                 AppEvent::PickedFile { field, path } => {
@@ -631,6 +659,11 @@ impl App {
                         }
                     }
                     Err(err) => self.status = Some(err),
+                },
+                AppEvent::Search(value) => match value {
+                    Some(q) if !q.trim().is_empty() => self.run_search(q.trim()),
+                    // 取消或空关键词：搜索态结束，视图回到实时底部
+                    _ => self.clear_search(),
                 },
                 AppEvent::SftpCwd(Ok(dir)) => {
                     self.remote_cwd = dir.clone();
@@ -820,12 +853,113 @@ impl App {
             self.help_open = true;
             return;
         }
+        // 搜索态只占用 n/N/Esc：其它按键先退出搜索，再原样交给远端
+        if self.search.is_some() {
+            let scrolled = self.session.as_ref().is_some_and(|s| s.scroll > 0);
+            match key.code {
+                KeyCode::Esc => self.clear_search(),
+                KeyCode::Char('n') if scrolled => self.step_search(true),
+                KeyCode::Char('N') if scrolled => self.step_search(false),
+                _ => {
+                    self.clear_search();
+                    self.forward_to_remote(key);
+                }
+            }
+            return;
+        }
+        // F3 = 搜索；`/` 仅在已回看历史时可用（平时它是远端的路径字符）。
+        let embedded = self.session.as_ref().map(|s| s.mode) == Some(TermMode::Embedded);
+        let scrolled = self.session.as_ref().is_some_and(|s| s.scroll > 0);
+        if embedded && (matches!(key.code, KeyCode::F(3)) || (scrolled && matches!(key.code, KeyCode::Char('/')))) {
+            self.open_search();
+            return;
+        }
+        self.forward_to_remote(key);
+    }
+
+    fn forward_to_remote(&mut self, key: &KeyEvent) {
         let action = match &mut self.session {
             Some(s) => s.handle_key(key),
             None => SessionAction::Keep,
         };
         if action == SessionAction::Detach {
             self.detach_session("已返回列表");
+        }
+    }
+
+    /// F3：搜索已回看的终端输出（内嵌模式专有）。
+    fn open_search(&mut self) {
+        let buffer = self.search.as_ref().map(|s| s.query.clone()).unwrap_or_default();
+        let tx = self.event_tx.clone();
+        self.prompt = Some(Prompt {
+            title: "搜索历史输出".to_string(),
+            label: "关键词",
+            buffer,
+            error: None,
+            hint: Some("回车跳到首个命中 · n/N 下一条/上一条 · Esc 退出"),
+            allow_empty: true,
+            on_done: Box::new(move |value| {
+                let _ = tx.send(AppEvent::Search(value));
+            }),
+        });
+    }
+
+    fn run_search(&mut self, query: &str) {
+        let Some(s) = self.session.as_mut() else {
+            self.search = None;
+            return;
+        };
+        let (max, lines) = s.history_lines();
+        let needle = query.to_lowercase();
+        let hits: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.to_lowercase().contains(&needle))
+            .map(|(i, _)| i)
+            .collect();
+        if hits.is_empty() {
+            self.search = None;
+            self.status = Some(format!("历史输出里没有「{query}」（共 {} 行）", lines.len()));
+            return;
+        }
+        // 从当前视图往下找第一个命中，到底了再回头（与 less 的 / 一致）
+        let top = max.saturating_sub(s.scroll);
+        let cursor = hits.iter().position(|i| *i > top).unwrap_or(0);
+        let view_row = s.jump_history(max, hits[cursor]);
+        self.status = None;
+        self.search = Some(SearchState {
+            query: query.to_string(),
+            hits,
+            cursor,
+            max,
+            view_row,
+        });
+    }
+
+    fn step_search(&mut self, next: bool) {
+        let (Some(search), Some(s)) = (self.search.as_mut(), self.session.as_mut()) else {
+            return;
+        };
+        let count = search.hits.len();
+        if count == 0 {
+            return;
+        }
+        search.cursor = if next {
+            (search.cursor + 1) % count
+        } else {
+            (search.cursor + count - 1) % count
+        };
+        let idx = search.hits[search.cursor];
+        search.view_row = s.jump_history(search.max, idx);
+    }
+
+    fn clear_search(&mut self) {
+        if self.search.take().is_none() {
+            return;
+        }
+        if let Some(s) = self.session.as_mut() {
+            s.emu.set_scrollback(0);
+            s.scroll = 0;
         }
     }
 
@@ -1215,6 +1349,8 @@ impl App {
     }
 
     fn detach_session(&mut self, status: &str) {
+        // 主动断开：不给"连接已断开 / 重连"弹窗，这条会话到此为止
+        self.last_host = None;
         if let Some(mut s) = self.session.take() {
             s.close();
             self.status = Some(format!("[{}] {status}", s.label));
@@ -2108,6 +2244,8 @@ impl App {
     /// 连接放到后台任务：主机密钥确认要求事件环一直能响应按键。
     fn spawn_connect(&mut self, host: Host) {
         self.connecting_label = Some(format!("{} · {}", host.alias, host.target()));
+        // 记住当前主机：意外断开时用它提供重连（主动断开会清掉）
+        self.last_host = Some(host.clone());
         let vault = self.vault.clone();
         let policy = self.hostkey.clone();
         let (cols, rows) = term_size();
@@ -2117,6 +2255,30 @@ impl App {
                 .await
                 .map_err(|e| format!("{e:#}"));
             let _ = tx.send(AppEvent::Connected(res));
+        });
+    }
+
+    /// 连接意外结束：一键重连同一主机（用户按 Ctrl-] 主动断开不会走到这里）。
+    fn offer_reconnect(&mut self, host: Host) {
+        if let Some(idx) = self.vault.hosts.iter().position(|h| h.alias == host.alias) {
+            self.list.selected = idx;
+        }
+        let tx = self.event_tx.clone();
+        self.choice = Some(Choice {
+            title: "连接已断开".to_string(),
+            lines: vec![
+                format!("主机：{}", host.target()),
+                "可能是网络中断、服务器重启或空闲超时。".to_string(),
+            ],
+            options: vec!["重 连".to_string(), "返 回 列 表".to_string()],
+            selected: 0,
+            shortcuts: &[('r', 0), ('l', 1)],
+            danger: false,
+            on_pick: Box::new(move |idx| {
+                if matches!(idx, Some(0)) {
+                    let _ = tx.send(AppEvent::Reconnect(host));
+                }
+            }),
         });
     }
 

@@ -241,6 +241,31 @@ impl SessionState {
         self.scroll = self.emu.scrollback_offset();
     }
 
+    /// 直通模式下 `screen()` 属于远端程序，ells 无法回看，也就没有历史可搜。
+    pub fn history_lines(&mut self) -> (usize, Vec<String>) {
+        if self.mode != TermMode::Embedded {
+            return (0, Vec::new());
+        }
+        self.emu.history_lines()
+    }
+
+    /// 把视图滚到历史第 `idx` 行（下标来自 `history_lines`），
+    /// 返回该行在当前视图中的行号，供高亮使用。
+    pub fn jump_history(&mut self, max: usize, idx: usize) -> u16 {
+        if self.mode != TermMode::Embedded {
+            return 0;
+        }
+        if idx >= max {
+            self.emu.set_scrollback(0);
+            self.scroll = 0;
+            (idx - max) as u16
+        } else {
+            self.emu.set_scrollback(max - idx);
+            self.scroll = self.emu.scrollback_offset();
+            0
+        }
+    }
+
     pub fn begin_selection(&mut self, col: u16, row: u16) {
         self.selection = Some(((col, row), (col, row)));
     }

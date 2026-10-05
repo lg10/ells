@@ -315,7 +315,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
     );
     let sections: [(&str, &str); 7] = [
         ("主机列表", "↑↓/jk 选择 · Enter 连接 · a 新增 · e 编辑 · d 删除（二次确认）· s 设置 · i 导入 ~/.ssh/config · ?/F1 帮助 · q/Ctrl-C 退出"),
-        ("会话终端", "直接打字即发往远端 · Ctrl-S 文件浏览器 · Ctrl-Q 内嵌/直通 · Ctrl-] 断开返回列表 · Ctrl-L 整屏重绘 · 滚轮回看 · 拖选复制（OSC 52）· / 搜索历史 · F1 帮助"),
+        ("会话终端", "直接打字即发往远端 · Ctrl-S 文件浏览器 · Ctrl-Q 内嵌/直通 · Ctrl-] 断开返回列表 · Ctrl-L 整屏重绘 · 滚轮回看 · 拖选复制（OSC 52）· F3 搜索历史输出（回看时按 / 同样可用，n/N 上下条）· F1 帮助"),
         ("文件浏览器", "↑↓/滚轮 选择 · Enter 进入目录或下载 · u 上传文件 · U 上传整个目录 · d 下载 · m 新建目录 · n 重命名 · D 删除（递归，先确认）· Ctrl-C 取消全部在途传输 · r 刷新 · Backspace 上级 · Esc 返回终端"),
         ("主机表单", "Tab/↓ 下一个字段 · ↑ 上一个 · ←→ 切换认证方式 · Ctrl-F 选私钥 · Ctrl-J 选跳板机 · Ctrl-C 清空当前字段 · Enter 在\"私钥路径/跳板机\"上直接打开选择器，保存要点【保 存】或聚焦后回车"),
         ("解锁保险库", "输入主密码后回车；首次使用会要求输入两遍。主密码不可找回，忘记只能删除 ~/.ells/vault.bin 重来。"),
@@ -846,7 +846,7 @@ fn draw_session(f: &mut Frame, app: &mut App) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            "Ctrl-Q 切模式 · Ctrl-S 文件 · Ctrl-L 重绘 · Ctrl-] 返回",
+            "Ctrl-Q 切模式 · Ctrl-S 文件 · Ctrl-L 重绘 · F3 搜索 · Ctrl-] 返回",
             Style::default().fg(Color::DarkGray),
         ),
     ]);
@@ -871,7 +871,18 @@ fn draw_session(f: &mut Frame, app: &mut App) {
         Paragraph::new(Line::from("")).style(Style::default().bg(Color::Black)),
         note_row,
     );
-    if s.scroll > 0 {
+    if let Some(search) = &app.search {
+        let line = Line::from(Span::styled(
+            format!(
+                " 搜索「{}」：第 {}/{} 个命中 · n 下一个 · N 上一个 · Esc 退出",
+                search.query,
+                search.cursor + 1,
+                search.hits.len()
+            ),
+            Style::default().fg(Color::Cyan).bg(Color::Black),
+        ));
+        f.render_widget(Paragraph::new(line), note_row);
+    } else if s.scroll > 0 {
         let line = Line::from(Span::styled(
             format!(" 回看历史：已向上 {n} 行 · 滚轮回底部 · 任意按键回到实时", n = s.scroll),
             Style::default().fg(Color::Magenta).bg(Color::Black),
@@ -974,6 +985,22 @@ fn draw_session(f: &mut Frame, app: &mut App) {
                 }
             }
             buf[(x, y)].set_symbol(symbol).set_style(style);
+        }
+    }
+    // 搜索命中行整行压暗加粗：跳到哪一行必须一眼看得见
+    if let Some(search) = &app.search {
+        if search.view_row < rows {
+            buf.set_style(
+                Rect {
+                    x: area.x,
+                    y: area.y + search.view_row,
+                    width: area.width,
+                    height: 1,
+                },
+                Style::default()
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            );
         }
     }
     // 回看历史时隐藏光标：光标属于实时视图，不应出现在 scrollback 画面上。
