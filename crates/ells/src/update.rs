@@ -502,14 +502,29 @@ pub fn cleanup_leftovers() {
     }
 }
 
-/// 用替换后的新二进制重启自己。调用方必须已经还原终端，并且紧接着退出进程。
+/// 用替换后的新二进制重启自己。**必须由主线程调用**，且终端已还原。
+///
+/// unix 走 exec：原地替换当前进程映像，pid、进程组、控制终端全部保留。
+/// 之前用 spawn 拉新进程，旧进程一退出，新进程就成了"死进程组"里的孤儿——
+/// tty 不再是它的前台，macOS 上任何 termios 初始化直接 EIO，新版本还没开局就报
+/// "Input/output error (os error 5)"。Windows 控制台没有这套进程组语义，维持 spawn。
 pub fn restart() -> Result<(), String> {
     let exe = exe_path()?;
-    std::process::Command::new(&exe)
-        .args(std::env::args_os().skip(1))
-        .spawn()
-        .map_err(|e| format!("新版本启动失败：{e}（请手动运行 {}）", exe.display()))?;
-    Ok(())
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.args(std::env::args_os().skip(1));
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // exec 成功则永不返回；返回即失败
+        let err = cmd.exec();
+        Err(format!("新版本启动失败：{err}（请手动运行 {}）", exe.display()))
+    }
+    #[cfg(not(unix))]
+    {
+        cmd.spawn()
+            .map(|_| ())
+            .map_err(|e| format!("新版本启动失败：{e}（请手动运行 {}）", exe.display()))
+    }
 }
 
 #[cfg(test)]

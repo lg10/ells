@@ -76,12 +76,18 @@ fn main() -> Result<()> {
     // 主线程只服务系统文件对话框：macOS 的 AppKit 面板不允许在其他线程上创建
     dialog::run_service(rx);
 
-    match app_thread.join() {
-        Ok(result) => result,
-        Err(_) => Err(anyhow::anyhow!(
+    let restart = match app_thread.join() {
+        Ok(result) => result?,
+        Err(_) => anyhow::bail!(
             "ells 主循环异常退出，屏幕已恢复；详情见上方错误信息"
-        )),
+        ),
+    };
+    if restart {
+        // 必须在主线程执行：unix 的 exec 原地替换进程映像，pid/进程组/控制终端
+        // 全部保留，新版本才能直接接管屏幕；Windows 是 spawn 后正常退出
+        update::restart().map_err(anyhow::Error::msg)?;
     }
+    Ok(())
 }
 
 /// `ells --check-update`：只查版本就退出。界面里能不能提示更新，取决于这条网络路径

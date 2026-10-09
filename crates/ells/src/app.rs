@@ -403,7 +403,9 @@ pub struct App {
     event_rx: mpsc::UnboundedReceiver<AppEvent>,
 }
 
-pub async fn run(alias: Option<String>, dev: bool, yes: bool) -> Result<()> {
+/// 返回 `Ok(true)` 表示更新已替换到位、调用方（主线程）负责拉起新版本：
+/// unix 上 restart 走 exec，必须发生在主线程，工作线程里只能做标记。
+pub async fn run(alias: Option<String>, dev: bool, yes: bool) -> Result<bool> {
     enable_raw_mode()?;
     let mut out = stdout();
     // 括号粘贴：粘贴整段命令时终端会包上 ESC[200~/201~，ells 据此把它当一次
@@ -435,11 +437,9 @@ pub async fn run(alias: Option<String>, dev: bool, yes: bool) -> Result<()> {
     terminal.show_cursor()?;
     result?;
     if restart {
-        // 终端已还原、旧进程要让位：拉起新版本后马上退出，中间不再往屏幕写东西
-        update::restart().map_err(anyhow::Error::msg)?;
-        std::process::exit(0);
+        return Ok(true);
     }
-    Ok(())
+    Ok(false)
 }
 
 impl App {
