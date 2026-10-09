@@ -9,6 +9,15 @@ English summary lives in each GitHub Release note; this file is the full history
 发版流程：把下面的 `[未发布 / Unreleased]` 小节改名为 `[x.y.z] - 日期`，再打 tag。
 CI 的 release 作业会按 tag 从本文件截取对应小节，作为 GitHub Release 说明。
 
+## [0.1.9] - 2026-10-09
+
+### 修复
+- **macOS：更新后选"立刻重启"不再报 `Input/output error (os error 5)`**：旧实现从工作线程
+  `spawn` 新进程再 `exit(0)`，新版本继承的是旧进程组的进程组——旧进程一退出它就不再是
+  终端的前台进程组，macOS 上任何 termios 初始化直接返回 EIO，还没开局就死。
+  现在 unix 上改用 `exec` 原地替换进程映像（pid、进程组、控制终端全部保留），
+  并把拉起动作挪回主线程执行；Windows 无此语义，维持 spawn。
+
 ## [0.1.8] - 2026-10-09
 
 ### 修复

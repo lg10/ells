@@ -60,7 +60,7 @@ body:
     attributes:
       label: ells 版本
       description: 运行 `ells --version` 把输出贴过来
-      placeholder: ells 0.1.8
+      placeholder: ells 0.1.9
     validations:
       required: true
   - type: textarea
