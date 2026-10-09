@@ -9,6 +9,14 @@ English summary lives in each GitHub Release note; this file is the full history
 发版流程：把下面的 `[未发布 / Unreleased]` 小节改名为 `[x.y.z] - 日期`，再打 tag。
 CI 的 release 作业会按 tag 从本文件截取对应小节，作为 GitHub Release 说明。
 
+## [未发布 / Unreleased]
+
+### 修复
+- **Windows 安装脚本不再把 ARM64 / 老 .NET 误判成"不支持的架构"**：`install.ps1` 原先只认
+  `OSArchitecture = X64`，Windows on ARM 装不上（其实 x86_64 产物由系统内置转译运行），
+  老 .NET Framework 下取值为空也会误报。现在取不到就回落 `PROCESSOR_ARCHITECTURE`，
+  x86_64 直装、ARM64 装 x86_64 并提示走转译，仅 32 位或未知架构才报错。
+
 ## [0.1.9] - 2026-10-09
 
 ### 修复

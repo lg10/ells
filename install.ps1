@@ -13,8 +13,24 @@ function Info($msg) { Write-Host "[ells] $msg" -ForegroundColor Cyan }
 # NOTE: never exit 1 here -- under `irm | iex` that would close the user's shell session.
 function Fail($msg) { Write-Host "[ells] install failed: $msg" -ForegroundColor Red; throw "ells install failed: $msg" }
 
-$arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
-if ($arch -ne 'X64') { Fail "unsupported Windows architecture: $arch (only x86_64 is published for now)" }
+# Architecture detection: RuntimeInformation can be missing/empty on old .NET
+# Framework (PowerShell 5.1 without 4.7.1+), so fall back to
+# PROCESSOR_ARCHITECTURE. ARM64 Windows has no native asset yet -- the x86_64
+# build runs through Windows' built-in emulation, so we accept both.
+$archRaw = $null
+try { $archRaw = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture } catch { }
+if (-not "$archRaw") { $archRaw = $env:PROCESSOR_ARCHITECTURE }
+$arch = switch -Regex ("$archRaw") {
+  '^(x64|amd64)$'   { 'x86_64' }
+  '^(arm64)$'       { 'arm64' }
+  default           { "$archRaw" }
+}
+if ($arch -eq 'arm64') {
+  Info 'Windows ARM64 detected: installing the x86_64 build (runs via built-in emulation)'
+} elseif ($arch -ne 'x86_64') {
+  Fail "unsupported Windows architecture: '$archRaw' (only x86_64 and ARM64-via-emulation are published for now)"
+}
+Info "target architecture: $arch"
 
 $version = $env:ELLS_VERSION
 if (-not $version) {
