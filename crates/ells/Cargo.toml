@@ -30,5 +30,11 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 ureq = { version = "3.4.2", default-features = false, features = ["rustls"] }
 zeroize.workspace = true
 
+# 仅 macOS：弹对话框前把 AppKit 正式拉起（见 dialog.rs 注释）。版本与 rfd 0.15.4
+# 内部所用一致，特性取两者的交集就够用。
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSResponder", "NSRunningApplication"] }
+
 [build-dependencies]
 chrono = "0.4"

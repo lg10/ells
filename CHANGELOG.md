@@ -9,6 +9,20 @@ English summary lives in each GitHub Release note; this file is the full history
 发版流程：把下面的 `[未发布 / Unreleased]` 小节改名为 `[x.y.z] - 日期`，再打 tag。
 CI 的 release 作业会按 tag 从本文件截取对应小节，作为 GitHub Release 说明。
 
+## [未发布 / Unreleased]
+
+### 修复
+- **macOS：上传 / 选密钥不再卡住访达**：终端里启动的纯命令行进程从未 `finishLaunching`，
+  rfd 直接 `runModal` 会把系统共享的 openAndSavePanelService 一起锁死——访达跟着卡住，
+  直到退出 ells 才恢复。现在对话框弹出前主线程先把 AppKit 以 Regular 正式拉起并激活，
+  收尾后调回 Prohibited，Dock 与焦点都还给终端。
+- **远端敲 `exit` 退出后不再弹"连接已断开 / 重连"**：重连提示改为看通道关闭方式——
+  收到过 exit-status（远端 shell 正常退出）就只回列表提示"会话已结束"；只有没收到它的
+  异常关闭（网络中断、空闲超时被掐）才提供一键重连。Ctrl-] 主动断开维持原样。
+- **传输一条文件后进度不再卡 100%、计数不再停在 1/2**：上传 / 下载收尾时"完成"事件先发、
+  进度转发任务后清空，尾随的进度事件匹配不到已完成的条目，会被登记成一条永不完结的
+  幽灵传输——顶栏聚合进度就此卡在 100%，计数永远差一个。现在先把转发任务收干再发完成。
+
 ## [0.1.7] - 2026-10-06
 
 ### 变更

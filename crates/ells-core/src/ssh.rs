@@ -10,7 +10,9 @@ use crate::hostkey::HostKeyPolicy;
 #[derive(Debug)]
 pub enum RemoteEvent {
     Data(Vec<u8>),
-    Closed(Result<()>),
+    /// 通道结束。`graceful = true` 表示远端 shell 正常退出（exit-status 已到，
+    /// 通常是用户敲了 exit/logout）；网络中断、服务器被杀等只会看到通道凭空关闭。
+    Closed { graceful: bool },
 }
 
 /// 空闲保活间隔（秒），全局可调（ells 设置弹窗），默认 30s。
@@ -137,6 +139,7 @@ impl RemoteSession {
 
         tokio::spawn(async move {
             let mut open = true;
+            let mut shell_exited = false;
             while open {
                 tokio::select! {
                     msg = channel.wait() => {
@@ -152,6 +155,8 @@ impl RemoteSession {
                                 }
                             }
                             Some(russh::ChannelMsg::ExitStatus { exit_status }) => {
+                                // 只有远端 shell 自己退出才会发 exit-status——主动 exit 与掉线的分界
+                                shell_exited = true;
                                 tracing::debug!("remote shell exited with status {exit_status}");
                             }
                             Some(russh::ChannelMsg::Eof)
@@ -180,7 +185,7 @@ impl RemoteSession {
                 }
             }
             let _ = channel.close().await;
-            let _ = output_tx.send(RemoteEvent::Closed(Ok(())));
+            let _ = output_tx.send(RemoteEvent::Closed { graceful: shell_exited });
         });
 
         Ok(Self {

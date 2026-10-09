@@ -24,7 +24,8 @@ pub enum AppEvent {
     /// 以下带 `slot` 的事件属于某个标签页（多会话）：标签可能已被关掉，
     /// 收到找不到对应 id 的事件就直接丢弃，绝不能落到"当前标签"上。
     RemoteData { slot: u32, bytes: Vec<u8> },
-    RemoteClosed { slot: u32 },
+    /// `graceful`：远端 shell 正常退出（用户敲了 exit），区别于异常掉线
+    RemoteClosed { slot: u32, graceful: bool },
     /// 主机密钥待确认：由 UI 弹窗回答，连接任务在等待这个回答。
     HostKey(HostKeyPrompt),
     /// 后台连接（含认证与主机密钥确认）结束。
@@ -175,12 +176,7 @@ pub fn spawn_remote_pump(
         while let Some(ev) = rx.recv().await {
             let app_ev = match ev {
                 RemoteEvent::Data(bytes) => AppEvent::RemoteData { slot, bytes },
-                RemoteEvent::Closed(res) => {
-                    if let Err(err) = res {
-                        tracing::warn!(%err, "remote session error");
-                    }
-                    AppEvent::RemoteClosed { slot }
-                }
+                RemoteEvent::Closed { graceful } => AppEvent::RemoteClosed { slot, graceful },
             };
             if tx.send(app_ev).is_err() {
                 return;

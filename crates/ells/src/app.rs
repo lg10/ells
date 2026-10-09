@@ -612,7 +612,7 @@ impl App {
                         self.clear_zmodem_soon();
                     }
                 }
-                AppEvent::RemoteClosed { .. } => {
+                AppEvent::RemoteClosed { graceful, .. } => {
                     let label = if let Some(mut s) = self.slots[self.work].session.take() {
                         s.close();
                         Some(s.label.clone())
@@ -643,8 +643,10 @@ impl App {
                         self.dialog_open = false;
                     }
                     if let (true, Some(host)) = (self.work == self.active, reconnect) {
+                        // 远端 shell 正常退出（exit/logout）是主动行为，不弹重连；
+                        // 只有没收到 exit-status 的异常关闭才提供一键重连。
                         // 已有弹窗时不再叠加：一次只弹一个，且会孤儿掉前一个的应答通道
-                        if self.choice.is_none() {
+                        if !graceful && self.choice.is_none() {
                             self.offer_reconnect(host);
                         }
                     }
@@ -1192,7 +1194,7 @@ impl App {
     fn event_slot(&self, ev: &AppEvent) -> Option<usize> {
         let id = match ev {
             AppEvent::RemoteData { slot, .. }
-            | AppEvent::RemoteClosed { slot }
+            | AppEvent::RemoteClosed { slot, .. }
             | AppEvent::Connected { slot, .. }
             | AppEvent::Reconnect { slot, .. }
             | AppEvent::Conflict { slot, .. }
@@ -2316,8 +2318,10 @@ impl App {
                 }
             });
             let res = run_upload(sftp, local, dest, name, ptx, &tx, slot, &cancel).await;
-            let _ = tx.send(AppEvent::SftpDone { slot, res });
+            // 先收干进度转发、再发 Done：顺序反了的话，尾随的进度事件会因为
+            // 条目已 done 匹配不上，被登记成一条永不完结的"?"传输（100% 卡住、1/2）
             let _ = pump.await;
+            let _ = tx.send(AppEvent::SftpDone { slot, res });
         });
     }
 
@@ -2370,8 +2374,9 @@ impl App {
             });
             let res = run_download(sftp, entry, dest_dir, name, confirm_overwrite, ptx, &tx, slot, &cancel)
                 .await;
-            let _ = tx.send(AppEvent::SftpDone { slot, res });
+            // 同 start_upload：尾随进度必须先于 Done 入队，否则会在传输列表里留下永不完结的残项
             let _ = pump.await;
+            let _ = tx.send(AppEvent::SftpDone { slot, res });
         });
     }
 
@@ -3163,7 +3168,8 @@ impl App {
         });
     }
 
-    /// 连接意外结束：一键重连同一主机（用户按 Ctrl-] 主动断开不会走到这里）。
+    /// 连接意外结束：一键重连同一主机（用户按 Ctrl-] 主动断开、或在远端敲
+    /// exit/logout 正常退出都不会走到这里）。
     fn offer_reconnect(&mut self, host: Host) {
         if let Some(idx) = self.vault.hosts.iter().position(|h| h.alias == host.alias) {
             self.list.selected = idx;
