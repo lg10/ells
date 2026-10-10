@@ -33,6 +33,11 @@ pub struct Palette {
     pub bg: Color,
     /// 顶部条、标签条、弹窗标题带的底色
     pub band: Color,
+    /// 进度条空档那一截自己的底色。
+    /// 条不能靠"色带透出来"画：`Dark` 的色带是浅灰，`░` 网点透出来的还是浅灰，
+    /// 于是整根条和背景一个亮度，看起来像被背景吃掉了。不画底色的主题一律 `Reset`
+    /// （跟随终端时终端自己的底色就是轨道，画反而脏）。
+    pub track: Color,
     /// 压在条带上的刻线（标签之间的 `│`）：必须和 band 不同档，否则跟随终端时线条会消失
     pub rule: Color,
     /// 正文
@@ -93,14 +98,11 @@ impl Theme {
         }
     }
 
-    /// 没配过 theme 时用什么：mac 的终端主题五花八门，画死底色最容易翻车，所以默认交给终端；
-    /// Windows/Linux 的主流终端默认就是深底，保持现在这套观感。
+    /// 没配过 theme 时一律跟随终端：ells 只给前景色，底色交给终端自己的主题。
+    /// 画死底色的那套（`Dark`）留给显式选它的人 —— 它把色带刷成浅灰之后，压在上面的
+    /// 进度条要靠自己的轨道色才看得见（见 `Palette::track`）。
     pub fn platform_default() -> Theme {
-        if cfg!(any(target_os = "macos",target_os = "ios")) {
-            Theme::Terminal
-        } else {
-            Theme::Dark
-        }
+        Theme::Terminal
     }
 
     /// 循环取色：`backwards` 为真时往前一套（设置面板的 ← / Enter）。
@@ -116,6 +118,7 @@ impl Theme {
             Theme::Dark => Palette {
                 bg: Color::Black,
                 band: Color::DarkGray,
+                track: Color::Black,
                 rule: Color::Black,
                 text: Color::White,
                 dim: Color::DarkGray,
@@ -132,6 +135,7 @@ impl Theme {
             Theme::Terminal => Palette {
                 bg: Color::Reset,
                 band: Color::Reset,
+                track: Color::Reset,
                 // 底色跟着终端，刻线就得留在"看得见的那一档"，黑字在深底终端上会直接消失
                 rule: Color::DarkGray,
                 text: Color::Reset,
@@ -149,6 +153,7 @@ impl Theme {
             Theme::HighContrast => Palette {
                 bg: Color::Reset,
                 band: Color::Reset,
+                track: Color::Reset,
                 rule: Color::Reset,
                 text: Color::Reset,
                 dim: Color::Reset,
@@ -166,6 +171,7 @@ impl Theme {
             Theme::Light => Palette {
                 bg: Color::Reset,
                 band: Color::Reset,
+                track: Color::Reset,
                 rule: Color::DarkGray,
                 text: Color::Black,
                 dim: Color::DarkGray,
@@ -223,6 +229,11 @@ pub fn bg() -> Color {
 
 pub fn band() -> Color {
     pal().band
+}
+
+/// 进度条空档的底色。只有画死底色的主题才给它一个真颜色。
+pub fn track() -> Color {
+    pal().track
 }
 
 pub fn rule() -> Color {
@@ -298,6 +309,26 @@ mod tests {
         assert_eq!(p.text, Color::Reset);
         // 但强调底色仍然要有，否则当前标签和别的标签分不出来
         assert_ne!(p.accent_bg, Color::Reset);
+    }
+
+    #[test]
+    fn the_progress_track_is_visible_on_the_painted_band() {
+        // 深色主题把色带刷成浅灰，条的空档要是还靠它透出来，整根条就和背景一个亮度
+        let d = Theme::Dark.palette();
+        assert_eq!(d.band, Color::DarkGray);
+        assert_ne!(d.track, d.band, "轨道和色带同色 = Windows 上那条进度条被背景吃掉");
+        // 不画底色的三套交给终端，多画一层反而脏
+        for theme in [Theme::Terminal, Theme::HighContrast, Theme::Light] {
+            assert_eq!(theme.palette().track, Color::Reset, "{}", theme.ini_value());
+        }
+    }
+
+    #[test]
+    fn every_platform_defaults_to_the_terminal_theme() {
+        // 分平台默认值的代价是"同一份代码两台机器长得不一样"：mac 上清楚的条，
+        // Windows 上落在浅灰色带里就看不见了。现在一律跟随终端。
+        assert_eq!(Theme::platform_default(), Theme::Terminal);
+        assert_eq!(Theme::platform_default().palette().band, Color::Reset);
     }
 
     #[test]

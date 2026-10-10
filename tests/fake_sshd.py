@@ -3,8 +3,10 @@
 
 Listens on 127.0.0.1:2222 (override: ELLS_TEST_PORT). Any password equal to
 "test123" authenticates. Shell echoes lines; "echo COLOR" prints an ANSI-colored
-line; "exit" closes the channel. A second (subsystem) channel can request
-"sftp", served from ./sftp_root/ (client "/" == sftp_root).
+line; "exit" ends the channel the way OpenSSH does (exit-status then close) and
+"logout" ends it the way a bastion/gateway does (close only, no exit-status),
+while "__drop__" kills the transport without any goodbye. A second (subsystem)
+channel can request "sftp", served from ./sftp_root/ (client "/" == sftp_root).
 """
 import errno
 import os
@@ -400,7 +402,24 @@ def run_echo_shell(channel):
                     text = line.decode(errors="replace")
                     channel.sendall(b"\r\n")
                     if text == "exit":
-                        raise StopIteration
+                        # 真 OpenSSH 的形状：exit-status 先到，再关通道
+                        channel.sendall(b"logout\r\n")
+                        channel.send_exit_status(0)
+                        channel.close()
+                        return
+                    if text == "logout":
+                        # 跳板机/网关的形状：终端上打了 logout，然后直接把通道关掉，
+                        # 一个 exit-status 都不发。ells 以前只认 exit-status，
+                        # 于是这种机器上敲 exit 也会被当成掉线、追问要不要重连。
+                        channel.sendall(b"logout\r\n")
+                        channel.close()
+                        return
+                    if text == "__drop__":
+                        # 唯一该重连的那一档：链路凭空断掉，不发 CHANNEL_CLOSE
+                        transport = channel.get_transport()
+                        if transport is not None:
+                            transport.close()
+                        return
                     parts = text.split()
                     if parts and parts[0] in ("sz", "rz"):
                         simulate_zmodem(channel, parts)

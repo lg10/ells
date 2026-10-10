@@ -1480,8 +1480,9 @@ impl App {
                         self.dialog_open = false;
                     }
                     if let (true, Some(host)) = (self.work == self.active, reconnect) {
-                        // 远端 shell 正常退出（exit/logout）是主动行为，不弹重连；
-                        // 只有没收到 exit-status 的异常关闭才提供一键重连。
+                        // graceful 由 ells-core 判定：远端自己退了（exit-status）、对端把通道
+                        // 正常关掉（跳板机常常只关通道、不发退出状态）、或本地 Ctrl-] 断的。
+                        // 只有链路凭空没了才提供重连。
                         // 已有弹窗时不再叠加：一次只弹一个，且会孤儿掉前一个的应答通道
                         if graceful || self.choice.is_some() {
                             self.slots[self.work].reconnect_attempt = 0;

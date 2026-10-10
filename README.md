@@ -39,7 +39,7 @@ ells is an all-in-one terminal SSH client written in pure Rust. It embeds a real
 - 📥 **Two-way `~/.ssh/config`** — `i` pulls your existing OpenSSH hosts in (only aliases ells doesn't have yet; hosts you already filled in are never overwritten). `x` goes the other way: it writes an ssh_config snippet to `~/.ells/ssh_config.export` containing alias / host / port / user / `IdentityFile` / `ProxyJump` / forwards — **never a password** — and it does not touch your `~/.ssh/config`.
 - 🧭 **Groups · tags · favorites · fuzzy filter** — the list draws one section per group (`▾ prod (3)`), sorted by group → favorites inside the group → recently used → alias; `o` cycles four sort modes (default · recent · alias · group) and remembers the choice in `settings.ini`; `Space` folds the section under the cursor, `z` folds or unfolds everything; `/` then just type, matching alias, host, user, group, tag and note — the header shows `hits n/m` and the matched characters light up inside the alias; `f` stars a host, and every row ends with a right-aligned "last used" stamp (`now / 5m / 3h / yesterday / 5d / never`).
 - 🔀 **Local port forwarding** — forward rules live in the host form (`-L 8080:127.0.0.1:5432`, `-D 1080`, or `-L db:5432` when you don't care which local port); one SSH connection carries every rule for that host. `t` opens the tunnel manager with live per-host state: `space`/`s` starts or stops, `Enter` opens a **table editor** (kind · bind · local port · destination host · destination port) — `p` on the host list opens the same table. Leave the local port **blank and the OS picks one** (same as `ssh -L 0:db:5432`), so two hosts reaching for 8080 no longer fight; `m` shows the **port map** with the ports actually bound (auto ones marked). When a fixed port really is taken, the failure names who holds it. The local listener is bound before dialing, so a dropped session doesn't take the tunnel down — it backoffs and reconnects on its own.
-- 🔁 **Auto-reconnect** — after a drop you didn't cause, ells retries with exponential backoff (from 1s, doubling, capped at 60s, ±20% jitter). The status line says how long until the next try and which attempt it is; `Ctrl-]` cancels. A refused host key is never auto-retried — it stops and asks. The attempt limit is a settings row (`0` turns it off).
+- 🔁 **Auto-reconnect** — after a drop you didn't cause, ells retries with exponential backoff (from 1s, doubling, capped at 60s, ±20% jitter). The status line says how long until the next try and which attempt it is; `Ctrl-]` cancels. A refused host key is never auto-retried — it stops and asks. What counts as "you caused it": typing `exit`/`logout` on the remote, the peer shutting the channel down the orderly way (bastions and gateways often close the channel without ever sending an exit status), or `Ctrl-]` — all of those end the session quietly. Only a dead link (TCP death, keepalive timeout) reconnects. The attempt limit is a settings row (`0` turns it off).
 - 🖧 **Headless CLI** — work without the UI: `ells list`, `ells exec <alias> -- <cmd>`, `ells sftp ls/get/put/rm/chmod`, `ells tunnel <alias>` (forwards only, stays resident; `--all` starts every host that has rules), `ells export`, `ells completions bash`. Exit codes are a contract: 0 OK · 1 failure · 2 usage or safety gate · 124 timeout. One red line: no password, private key material or master password is ever printed. Feed the master password through `ELLS_MASTER` or a stdin pipe.
 - 🪪 **Known-hosts panel** — `h` lists what ells remembers: entries in `~/.ells/known_hosts` can be deleted (next connect asks for the fingerprint again); `~/.ssh/known_hosts` is displayed read-only and never modified.
 - 📜 **Audit log** — `l` reads `~/.ells/audit.log`: connects, disconnects, key trusted/changed, transfers, tunnels, vault saves, imports/exports, master-password changes (Beijing time, append-only, rotated past 1 MiB, never containing a password or a private key).
@@ -96,14 +96,14 @@ Reopen your terminal afterwards, and both `ells` and the short command `s` are r
 macOS / Linux:
 
 ```bash
-ELLS_VERSION=v0.2.0 curl -fsSL https://raw.githubusercontent.com/lg10/ells/main/install.sh | sh
+ELLS_VERSION=v0.2.1 curl -fsSL https://raw.githubusercontent.com/lg10/ells/main/install.sh | sh
 ELLS_INSTALL_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/lg10/ells/main/install.sh | sh
 ```
 
 Windows PowerShell:
 
 ```powershell
-$env:ELLS_VERSION="v0.2.0"; irm https://raw.githubusercontent.com/lg10/ells/main/install.ps1 | iex
+$env:ELLS_VERSION="v0.2.1"; irm https://raw.githubusercontent.com/lg10/ells/main/install.ps1 | iex
 $env:ELLS_INSTALL_DIR="$env:USERPROFILE\bin"; irm https://raw.githubusercontent.com/lg10/ells/main/install.ps1 | iex
 ```
 
@@ -225,9 +225,11 @@ with other bytes or with Windows Terminal's own shortcuts, and the panel footer 
 platform you are running on.
 
 Colors are a setting too: the host list `s` → settings → 「界面主题」 cycles four palettes with `Enter` or `←→` —
-**dark** (painted black/dark-gray backgrounds, the look on Windows), **跟随终端 / follow-terminal** (ells paints
-no background at all and reuses your terminal's own theme — recommended for macOS Terminal, iTerm2 and WezTerm,
-and the default on macOS), **高对比 / high contrast** (no small gray text; hierarchy comes from bold and
+**跟随终端 / follow-terminal** (ells paints
+no background at all and reuses your terminal's own theme — fits macOS Terminal, iTerm2, WezTerm and Windows
+Terminal alike, and **the default on every platform**), **dark** (painted black/dark-gray backgrounds, a safe
+fallback when you don't know what the terminal's palette is), **高对比 / high contrast** (no small gray text;
+hierarchy comes from bold and
 reverse) and **浅色底 / light** (dark text for light-background terminals). A switch previews immediately and is
 only written to `theme=` in `~/.ells/settings.ini` when you hit 【保 存】; 【取 消】 reverts the preview.
 

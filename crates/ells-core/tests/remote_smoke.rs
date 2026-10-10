@@ -251,3 +251,51 @@ async fn metrics_gather_reads_proc_over_sftp() {
     session.write_input(b"exit\r".to_vec());
     session.close();
 }
+
+/// 会话收尾的三档形状，只有真服务器说得清：
+/// `exit`（OpenSSH：exit-status 后关通道）和 `logout`（跳板机：只关通道、没有 exit-status）
+/// 都不该被当成掉线；`__drop__`（transport 直接没了）才是唯一该走重连的那一档。
+/// 早先的实现只认 exit-status，于是跳板机上敲 exit 也会被追问"要不要重连"。
+#[tokio::test]
+#[ignore = "requires tests/fake_sshd.py running on 127.0.0.1:2222"]
+async fn a_goodbye_is_not_a_drop() {
+    assert!(ended_by(b"exit\r").await, "exit-status 那一份");
+    assert!(
+        ended_by(b"logout\r").await,
+        "跳板机只关通道，也算正常收尾，不该弹重连"
+    );
+    assert!(
+        !ended_by(b"__drop__\r").await,
+        "transport 被拆了才是掉线，这一档要留给重连"
+    );
+}
+
+/// 连上去、等 banner、敲一行，返回这路会话收尾时报告的是不是"正常结束"。
+async fn ended_by(line: &[u8]) -> bool {
+    let mut session =
+        RemoteSession::connect(&test_host(), &Vault::default(), 80, 24, &HostKeyPolicy::trust_all())
+            .await
+            .expect("connect to fake sshd");
+    let mut rx = session.take_output().expect("output rx");
+
+    let mut banner = String::new();
+    while let Some(bytes) = next_data(&mut rx).await {
+        banner.push_str(&String::from_utf8_lossy(&bytes));
+        if banner.contains("ready") {
+            break;
+        }
+    }
+    assert!(banner.contains("ells-test-sh ready"), "banner: {banner:?}");
+
+    session.write_input(line.to_vec());
+    loop {
+        let ev = tokio::time::timeout(Duration::from_secs(8), rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("{line:?}：会话收尾迟迟不来"));
+        match ev {
+            Some(RemoteEvent::Closed { graceful }) => return graceful,
+            Some(_) => {}
+            None => panic!("{line:?}：输出通道先没了"),
+        }
+    }
+}

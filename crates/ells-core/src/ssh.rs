@@ -6,12 +6,49 @@ use tokio::sync::mpsc;
 use crate::host::{Auth, Host};
 use crate::hostkey::HostKeyPolicy;
 
+/// 通道是怎么停下来的。只有后两种才算掉线。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum Stop {
+    /// 还在跑（不该出现在收尾里，留着让 default 安全）
+    #[default]
+    Running,
+    /// 对端发来 CHANNEL_EOF / CHANNEL_CLOSE：它在道别
+    PeerClosed,
+    /// 本地主动断开：Ctrl-]、关标签、退出程序
+    Local,
+    /// 通道凭空消失：TCP 死亡、keepalive 超时、服务端进程被杀
+    Vanished,
+    /// 往已断的通道里写按键
+    Broken,
+}
+
+/// 一条会话通道的收尾依据。
+#[derive(Debug, Clone, Copy, Default)]
+struct SessionEnd {
+    /// 收到过远端的 exit-status：shell 自己退出的硬证据
+    exit_status: bool,
+    stop: Stop,
+}
+
+impl SessionEnd {
+    /// 算不算"正常结束"（不弹重连、不自动重连）。
+    ///
+    /// 为什么光看 exit-status 不够：跳板机/网关这类服务端在 `logout` 之后直接关通道，
+    /// 一个 exit-status 都不发，于是用户敲了 exit 也被判成掉线、被追问要不要重连。
+    /// 反过来也不能把 `None` 算正常：russh 收到对端的 CHANNEL_CLOSE 时会先把消息转给
+    /// 等待中的通道再摘除它，所以"对端道别"和"链路凭空断了"分得开。
+    fn is_graceful(self) -> bool {
+        self.exit_status || matches!(self.stop, Stop::PeerClosed | Stop::Local)
+    }
+}
+
 /// Events streamed back from the remote SSH channel to the UI.
 #[derive(Debug)]
 pub enum RemoteEvent {
     Data(Vec<u8>),
-    /// 通道结束。`graceful = true` 表示远端 shell 正常退出（exit-status 已到，
-    /// 通常是用户敲了 exit/logout）；网络中断、服务器被杀等只会看到通道凭空关闭。
+    /// 通道结束。`graceful = true` 表示这一场是**谁主动收尾**能解释得通的：远端 shell 退了、
+    /// 对端正常关了通道、或本地按 Ctrl-] 断的；只有通道凭空消失/写不进去才算掉线，
+    /// 那种情况才该走重连。
     Closed { graceful: bool },
 }
 
@@ -147,31 +184,37 @@ impl RemoteSession {
         let mut channel = channel;
 
         tokio::spawn(async move {
-            let mut open = true;
-            let mut shell_exited = false;
-            while open {
+            let mut end = SessionEnd::default();
+            'channel: loop {
                 tokio::select! {
                     msg = channel.wait() => {
                         match msg {
                             Some(russh::ChannelMsg::Data { data }) => {
                                 if output_tx.send(RemoteEvent::Data(data.to_vec())).is_err() {
-                                    open = false;
+                                    // UI 侧已经不听这路了，按本地收尾处理
+                                    end.stop = Stop::Local;
+                                    break 'channel;
                                 }
                             }
                             Some(russh::ChannelMsg::ExtendedData { data, .. }) => {
                                 if output_tx.send(RemoteEvent::Data(data.to_vec())).is_err() {
-                                    open = false;
+                                    end.stop = Stop::Local;
+                                    break 'channel;
                                 }
                             }
                             Some(russh::ChannelMsg::ExitStatus { exit_status }) => {
-                                // 只有远端 shell 自己退出才会发 exit-status——主动 exit 与掉线的分界
-                                shell_exited = true;
+                                // 记下来但**不**立刻收场：`logout` 之类的收尾输出可能还在后面
+                                end.exit_status = true;
                                 tracing::debug!("remote shell exited with status {exit_status}");
                             }
                             Some(russh::ChannelMsg::Eof)
-                            | Some(russh::ChannelMsg::Close)
-                            | None => {
-                                open = false;
+                            | Some(russh::ChannelMsg::Close) => {
+                                end.stop = Stop::PeerClosed;
+                                break 'channel;
+                            }
+                            None => {
+                                end.stop = Stop::Vanished;
+                                break 'channel;
                             }
                             Some(_) => {}
                         }
@@ -180,21 +223,25 @@ impl RemoteSession {
                         match input {
                             SessionInput::Bytes(bytes) => {
                                 if writer.write_all(&bytes).await.is_err() {
-                                    open = false;
+                                    end.stop = Stop::Broken;
+                                    break 'channel;
                                 }
                             }
                             SessionInput::Resize { cols, rows } => {
                                 let _ = channel.window_change(cols as u32, rows as u32, 0, 0).await;
                             }
                             SessionInput::Close => {
-                                open = false;
+                                end.stop = Stop::Local;
+                                break 'channel;
                             }
                         }
                     }
                 }
             }
             let _ = channel.close().await;
-            let _ = output_tx.send(RemoteEvent::Closed { graceful: shell_exited });
+            let graceful = end.is_graceful();
+            tracing::debug!("会话通道收尾：{end:?}，graceful={graceful}");
+            let _ = output_tx.send(RemoteEvent::Closed { graceful });
         });
 
         Ok(Self {
@@ -919,5 +966,40 @@ mod legacy_key_tests {
         assert!(key.algorithm().is_rsa());
         // Wrong passphrase must fail cleanly, not panic.
         assert!(decrypt_des3_pem(pem, "wrong").is_err());
+    }
+}
+
+#[cfg(test)]
+mod session_end_tests {
+    use super::*;
+
+    fn end(exit_status: bool, stop: Stop) -> SessionEnd {
+        SessionEnd { exit_status, stop }
+    }
+
+    /// exit / logout 最硬的一条证据是 exit-status，收到就该安静收尾
+    #[test]
+    fn an_exit_status_is_never_a_drop() {
+        for stop in [Stop::PeerClosed, Stop::Vanished, Stop::Broken, Stop::Running] {
+            assert!(end(true, stop).is_graceful(), "{stop:?}");
+        }
+    }
+
+    /// 跳板机/网关在 logout 之后直接关通道，一个 exit-status 都不发：
+    /// 这仍然是远端主动收尾，追问"要不要重连"就是把正常退出当成了事故。
+    #[test]
+    fn a_peer_closed_channel_is_a_goodbye_not_a_drop() {
+        assert!(end(false, Stop::PeerClosed).is_graceful());
+        // Ctrl-] 与关标签也是主动行为
+        assert!(end(false, Stop::Local).is_graceful());
+    }
+
+    /// 只有链路自己没了才该走重连：TCP 死亡、keepalive 超时、服务端进程被杀
+    #[test]
+    fn only_a_dead_link_reconnects() {
+        assert!(!end(false, Stop::Vanished).is_graceful());
+        assert!(!end(false, Stop::Broken).is_graceful());
+        // 一条收尾消息都没收到
+        assert!(!end(false, Stop::Running).is_graceful());
     }
 }

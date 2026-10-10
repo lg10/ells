@@ -39,7 +39,7 @@ ells 是一个纯 Rust 编写的一体化终端 SSH 客户端。它在高速 TUI
 - 📥 **`~/.ssh/config` 双向搬砖** — 主机列表按 `i` 一键把已有的 OpenSSH 主机搬进来（只新增库里没有的别名，绝不覆盖你填好的密码）；按 `x` 反向导出一段 ssh_config 到 `~/.ells/ssh_config.export`，只写别名 / 主机 / 端口 / 用户 / `IdentityFile` / `ProxyJump` / 转发，**密码一条都不写**，`~/.ssh/config` 本体 ells 从不动笔。
 - 🧭 **分组 · 标签 · 收藏 · 模糊过滤** — 列表画段头（`▾ 生产 (3)`），默认按 分组 → 组内收藏 → 最近使用 → 别名 排序；`o` 循环四档排序（默认 / 最近使用 / 别名 / 分组，选中的写进 `settings.ini`），`Space` 折叠光标所在那一组、`z` 一键收起全部；`/` 之后直接打字，别名、主机、用户、分组、标签、备注都算命中，标题写 `命中 n/m`，别名里命中的字符点亮；`f` 加星置顶，行尾右对齐一列「最近使用」（`刚刚 / 5分 / 3小时 / 昨天 / 5天 / 从未`）。
 - 🔀 **本地端口转发** — 转发规则写在主机表单的「转发」栏（`-L 8080:127.0.0.1:5432`、`-D 1080`、只写目标的 `-L db:5432`），一条 SSH 承载这台机器的全部规则；`t` 打开隧道面板看每台实况，`空格` 启停、`Enter` 进**表格编辑器**一格一格改（类型 / 绑定 / 本地端口 / 目标主机 / 目标端口）。本地端口**留空就交给系统分配**（同 `ssh -L 0:db:5432`），两台主机想占同一个口也不会互挤，实际落在哪个口按 `m` 看「端口映射」总表；写死的端口真撞上时，失败原因会点名是谁占着。本地监听口在拨号前就占好，会话断开不影响隧道，它自己按退避重连。
-- 🔁 **自动重连** — 非人为断开时按指数退避自动重试（1s 起、翻倍、封顶 60s、±20% 抖动），状态行写清"几秒后重连（第 n/m 次）"，`Ctrl-]` 随时取消；主机密钥被拒**绝不**自动重试，而是停下来问人。次数上限在「设置 → 自动重连」里调，`0` 就是关掉。
+- 🔁 **自动重连** — 非人为断开时按指数退避自动重试（1s 起、翻倍、封顶 60s、±20% 抖动），状态行写清"几秒后重连（第 n/m 次）"，`Ctrl-]` 随时取消；主机密钥被拒**绝不**自动重试，而是停下来问人。什么叫"人为"：你在远端敲 `exit`/`logout`、对端把通道正常关掉（跳板机/网关常只关通道、不发退出状态）、或你按 `Ctrl-]` 断开——这些都算正常收尾，不重连也不弹窗；只有链路自己断了（TCP 死亡、keepalive 超时）才走重连。次数上限在「设置 → 自动重连」里调，`0` 就是关掉。
 - 🖧 **无头 CLI** — 不开界面也能干活：`ells list`、`ells exec <别名> -- <命令>`、`ells sftp ls/get/put/rm/chmod`、`ells tunnel <别名>`（只起转发并常驻，`--all` 一次拉起所有配了规则的机器，Ctrl-C 结束）、`ells export`、`ells completions bash`。退出码固定 0/1/2/124（成功 / 失败 / 用法与安全闸门 / 超时），可直接进脚本；**任何密码、私钥内容、主密码都不会被打印**。主密码走 `ELLS_MASTER` 环境变量或 stdin 管道。
 - 🪪 **已知主机密钥管理** — `h` 打开面板：`~/.ells/known_hosts` 里的记录可删（删掉下次连重新问指纹），`~/.ssh/known_hosts` 只显示、永不改动。
 - 📜 **操作记录** — `l` 查看 `~/.ells/audit.log`：连接/断开、密钥被信任或变更、传输、隧道、保险库保存、导入导出、改主密码全部留痕（北京时间、只追加、超 1 MiB 自动转存，记录里不会出现任何密码或私钥）。
@@ -68,14 +68,14 @@ irm https://raw.githubusercontent.com/lg10/ells/main/install.ps1 | iex
 macOS / Linux：
 
 ```bash
-ELLS_VERSION=v0.2.0 curl -fsSL https://raw.githubusercontent.com/lg10/ells/main/install.sh | sh
+ELLS_VERSION=v0.2.1 curl -fsSL https://raw.githubusercontent.com/lg10/ells/main/install.sh | sh
 ELLS_INSTALL_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/lg10/ells/main/install.sh | sh
 ```
 
 Windows PowerShell：
 
 ```powershell
-$env:ELLS_VERSION='v0.2.0'; irm https://raw.githubusercontent.com/lg10/ells/main/install.ps1 | iex
+$env:ELLS_VERSION='v0.2.1'; irm https://raw.githubusercontent.com/lg10/ells/main/install.ps1 | iex
 $env:ELLS_INSTALL_DIR="$env:USERPROFILE\bin"; irm https://raw.githubusercontent.com/lg10/ells/main/install.ps1 | iex
 ```
 
@@ -190,10 +190,10 @@ ells 现在认出它们是同一条快捷键，所以默认键在 Windows、macO
 收窄为 F2–F9，`Ctrl+数字`/`Ctrl+空格`/`Ctrl-/` 与同码键一律拒绝并给出中文原因。
 
 界面配色也是可以选的：「主机列表 `s` → 设置 → 界面主题」按 Enter 或 `←→` 循环四套——
-**深色**（画死黑底灰条，Windows 上最贴）、**跟随终端**（ells 一处底色都不画，底与正文色都用终端
-自己的主题，macOS 终端 / iTerm2 / WezTerm 推荐，也是 mac 上的默认）、**高对比**（去掉灰色小字，
-层级靠粗体与反显）、**浅色底**（给白底终端的深字配色）。改完立刻预览，点【保 存】才写入 `settings.ini`
-的 `theme=`，【取消】还原。mac 上觉得"灰底/黑块和终端底色不搭"就换「跟随终端」。
+**跟随终端**（ells 一处底色都不画，底与正文色都用终端自己的主题，macOS 终端 / iTerm2 / WezTerm /
+Windows Terminal 都合适，**四个平台的默认就是它**）、**深色**（画死黑底灰条，拿不准终端配色时的
+保底）、**高对比**（去掉灰色小字，层级靠粗体与反显）、**浅色底**（给白底终端的深字配色）。改完立刻预览，点【保 存】才写入 `settings.ini`
+的 `theme=`，【取消】还原。觉得"灰底/黑块和终端底色不搭"就换「跟随终端」。
 
 设置页另外三行管的是"事后能不能查"、"要不要占掉底下那一行"和"断了要不要自己接"：
 

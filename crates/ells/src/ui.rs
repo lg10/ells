@@ -1249,7 +1249,7 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App) {
             "会话与标签页按键可在「设置 → 快捷键设置」里自定义（列表页按 s、会话页按顶部【设置】）：Enter 选中某项后按下新按键即可绑定，只接受 F2–F9 或带 Ctrl/Alt 的组合键（F1 留给帮助页，F10–F12 常被终端或系统吃掉），改完即时写入 ~/.ells/settings.ini；撞到已占用的键会自动互换，【恢复默认】一键还原。跨平台：mac/Linux 终端把 Ctrl-] 这类组合发成与 Ctrl-5 同一个字节，已自动归一，默认键在三个平台都能触发；本机注意点——{}",
             crate::keybinds::platform_note(),
         ))),
-        ("外观主题", std::borrow::Cow::Borrowed("设置页「界面主题」按 Enter 或 ←→ 循环四套：深色（画死黑底灰条，Windows 最贴）· 跟随终端（一处底色都不画，全用终端自己的主题，mac 终端/iTerm2/WezTerm 推荐，也是 mac 默认）· 高对比（去掉灰色小字，靠粗体与反显分层）· 浅色底（白底终端用深字）。切换即时预览，【保 存】才写入 settings.ini 的 theme=，【取消】还原。")),
+        ("外观主题", std::borrow::Cow::Borrowed("设置页「界面主题」按 Enter 或 ←→ 循环四套：跟随终端（一处底色都不画，全用终端自己的主题，mac 终端/iTerm2/WezTerm/Windows Terminal 都合适，**四个平台默认都是它**）· 深色（画死黑底灰条，终端配色自己拿不准时的保底）· 高对比（去掉灰色小字，靠粗体与反显分层）· 浅色底（白底终端用深字）。切换即时预览，【保 存】才写入 settings.ini 的 theme=，【取消】还原。")),
         ("文件浏览器", std::borrow::Cow::Borrowed("↑↓/滚轮 选择 · Enter 进入目录或下载 · u 上传文件 · U 上传整个目录 · d 下载 · m 新建目录 · n 重命名 · c 改权限（八进制 600/0644，只改权限位，不动属主和时间）· D 删除（递归，先确认）· Ctrl-C 取消全部在途传输 · r 刷新 · Backspace 上级 · Esc 返回终端")),
         ("主机表单", std::borrow::Cow::Borrowed("Tab/↓ 下一个字段 · ↑ 上一个 · ←→ 切换认证方式 · Ctrl-F 选私钥 · Ctrl-J 选跳板机 · Ctrl-C 清空当前字段 · 光标在「密码/私钥口令」上按 Ctrl-R 让它显形（再按一次遮回去）· Enter 在\"私钥路径/跳板机\"上直接打开选择器，保存要点【保 存】或聚焦后回车。带 ＊ 的别名、主机、用户是必填项，提交失败时只点缺的那几项的名。「分组」只影响列表归类与排序，光标停在这一栏时下面会列出已有分组和各自台数，敲同名即归入、敲新名即新建（末尾空格不算新分组）；「标签」用逗号分隔、过滤时按 #标签 命中；「转发」写 ssh 风格的 -L/-D 规则（见【端口转发】），想一列一列对着填就在列表页按 p（或隧道面板里按 Enter）进表格编辑器，本地端口那一格留空就是交给系统分配；这三栏留空即无。编辑已有主机不会丢掉它的收藏、备注和最近连接时间；按 a 新增时会把列表里选中的那台的用户/端口/认证方式/私钥路径/跳板/分组/标签/转发带过来，但别名、主机名和密码/口令一律留空 —— 身份和凭据要自己填")),
         ("解锁保险库", std::borrow::Cow::Borrowed("输入主密码后回车；首次使用会要求输入两遍。主密码不可找回，忘记只能删除 ~/.ells/vault.bin 重来。")),
@@ -2185,7 +2185,7 @@ pub fn metric_parts(m: &crate::app::Metrics, width: u16) -> Vec<(String, MetricT
             let filled = bar_filled(cell.percent, bar);
             parts.push((
                 format!("{}{}", "█".repeat(filled), "░".repeat(bar - filled)),
-                tone,
+                tone.as_bar(),
             ));
             parts.push((" ".to_string(), MetricTone::Dim));
         }
@@ -2207,6 +2207,13 @@ pub enum MetricTone {
     Ok,
     Warn,
     Err,
+    /// 进度条那一截的四档：字色和不带 `Bar` 的那一档一样，多垫一层自己的轨道底色。
+    /// 条不能靠"色带透出来"画 —— 深色主题的色带是浅灰，`░` 网点透出来还是浅灰，
+    /// 整根条就和背景一个亮度（mac 上默认不画底色所以看不出来，Windows 上一眼就穿）。
+    BarDim,
+    BarOk,
+    BarWarn,
+    BarErr,
 }
 
 impl MetricTone {
@@ -2219,14 +2226,40 @@ impl MetricTone {
         }
     }
 
+    /// 同一档换成"条"的那一档。
+    fn as_bar(self) -> MetricTone {
+        match self {
+            MetricTone::Ok => MetricTone::BarOk,
+            MetricTone::Warn => MetricTone::BarWarn,
+            MetricTone::Err => MetricTone::BarErr,
+            _ => MetricTone::BarDim,
+        }
+    }
+
     fn color(self) -> Color {
         match self {
             MetricTone::Label => theme::alt(),
-            MetricTone::Dim => theme::dim(),
-            MetricTone::Ok => theme::ok(),
-            MetricTone::Warn => theme::warn(),
-            MetricTone::Err => theme::err(),
+            MetricTone::Dim | MetricTone::BarDim => theme::dim(),
+            MetricTone::Ok | MetricTone::BarOk => theme::ok(),
+            MetricTone::Warn | MetricTone::BarWarn => theme::warn(),
+            MetricTone::Err | MetricTone::BarErr => theme::err(),
         }
+    }
+
+    /// 样式单独抽成吃 `track` 的纯函数：主题是一份进程级全局状态，测试里改它会和
+    /// 别的用例打架，所以这里把"用哪个轨道色"留在外面。
+    fn style_with(self, track: Color) -> Style {
+        match self {
+            MetricTone::BarDim
+            | MetricTone::BarOk
+            | MetricTone::BarWarn
+            | MetricTone::BarErr => Style::default().fg(self.color()).bg(track),
+            tone => Style::default().fg(tone.color()),
+        }
+    }
+
+    fn style(self) -> Style {
+        self.style_with(theme::track())
     }
 }
 
@@ -2240,7 +2273,7 @@ fn draw_metrics_bar(f: &mut Frame, app: &App, area: Rect) {
     let line = Line::from(
         metric_parts(&slot.metrics, area.width)
             .into_iter()
-            .map(|(text, tone)| Span::styled(text, Style::default().fg(tone.color())))
+            .map(|(text, tone)| Span::styled(text, tone.style()))
             .collect::<Vec<Span>>(),
     );
     f.render_widget(
@@ -3490,6 +3523,24 @@ mod tests {
         let parts = metric_parts(&m, 120);
         let disk = parts.iter().find(|(t, _)| t == "95%").expect("没有 95% 这一格");
         assert_eq!(disk.1, MetricTone::Err);
+    }
+
+    /// Windows 上"条被背景藏起来"的正解：条那一截自带轨道底色，其余格子一律不画底。
+    /// 深色主题的色带是浅灰，`░` 网点透出来还是浅灰，整根条就和背景一个亮度；
+    /// 而"跟随终端"那套一处底都不画，多垫一层反倒脏，所以轨道色只在画死底色的主题里有值。
+    #[test]
+    fn only_the_bar_buys_its_own_background() {
+        let track = Color::Black;
+        let bar = MetricTone::Warn.as_bar();
+        let style = bar.style_with(track);
+        assert_eq!(style.bg, Some(track), "条必须垫住自己的轨道色");
+        assert_eq!(style.fg, Some(theme::warn()), "字色还是跟着语气");
+        for tone in [MetricTone::Label, MetricTone::Dim, MetricTone::Ok, MetricTone::Err] {
+            assert_eq!(tone.style_with(track).bg, None, "{tone:?} 不该画底色");
+        }
+        // 语气判定不能因为套了一层"条"就变味：95% 的盘，条和数字得是同一个红
+        assert_eq!(MetricTone::of(Some(95)).as_bar(), MetricTone::BarErr);
+        assert_eq!(MetricTone::of(Some(95)).color(), MetricTone::BarErr.color());
     }
 
     /// 可视区高度 = 总高 − 标题栏 − 指标行，两者之和绝不能超出屏幕：
