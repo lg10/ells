@@ -70,6 +70,9 @@ pub enum AppEvent {
     PickedFile { field: usize, path: Option<String> },
     /// Background argon2 unlock finished.
     VaultUnlocked(std::result::Result<(Vault, VaultKey), String>),
+    /// 解锁忙帧：只为了重画那根进度条。`seq` 是这一轮忙态的代号，忙态一结束就对不上，
+    /// 在途的那一帧因此作废（不会有人停在列表页上还接着收定时）。
+    UnlockTick { seq: u64 },
     /// Background vault creation finished.
     VaultCreated(std::result::Result<VaultKey, String>),
     /// 主密码修改完成：新密钥 + 新密码明文（供自动解锁凭据同步）。

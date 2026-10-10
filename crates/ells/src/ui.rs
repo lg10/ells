@@ -1,13 +1,17 @@
 use ells_term::vt100;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Borders, Clear, Gauge, List, ListItem, ListState as RtListState, Paragraph, Wrap,
+    Block, BorderType, Borders, Clear, Gauge, List, ListItem, ListState as RtListState, Paragraph,
+    Wrap,
 };
 use ratatui::Frame;
 
-use crate::app::{App, Choice, FieldKind, FieldRole, ListRow, Prompt, RULE_COLS, ScreenKind, Slot, UnlockStage};
+use crate::app::{
+    App, Choice, FieldKind, FieldRole, ListRow, Prompt, RULE_COLS, ScreenKind, Slot, UnlockState,
+    UnlockStage,
+};
 use crate::session::TermMode;
 use crate::theme;
 
@@ -24,7 +28,7 @@ fn select_style() -> Style {
 pub fn draw(f: &mut Frame, app: &mut App) {
     app.last_area = f.area();
     match app.screen {
-        ScreenKind::Unlock => draw_unlock(f, app),
+        ScreenKind::Unlock => draw_unlock(f, &app.unlock, app.unlock_estimate),
         ScreenKind::List => draw_list(f, app),
         ScreenKind::Form => draw_form(f, app),
         ScreenKind::Session => draw_session(f, app),
@@ -111,88 +115,451 @@ pub fn update_badge_rect(area: Rect, label: &str) -> Rect {
     }
 }
 
-fn draw_unlock(f: &mut Frame, app: &mut App) {
-    let creating = app.unlock.stage != UnlockStage::Open;
-    // 首次设主密码要多几行"不可找回"警示：框子跟着长高、边框换黄色，
-    // 让用户一眼看出这是"正在定规矩"而不是"输入密码"。
-    let area = centered(if creating { 56 } else { 50 }, if creating { 11 } else { 9 }, f.area());
+/// 启动页的大 logo：五行高的块状 `ells`，`#` 是笔画、`.` 是空位。
+///
+/// 为什么手写点阵而不引 figlet 那类 crate：这份图正好 26 格宽（面板内宽 50，居中后左右各余
+/// 12 格），笔画只能是实心块 `█` —— 三套主题不画底色，`▓`/`▒` 的深浅在别的终端主题上未必还
+/// 分得开，而 `█` 前景色到哪都是同一块黑。用 `#`/`.` 存而不是直接存 `█` 和真空格，是因为
+/// 尾随空格会被编辑器抹掉，点阵就歪了。
+const UNLOCK_LOGO: [&str; 5] = [
+    ".###....##.....##.....####",
+    "#...#...##.....##....#....",
+    "#####...##.....##.....###.",
+    "#.......##.....##........#",
+    "####....####...####..####.",
+];
+
+/// 点阵的格宽：`#` 和 `.` 都只占一格，所以它就是渲染出来的显示宽度。
+const UNLOCK_LOGO_WIDTH: u16 = 26;
+
+/// 解锁面板的尺寸：大 logo 比一行字标高五行（含顶上那格呼吸位），建库那两步又各自多四行警示。
+fn unlock_panel_size(creating: bool, big: bool) -> (u16, u16) {
+    match (creating, big) {
+        (false, false) => (56, 13),
+        (false, true) => (56, 18),
+        (true, false) => (62, 17),
+        (true, true) => (62, 22),
+    }
+}
+
+/// 大 logo 摆不摆得下 —— 宁可退回小字标，也不能把错误行和键位行挤出框外。
+/// 纯函数：绘制侧和测试都从这里问尺寸，两边不会各算一套。
+fn unlock_logo_fits(outer: Rect, creating: bool) -> bool {
+    let (w, h) = unlock_panel_size(creating, true);
+    outer.width >= w + 2 && outer.height >= h + 2
+}
+
+/// 解锁页（也就是 ells 的启动页）。
+///
+/// 四段固定几何：抬头（品牌 + 说明 + 细线）· 输入 · 状态 · 键位。两个设计约束值得记住：
+/// - **忙的时候输入框不消失**，进度条在它正下方亮起来。原先是整行文案换成"请稍候"，
+///   用户看不出自己是卡在哪一步，也不知道还要不要等。
+/// - **状态行永远占一格**（没内容就空着），否则错误一出现下面的键位行就往下跳。
+///
+/// 所有宽度都走 `Layout`：终端被缩到放不下的时候，约束会自动把后面的行压成零高，
+/// 而不是画到框外面去。
+fn draw_unlock(f: &mut Frame, u: &UnlockState, estimate: std::time::Duration) {
+    let creating = u.stage != UnlockStage::Open;
+    let big = unlock_logo_fits(f.area(), creating);
+    let (panel_w, panel_h) = unlock_panel_size(creating, big);
+    let area = centered(panel_w, panel_h, f.area());
     f.buffer_mut().set_style(area, Style::default().bg(theme::bg()));
-    let u = &app.unlock;
     let stage_name = match u.stage {
         UnlockStage::Open => "解锁保险库",
         UnlockStage::CreateFirst => "设置主密码",
         UnlockStage::CreateConfirm => "确认主密码",
     };
-    let title = format!(" ells · {stage_name} · {} ", version_tag());
-    let accent = if creating { theme::warn() } else { theme::text() };
+    // 建库的两步用暖色边框：那是"正在定规矩"，和"输入密码"该一眼分开。
+    let accent = if creating { theme::warn() } else { theme::accent() };
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(title)
+        .border_type(BorderType::Rounded)
+        .title(
+            Line::from(format!(" {stage_name} "))
+                .centered()
+                .style(Style::default().fg(accent).add_modifier(Modifier::BOLD)),
+        )
+        .title_bottom(
+            Line::from(format!(" {} ", version_tag()))
+                .right_aligned()
+                .style(Style::default().fg(theme::dim())),
+        )
         .border_style(Style::default().fg(accent))
-        .title_style(Style::default().fg(accent).add_modifier(Modifier::BOLD))
         .style(Style::default().fg(theme::text()));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let masked: String = u.input.chars().map(|_| '•').collect();
-    // 两种阶段共用同一套 5 行切分：解锁页把第一行留空，省掉两套下标
-    let chunks = Layout::default()
+    let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(if creating { 3 } else { 0 }),
-            Constraint::Length(2),
+            Constraint::Length(if big { 8 } else { 3 }),
+            Constraint::Length(1),
+            Constraint::Length(if creating { 4 } else { 0 }),
+            Constraint::Length(3),
+            Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Min(0),
         ])
         .split(inner);
+
+    draw_unlock_header(f, rows[0], u.stage, accent);
+    // rows[1] 是留白
     if creating {
-        let warn = Paragraph::new(vec![
-            Line::from(Span::styled(
-                " ! 主密码忘记后无法找回，ells 不做任何找回。",
-                Style::default().fg(theme::err()).add_modifier(Modifier::BOLD),
-            )),
-            Line::from(Span::styled(
-                "   只能重置保险库重来：主机与凭据都要重填。",
-                Style::default().fg(theme::err()),
-            )),
-            Line::from(Span::styled(
-                "   主密码只加密本机保险库，不会发往任何服务器。",
-                Style::default().fg(theme::dim()),
-            )),
-        ]);
-        f.render_widget(warn, chunks[0]);
+        draw_unlock_creating(f, rows[2], u.stage);
     }
-    let first_line = if u.busy {
-        Span::styled(
-            "正在解密/创建保险库，请稍候（约 1 秒）…",
-            Style::default().fg(theme::warn()).add_modifier(Modifier::BOLD),
-        )
-    } else {
-        Span::styled(format!("主密码：{masked}"), Style::default().fg(theme::accent()))
-    };
-    f.render_widget(Paragraph::new(Line::from(first_line)), chunks[1]);
+    draw_unlock_input(f, rows[3], u, accent);
+    draw_unlock_status(f, rows[4], u, estimate, creating);
     if let Some(err) = &u.error {
         f.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                err.clone(),
-                Style::default().fg(theme::err()),
-            ))),
-            chunks[2],
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    "× ",
+                    Style::default().fg(theme::err()).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(err.clone(), Style::default().fg(theme::err())),
+            ])),
+            inset_x(rows[5], 2),
         );
     }
     f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            if creating {
-                "Enter 下一步 · Esc 退出 · 请务必记牢"
-            } else {
-                "Enter 提交 · Esc 退出"
-            },
-            Style::default().add_modifier(Modifier::DIM),
-        ))),
-        chunks[3],
+        Paragraph::new(Line::from(key_hint_spans(u.stage))),
+        inset_x(rows[6], 2),
     );
 }
+
+/// 抬头：大 logo（顶上留一格呼吸，再五行点阵）或小字标（带字距的一行 `e l l s`）· 一句话说明 ·
+/// 中间断开的细分隔线。摆哪一套由分到的行数决定，而那个数在 `draw_unlock` 里已经按终端尺寸
+/// 算过一遍，所以这里不需要再问一次终端多大。
+fn draw_unlock_header(f: &mut Frame, area: Rect, stage: UnlockStage, accent: Color) {
+    let big = area.height >= 8;
+    // `b`：大 logo 多出来的那格呼吸位占掉的下标，往后品牌、说明、分隔线依次顺延
+    let b = usize::from(big);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(if big {
+            [
+                Constraint::Length(1),
+                Constraint::Length(5),
+                Constraint::Length(1),
+                Constraint::Length(1),
+            ]
+        } else {
+            [
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Length(0),
+            ]
+        })
+        .split(area);
+    if big {
+        // 两侧各 Min(0)：点阵整体居中。逐行居中会把每行按自己的宽度挪，尾随空格一多，
+        // "ells" 的四根笔画就错开了。
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Min(0),
+                Constraint::Length(UNLOCK_LOGO_WIDTH.min(area.width)),
+                Constraint::Min(0),
+            ])
+            .split(rows[1]);
+        let stroke = Style::default().fg(accent);
+        f.render_widget(
+            Paragraph::new(
+                UNLOCK_LOGO
+                    .iter()
+                    .map(|row| {
+                        Line::from(Span::styled(
+                            row.replace('#', "█").replace('.', " "),
+                            stroke,
+                        ))
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+            cols[1],
+        );
+    } else {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "e l l s",
+                Style::default().fg(accent).add_modifier(Modifier::BOLD),
+            )))
+            .alignment(Alignment::Center),
+            rows[0],
+        );
+    }
+    let tagline = match stage {
+        UnlockStage::Open => "跨平台终端 SSH 客户端 · 保险库已加密",
+        UnlockStage::CreateFirst => "跨平台终端 SSH 客户端 · 首次运行，先定主密码",
+        UnlockStage::CreateConfirm => "跨平台终端 SSH 客户端 · 再看一眼刚才那串",
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(tagline, Style::default().fg(theme::muted()))))
+            .alignment(Alignment::Center),
+        rows[b + 1],
+    );
+    // 分隔线两端留白，中间一个断点：整条铺满会像表格线，太硬；顶到边框又像漏了缝。
+    let w = inset_x(rows[b + 2], 2).width as usize;
+    let side = w.saturating_sub(3) / 2;
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("─".repeat(side), Style::default().fg(theme::rule())),
+            Span::styled(" · ", Style::default().fg(theme::dim())),
+            Span::styled("─".repeat(side), Style::default().fg(theme::rule())),
+        ]))
+        .alignment(Alignment::Center),
+        inset_x(rows[b + 2], 2),
+    );
+}
+
+/// 建库时才有的四行：三行"不可找回"警示 + 一步骤指示。
+fn draw_unlock_creating(f: &mut Frame, area: Rect, stage: UnlockStage) {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Length(1)])
+        .split(area);
+    // 警示用同一条左栏：符号占一格、颜色固定，正文才对齐得整齐。
+    let warn_line = |mark: &str, text: &str, tone: Color| {
+        Line::from(vec![
+            Span::styled(
+                format!(" {mark} "),
+                Style::default().fg(tone).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(text.to_string(), Style::default().fg(tone)),
+        ])
+    };
+    f.render_widget(
+        Paragraph::new(vec![
+            warn_line("!", "主密码忘记后无法找回，ells 不做任何找回。", theme::err()),
+            warn_line("!", "只能重置保险库重来：主机与凭据都要重填。", theme::err()),
+            warn_line("i", "主密码只加密本机保险库，不会发往任何服务器。", theme::dim()),
+        ]),
+        inset_x(rows[0], 1),
+    );
+    f.render_widget(
+        Paragraph::new(Line::from(step_spans(stage == UnlockStage::CreateConfirm)))
+            .alignment(Alignment::Center),
+        rows[1],
+    );
+}
+
+/// 建库两步的进度指示：当前那格实心（`◉`），已过的一格用小实心点，没到的空心。
+fn step_spans(second: bool) -> Vec<Span<'static>> {
+    let dim = Style::default().fg(theme::dim());
+    let on = Style::default()
+        .fg(theme::warn())
+        .add_modifier(Modifier::BOLD);
+    vec![
+        Span::styled(if second { "● 设置 " } else { "◉ 设置 " }, if second { dim } else { on }),
+        Span::styled("·", dim),
+        Span::styled(if second { " ◉ 确认" } else { " ○ 确认" }, if second { on } else { dim }),
+    ]
+}
+
+/// 主密码输入框：自己的圆角小盒子，压在页面正中，比一行"主密码：xxx"更像在填东西。
+fn draw_unlock_input(f: &mut Frame, area: Rect, u: &UnlockState, accent: Color) {
+    // 左右各留两格，盒子就不会和外面的大框贴在一起。
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(2), Constraint::Min(0), Constraint::Length(2)])
+        .split(area);
+    let box_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(
+            Line::from(" 主密码 ")
+                .left_aligned()
+                .style(Style::default().fg(accent).add_modifier(Modifier::BOLD)),
+        )
+        .title_bottom(
+            Line::from(if u.reveal { " 明文回显中 " } else { " Tab 切换回显 " })
+                .right_aligned()
+                .style(Style::default().fg(if u.reveal { theme::warn() } else { theme::dim() })),
+        )
+        .border_style(Style::default().fg(if u.busy { theme::muted() } else { accent }));
+    let value_area = box_block.inner(cols[1]);
+    f.render_widget(box_block, cols[1]);
+    if value_area.width == 0 || value_area.height == 0 {
+        return;
+    }
+    // 掩码一位一个 `•`：除长度外不泄露任何东西。回显与否只改画法，不改输入本身。
+    let budget = value_area.width.saturating_sub(1) as usize;
+    let shown: String = if u.reveal {
+        u.input.chars().take(budget).collect()
+    } else {
+        "•".repeat(budget.min(u.input.chars().count()))
+    };
+    let mut spans = vec![Span::styled(shown, Style::default().fg(theme::text()))];
+    if !u.busy {
+        // 光标画成四分之一格竖线：比整格 `█` 轻，也不用管 raw 模式下真光标落在哪儿。
+        spans.push(Span::styled(
+            "▏",
+            Style::default().fg(accent).add_modifier(Modifier::BOLD),
+        ));
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), value_area);
+}
+
+/// 状态行：忙 = 进度条；闲 = 强度条（建库那两步）或保险库说明（解锁）。
+fn draw_unlock_status(
+    f: &mut Frame,
+    area: Rect,
+    u: &UnlockState,
+    estimate: std::time::Duration,
+    creating: bool,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let line = if u.busy {
+        unlock_progress_line(u.stage, u.busy_since, estimate, area.width as usize)
+    } else if creating {
+        strength_line(&u.input)
+    } else {
+        Line::from(Span::styled(
+            "~/.ells/vault.bin · argon2id + XChaCha20-Poly1305",
+            Style::default().fg(theme::dim()),
+        ))
+    };
+    f.render_widget(Paragraph::new(line).alignment(Alignment::Center), area);
+}
+
+/// 忙时那一行：文案 + 进度条 + 已用时间。
+///
+/// 条按"已用 / 估计"走，估计是本进程实测到的派生耗时（第一次没有实测就按 1 秒），
+/// 并且最多只走到 95%：argon2 没有可上报进度的中间点，最后那几格留给真结果，
+/// 条就不会在算完之前假装到顶。头三格 `▓▒░` 每帧轮换，动的是"还在算"这件事，
+/// 而"已用 X.X 秒"把真实耗时摆在明处。
+fn unlock_progress_line(
+    stage: UnlockStage,
+    since: Option<std::time::Instant>,
+    estimate: std::time::Duration,
+    width: usize,
+) -> Line<'static> {
+    let spent = since.map(|t| t.elapsed()).unwrap_or_default();
+    let label = match stage {
+        UnlockStage::Open => "正在解密保险库",
+        UnlockStage::CreateFirst => "请稍候",
+        UnlockStage::CreateConfirm => "正在创建保险库",
+    };
+    let est_ms = estimate.as_millis().max(1) as f64;
+    let ratio = (spent.as_secs_f64() * 1000.0 / est_ms).clamp(0.0, 0.95);
+    let pulse = (spent.as_millis() as usize / crate::app::UNLOCK_TICK_MS as usize) % 3;
+    let secs = format!("已用 {:.1}s", spent.as_secs_f64());
+    // 条的宽度按这一行剩下的地方算，宁可短，也不要挤出面板。
+    let used = display_width(label) + display_width(&secs) + 4;
+    let bar_w = width.saturating_sub(used).clamp(4, 24);
+    let mut spans = vec![Span::styled(
+        format!("{label} "),
+        Style::default()
+            .fg(theme::warn())
+            .add_modifier(Modifier::BOLD),
+    )];
+    spans.extend(unlock_bar(ratio, bar_w, pulse));
+    spans.push(Span::styled(
+        format!(" {secs}"),
+        Style::default().fg(theme::muted()),
+    ));
+    Line::from(spans)
+}
+
+/// 进度条本体：`█` 是已走过的部分，后面三格是渐淡的头，再后面是轨道。
+/// 轨道自己带底色（`theme::track()`），这是 Windows 深色主题下条能看见的前提。
+fn unlock_bar(ratio: f64, width: usize, pulse: usize) -> Vec<Span<'static>> {
+    const HEAD: [&str; 3] = ["▓", "▒", "░"];
+    let filled = ((ratio * width as f64).round() as usize).min(width);
+    let mut spans = vec![Span::styled(
+        "█".repeat(filled),
+        Style::default()
+            .fg(theme::accent())
+            .bg(theme::track()),
+    )];
+    let head = (width - filled).min(3);
+    for i in 0..head {
+        let fg = match i {
+            0 => theme::accent(),
+            1 => theme::muted(),
+            _ => theme::dim(),
+        };
+        spans.push(Span::styled(
+            HEAD[(i + pulse) % HEAD.len()].to_string(),
+            Style::default().fg(fg).bg(theme::track()),
+        ));
+    }
+    let rest = width - filled - head;
+    if rest > 0 {
+        spans.push(Span::styled(
+            "░".repeat(rest),
+            Style::default().fg(theme::dim()).bg(theme::track()),
+        ));
+    }
+    spans
+}
+
+/// 建库时的强度条：只看四件当场算得出的事。这不是安全分，是"够不够长、够不够杂"的即时反馈。
+fn strength_line(pw: &str) -> Line<'static> {
+    let n = pw.chars().count();
+    let mut seg = 0usize;
+    if n >= 8 {
+        seg += 1;
+    }
+    if n >= 14 {
+        seg += 1;
+    }
+    if pw.chars().any(|c| c.is_ascii_digit()) {
+        seg += 1;
+    }
+    if pw.chars().any(|c| !(c.is_alphanumeric() || c.is_whitespace())) {
+        seg += 1;
+    }
+    let note = if n == 0 {
+        "建议 8 位以上，混大小写、数字与符号"
+    } else if seg <= 1 {
+        "偏短：再加几位，混进数字或符号"
+    } else if seg == 2 {
+        "够用，但还可以再长一点"
+    } else {
+        "这一把够长也够杂"
+    };
+    let tone = if seg >= 3 {
+        theme::ok()
+    } else if seg == 2 {
+        theme::warn()
+    } else {
+        theme::dim()
+    };
+    Line::from(vec![
+        Span::styled("强度 ", Style::default().fg(theme::dim())),
+        Span::styled(
+            "▰".repeat(seg) + &"▱".repeat(4 - seg),
+            Style::default().fg(if seg == 0 { theme::dim() } else { tone }),
+        ),
+        Span::styled(format!(" {note}"), Style::default().fg(theme::muted())),
+    ])
+}
+
+/// 键位提示行：按键本身加粗，动作跟在后面淡一档。写的每个键都真能按出来。
+fn key_hint_spans(stage: UnlockStage) -> Vec<Span<'static>> {
+    let action = match stage {
+        UnlockStage::Open => "提交",
+        UnlockStage::CreateFirst => "下一步",
+        UnlockStage::CreateConfirm => "确认",
+    };
+    let key = Style::default().fg(theme::text()).add_modifier(Modifier::BOLD);
+    let gap = Style::default().fg(theme::dim());
+    vec![
+        Span::styled("Enter", key),
+        Span::styled(format!(" {action} "), gap),
+        Span::styled("·", gap),
+        Span::styled(" Tab", key),
+        Span::styled(" 明文回显 ", gap),
+        Span::styled("·", gap),
+        Span::styled(" Esc", key),
+        Span::styled(" 退出", gap),
+    ]
+}
+
 
 /// 主机列表页几何：品牌行 / 标签条 / 主机面板 / 键位行 / 状态行。
 /// 标签条在列表页也要能点（那是回到"已经连着的会话"的入口），所以绘制与命中测试共用它。
@@ -1252,7 +1619,7 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App) {
         ("外观主题", std::borrow::Cow::Borrowed("设置页「界面主题」按 Enter 或 ←→ 循环四套：跟随终端（一处底色都不画，全用终端自己的主题，mac 终端/iTerm2/WezTerm/Windows Terminal 都合适，**四个平台默认都是它**）· 深色（画死黑底灰条，终端配色自己拿不准时的保底）· 高对比（去掉灰色小字，靠粗体与反显分层）· 浅色底（白底终端用深字）。切换即时预览，【保 存】才写入 settings.ini 的 theme=，【取消】还原。")),
         ("文件浏览器", std::borrow::Cow::Borrowed("↑↓/滚轮 选择 · Enter 进入目录或下载 · u 上传文件 · U 上传整个目录 · d 下载 · m 新建目录 · n 重命名 · c 改权限（八进制 600/0644，只改权限位，不动属主和时间）· D 删除（递归，先确认）· Ctrl-C 取消全部在途传输 · r 刷新 · Backspace 上级 · Esc 返回终端")),
         ("主机表单", std::borrow::Cow::Borrowed("Tab/↓ 下一个字段 · ↑ 上一个 · ←→ 切换认证方式 · Ctrl-F 选私钥 · Ctrl-J 选跳板机 · Ctrl-C 清空当前字段 · 光标在「密码/私钥口令」上按 Ctrl-R 让它显形（再按一次遮回去）· Enter 在\"私钥路径/跳板机\"上直接打开选择器，保存要点【保 存】或聚焦后回车。带 ＊ 的别名、主机、用户是必填项，提交失败时只点缺的那几项的名。「分组」只影响列表归类与排序，光标停在这一栏时下面会列出已有分组和各自台数，敲同名即归入、敲新名即新建（末尾空格不算新分组）；「标签」用逗号分隔、过滤时按 #标签 命中；「转发」写 ssh 风格的 -L/-D 规则（见【端口转发】），想一列一列对着填就在列表页按 p（或隧道面板里按 Enter）进表格编辑器，本地端口那一格留空就是交给系统分配；这三栏留空即无。编辑已有主机不会丢掉它的收藏、备注和最近连接时间；按 a 新增时会把列表里选中的那台的用户/端口/认证方式/私钥路径/跳板/分组/标签/转发带过来，但别名、主机名和密码/口令一律留空 —— 身份和凭据要自己填")),
-        ("解锁保险库", std::borrow::Cow::Borrowed("输入主密码后回车；首次使用会要求输入两遍。主密码不可找回，忘记只能删除 ~/.ells/vault.bin 重来。")),
+        ("解锁保险库", std::borrow::Cow::Borrowed("输入主密码后回车；首次使用会要求输入两遍（第 1 步定、第 2 步照抄一遍）。Tab 切换明文回显，确认自己没敲错再回车；回车后输入框下面亮起一条进度带，它按本机这一趟 argon2id 的真实耗时走（第一次没有实测值就按 1 秒估，最多先走到九成五，算完才收口），右边写清已用几秒。主密码不可找回，忘记只能删除 ~/.ells/vault.bin 重来。")),
         ("确认弹窗", std::borrow::Cow::Borrowed("←→/Tab 切换选项 · Enter 确认 · Esc 取消。传输冲突默认停在\"改名保留双方\"；主机密钥变更默认停在\"拒绝\"。")),
         ("命令行", std::borrow::Cow::Borrowed("ells 打开列表；ells <别名> 直连；ells --dev 读 ~/.ells/hosts.dev.toml；ells -y 首次主机密钥自动接受（密钥变更仍然拒绝）。配置在 ~/.ells/。")),
     ];
@@ -3099,6 +3466,15 @@ fn map_color(c: vt100::Color) -> Option<Color> {
     }
 }
 
+/// 左右各收 `n` 格：让左对齐的正文（警示、错误、键位）与输入框的边框对上。
+fn inset_x(area: Rect, n: u16) -> Rect {
+    Rect {
+        x: area.x + n,
+        width: area.width.saturating_sub(2 * n),
+        ..area
+    }
+}
+
 fn centered(width: u16, height: u16, area: Rect) -> Rect {
     let w = width.min(area.width.saturating_sub(2));
     let h = height.min(area.height.saturating_sub(2));
@@ -3556,5 +3932,220 @@ mod tests {
                 assert!(emu.bottom() + footer <= area.bottom());
             }
         }
+    }
+
+    fn unlock_state(stage: UnlockStage, input: &str, busy: bool) -> UnlockState {
+        UnlockState {
+            input: input.to_string(),
+            error: None,
+            stage,
+            pending_master: None,
+            busy,
+            busy_since: busy.then(std::time::Instant::now),
+            reveal: false,
+        }
+    }
+
+    /// 整屏渲染一次解锁页，返回画面文本。宽字符占的两格里第二格是空格，读出来会隔字，
+    /// 所以这里把后半格跳掉。需要看画面时：`cargo test -p ells --bins unlock -- --nocapture`
+    fn render_unlock(u: &UnlockState, estimate: std::time::Duration) -> String {
+        render_unlock_at(u, estimate, 80, 24)
+    }
+
+    fn render_unlock_at(
+        u: &UnlockState,
+        estimate: std::time::Duration,
+        cols: u16,
+        rows: u16,
+    ) -> String {
+        use ratatui::backend::TestBackend;
+        let mut terminal = ratatui::Terminal::new(TestBackend::new(cols, rows)).unwrap();
+        terminal.draw(|f| draw_unlock(f, u, estimate)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let mut out = String::new();
+        for y in 0..rows {
+            let mut x = 0u16;
+            while x < cols {
+                let sym = buf[(x, y)].symbol();
+                let wide = sym.chars().next().is_some_and(is_wide);
+                out.push_str(sym);
+                x += 1;
+                if wide {
+                    x += 1;
+                }
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    /// 点阵里的一行按绘制侧同样的换算取出来，测试才不会和实现各写一份。
+    fn logo_row(i: usize) -> String {
+        UNLOCK_LOGO[i].replace('#', "█").replace('.', " ")
+    }
+
+    #[test]
+    fn the_unlock_logo_rows_are_all_the_declared_width() {
+        // 居中靠的是"整块 26 格"这个前提：哪一行长度写错了，四根笔画就会互相错开
+        for (i, row) in UNLOCK_LOGO.iter().enumerate() {
+            let drawn = logo_row(i);
+            assert_eq!(display_width(&drawn), UNLOCK_LOGO_WIDTH as usize, "第 {i} 行");
+            assert_eq!(row.chars().count(), UNLOCK_LOGO_WIDTH as usize, "第 {i} 行");
+        }
+    }
+
+    #[test]
+    fn the_unlock_screen_paints_a_box_and_a_hint_that_actually_work() {
+        theme::apply(theme::Theme::Dark);
+        let out = render_unlock(
+            &unlock_state(UnlockStage::Open, "hunter2", false),
+            std::time::Duration::from_millis(1000),
+        );
+        println!("{out}");
+        assert!(out.contains("解锁保险库"), "顶部标题要说清这是解锁");
+        assert!(out.contains(&logo_row(2)), "够高的终端该摆大 logo：{out}");
+        assert!(
+            out.contains(&logo_row(0))
+                && out.contains(&logo_row(1))
+                && out.contains(&logo_row(3))
+                && out.contains(&logo_row(4)),
+            "logo 得是完整的五行"
+        );
+        assert!(!out.contains("e l l s"), "大 logo 上头不该再叠一个小字标");
+        assert!(out.contains("主密码"));
+        assert!(out.contains("•••••••"), "七位密码该有七个点");
+        assert!(!out.contains("hunter2"), "没按 Tab 之前不许把密码写进屏幕");
+        // 提示行里写的每个键都必须在 handle_unlock_key 里真能按
+        assert!(out.contains("Enter 提交 · Tab 明文回显 · Esc 退出"));
+    }
+
+    /// 尺寸表只有一处（`unlock_panel_size`），测试把四格钉死：面板高度是终端尺寸的门槛值，
+    /// 改动会直接决定大 logo 在哪些终端上出现。
+    #[test]
+    fn the_unlock_panel_sizes_are_the_table_everyone_reads() {
+        assert_eq!(unlock_panel_size(false, false), (56, 13));
+        assert_eq!(unlock_panel_size(false, true), (56, 18));
+        assert_eq!(unlock_panel_size(true, false), (62, 17));
+        assert_eq!(unlock_panel_size(true, true), (62, 22));
+        // 大 logo 比一行字标正好高五行（呼吸一格 + 点阵五行），两个阶段涨的是同一个数
+        assert_eq!(
+            unlock_panel_size(false, true).1 - unlock_panel_size(false, false).1,
+            5
+        );
+        assert_eq!(
+            unlock_panel_size(true, true).1 - unlock_panel_size(true, false).1,
+            5
+        );
+    }
+
+    /// 终端不够高就退回一行字标：大 logo 多要五行，硬摆会把错误行和键位行挤出框外。
+    #[test]
+    fn a_short_terminal_falls_back_to_the_compact_wordmark() {
+        theme::apply(theme::Theme::Dark);
+        let est = std::time::Duration::from_millis(1000);
+        assert!(unlock_logo_fits(Rect::new(0, 0, 80, 24), false));
+        assert!(!unlock_logo_fits(Rect::new(0, 0, 80, 18), false));
+        assert!(unlock_logo_fits(Rect::new(0, 0, 80, 24), true));
+        assert!(!unlock_logo_fits(Rect::new(0, 0, 80, 22), true));
+        let big = render_unlock(&unlock_state(UnlockStage::Open, "hunter2", false), est);
+        assert!(big.contains(&logo_row(2)));
+        let small = render_unlock_at(&unlock_state(UnlockStage::Open, "hunter2", false), est, 80, 18);
+        println!("{small}");
+        assert!(small.contains("e l l s"), "18 行高该退回小字标：{small}");
+        assert!(!small.contains(&logo_row(2)), "退回去就别再画点阵");
+        assert!(
+            small.contains("Enter 提交 · Tab 明文回显 · Esc 退出"),
+            "退回小字标是为了保住键位行，不是把它挤掉"
+        );
+        // 建库那两步比解锁高四行，同一台终端上得跟着退
+        let creating_big = render_unlock(
+            &unlock_state(UnlockStage::CreateFirst, "horse-battery", false),
+            est,
+        );
+        assert!(creating_big.contains(&logo_row(2)), "24 行高建库页也该有大 logo");
+        let creating_small = render_unlock_at(
+            &unlock_state(UnlockStage::CreateFirst, "horse-battery", false),
+            est,
+            80,
+            22,
+        );
+        assert!(!creating_small.contains(&logo_row(2)));
+        assert!(creating_small.contains("e l l s"));
+    }
+
+    #[test]
+    fn the_unlock_screen_keeps_its_geometry_while_working() {
+        theme::apply(theme::Theme::Dark);
+        let out = render_unlock(
+            &unlock_state(UnlockStage::Open, "", true),
+            std::time::Duration::from_millis(1000),
+        );
+        println!("{out}");
+        // 输入框不能因为"忙"就消失：圆角小盒子的上下边框都还得在
+        assert!(out.contains("主密码"));
+        assert!(out.contains("正在解密保险库"));
+        assert!(out.contains("已用 "), "要报真实耗时，不能只说请稍候");
+        assert!(out.contains('█') || out.contains('▓'), "条上得有走动的头");
+        assert!(out.contains("Enter 提交 · Tab 明文回显 · Esc 退出"));
+    }
+
+    #[test]
+    fn creating_a_vault_shows_the_step_and_the_strength_meter() {
+        theme::apply(theme::Theme::Dark);
+        let est = std::time::Duration::from_millis(1000);
+        // 13 位、带符号、没数字：够长这一格拿不到，四格里亮两格
+        let short = render_unlock(
+            &unlock_state(UnlockStage::CreateFirst, "horse-battery", false),
+            est,
+        );
+        // 15 位 + 数字 + 符号：四格全亮
+        let strong = render_unlock(
+            &unlock_state(UnlockStage::CreateFirst, "correct-horse-1", false),
+            est,
+        );
+        println!("{short}\n{strong}");
+        assert!(short.contains("设置主密码"));
+        assert!(short.contains("◉ 设置 · ○ 确认"), "第 1 步实心、第 2 步空心");
+        assert!(short.contains("强度 ▰▰▱▱"), "两格：{}", short);
+        assert!(strong.contains("强度 ▰▰▰▰"), "四格：{}", strong);
+        assert!(short.contains("Enter 下一步 · Tab 明文回显 · Esc 退出"));
+        // 第二步：步骤条要跟着换，文案也要说清这是确认
+        let confirm = render_unlock(&unlock_state(UnlockStage::CreateConfirm, "", false), est);
+        println!("{confirm}");
+        assert!(confirm.contains("确认主密码"));
+        assert!(confirm.contains("● 设置 · ◉ 确认"));
+        assert!(confirm.contains("Enter 确认 · Tab 明文回显 · Esc 退出"));
+    }
+
+    /// 终端被缩到放不下的时候：Layout 会把溢出的行压成零高，绝不能 panic、也不能画到框外。
+    #[test]
+    fn a_tiny_terminal_still_draws_the_unlock_box() {
+        theme::apply(theme::Theme::Dark);
+        let est = std::time::Duration::from_millis(1000);
+        for (cols, rows) in [(70, 20), (40, 12), (30, 8), (20, 5), (12, 3)] {
+            let out = render_unlock_at(&unlock_state(UnlockStage::Open, "abc", true), est, cols, rows);
+            if cols >= 30 {
+                assert!(out.contains('╭'), "{cols}x{rows}：连个框都没画出来\n{out}");
+                assert!(out.contains("已用 "), "{cols}x{rows}：忙的时候进度行整个没了\n{out}");
+            }
+        }
+    }
+
+    /// 条走的是"已用 / 估计"，而估计来自实测：所以它只能逼近，不能假装到顶。
+    #[test]
+    fn the_progress_bar_never_claims_to_be_finished() {
+        let est = std::time::Duration::from_millis(1000);
+        let line_at = |ms: u64| {
+            let since = std::time::Instant::now() - std::time::Duration::from_millis(ms);
+            let l = unlock_progress_line(UnlockStage::Open, Some(since), est, 46);
+            l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()
+        };
+        let early = line_at(200);
+        let late = line_at(900);
+        let overrun = line_at(5000);
+        let filled = |s: &str| s.matches('█').count();
+        assert!(filled(&early) < filled(&late), "走得越久该越长：{early} / {late}");
+        assert!(overrun.contains('░'), "跑过估计值也还剩轨道没填满");
+        assert!(overrun.contains("已用 5.0s"), "超时就照实说超了多久");
     }
 }

@@ -96,14 +96,14 @@ Reopen your terminal afterwards, and both `ells` and the short command `s` are r
 macOS / Linux:
 
 ```bash
-ELLS_VERSION=v0.2.1 curl -fsSL https://raw.githubusercontent.com/lg10/ells/main/install.sh | sh
+ELLS_VERSION=v0.2.2 curl -fsSL https://raw.githubusercontent.com/lg10/ells/main/install.sh | sh
 ELLS_INSTALL_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/lg10/ells/main/install.sh | sh
 ```
 
 Windows PowerShell:
 
 ```powershell
-$env:ELLS_VERSION="v0.2.1"; irm https://raw.githubusercontent.com/lg10/ells/main/install.ps1 | iex
+$env:ELLS_VERSION="v0.2.2"; irm https://raw.githubusercontent.com/lg10/ells/main/install.ps1 | iex
 $env:ELLS_INSTALL_DIR="$env:USERPROFILE\bin"; irm https://raw.githubusercontent.com/lg10/ells/main/install.ps1 | iex
 ```
 
@@ -152,7 +152,7 @@ cargo build --release -p ells
 
 </details>
 
-First run asks you to create a master password and a vault. Add a host with `a`, then press Enter to connect.
+First run asks you to create a master password and a vault (`Tab` toggles plaintext echo, and the bar under the field runs on this machine's measured key-derivation time). Add a host with `a`, then press Enter to connect.
 
 ### Usage
 

@@ -68,14 +68,14 @@ irm https://raw.githubusercontent.com/lg10/ells/main/install.ps1 | iex
 macOS / Linux：
 
 ```bash
-ELLS_VERSION=v0.2.1 curl -fsSL https://raw.githubusercontent.com/lg10/ells/main/install.sh | sh
+ELLS_VERSION=v0.2.2 curl -fsSL https://raw.githubusercontent.com/lg10/ells/main/install.sh | sh
 ELLS_INSTALL_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/lg10/ells/main/install.sh | sh
 ```
 
 Windows PowerShell：
 
 ```powershell
-$env:ELLS_VERSION='v0.2.1'; irm https://raw.githubusercontent.com/lg10/ells/main/install.ps1 | iex
+$env:ELLS_VERSION='v0.2.2'; irm https://raw.githubusercontent.com/lg10/ells/main/install.ps1 | iex
 $env:ELLS_INSTALL_DIR="$env:USERPROFILE\bin"; irm https://raw.githubusercontent.com/lg10/ells/main/install.ps1 | iex
 ```
 
@@ -124,7 +124,7 @@ cargo build --release -p ells
 
 </details>
 
-首次运行会引导你设置主密码并创建保险库；按 `a` 添加主机，回车即可连接。
+首次运行会引导你设置主密码并创建保险库（输入时按 `Tab` 切换明文回显；回车后输入框下面那条进度带按本机实测的派生耗时走）；按 `a` 添加主机，回车即可连接。
 
 ### 用法
 

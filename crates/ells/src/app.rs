@@ -49,6 +49,14 @@ pub enum UnlockStage {
     CreateConfirm,
 }
 
+/// 首次解锁没有实测值时的进度条基准（毫秒）。argon2id 这档参数在常见机器上就是 1 秒上下，
+/// 估错了也不要紧：条只走到 95% 就停住等真结果，多等的部分由"已用 X.X 秒"说清楚。
+pub const UNLOCK_ESTIMATE_FALLBACK_MS: u64 = 1000;
+/// 解锁期间界面重画的间隔：一秒十多帧，条头与耗时数字都在动。
+pub const UNLOCK_TICK_MS: u64 = 80;
+/// 估计值下限：机器太快时别拿一次 30ms 的实测去标定下一次，那样条会瞬间冲满。
+const UNLOCK_ESTIMATE_FLOOR_MS: u64 = 250;
+
 /// 设置弹窗里"修改主密码"的输入阶段。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MpStage {
@@ -63,6 +71,10 @@ pub struct UnlockState {
     pub stage: UnlockStage,
     pub pending_master: Option<String>,
     pub busy: bool,
+    /// 进入 `busy` 的时刻。进度条画的是"这次真的跑了多久"，没有这一步就没有依据。
+    pub busy_since: Option<std::time::Instant>,
+    /// Tab 切换的明文回显。密码永远只在屏幕上换画法，输入内容本身不动。
+    pub reveal: bool,
 }
 
 pub struct ListState {
@@ -975,6 +987,12 @@ impl UpdateState {
 pub struct App {
     pub screen: ScreenKind,
     pub unlock: UnlockState,
+    /// 本进程实测到的 argon2 派生耗时（第一次没有实测值就按 1 秒估）。
+    /// 解锁页那根进度条按"已用时间 / 这个估计"走，所以它表达的是"快好了"，
+    /// 不是一个假装精确的百分比。
+    pub unlock_estimate: std::time::Duration,
+    /// 解锁动画定时器的代号：忙起来才续期，忙一结束代号就对不上，定时自然作废。
+    unlock_tick: u64,
     pub list: ListState,
     pub form: FormState,
     /// 标签页。`active` 恒在 `0..slots.len()` 内：启动即有一个空标签，
@@ -1202,7 +1220,11 @@ impl App {
                 stage: UnlockStage::Open,
                 pending_master: None,
                 busy: false,
+                busy_since: None,
+                reveal: false,
             },
+            unlock_estimate: std::time::Duration::from_millis(UNLOCK_ESTIMATE_FALLBACK_MS),
+            unlock_tick: 0,
             list: ListState {
                 selected: 0,
                 folded: Vec::new(),
@@ -1306,7 +1328,7 @@ impl App {
             if let Some(master) = crate::settings::read_master_backup() {
                 let tx = app.event_tx.clone();
                 app.auto_master = Some(Zeroizing::new(master.clone()));
-                app.unlock.busy = true;
+                app.begin_unlock_busy();
                 let master = Zeroizing::new(master);
                 tokio::spawn(async move {
                     let res = tokio::task::spawn_blocking(move || vault::unlock_vault(&master))
@@ -1526,8 +1548,15 @@ impl App {
                         }
                     }
                 }
+                AppEvent::UnlockTick { seq } => {
+                    // 到点只为了重画一帧（循环每转一圈就 draw）。还在忙才续下一帧，
+                    // 忙一结束没人再布防，这条链自己就断了。
+                    if seq == self.unlock_tick && self.unlock.busy {
+                        self.arm_unlock_tick();
+                    }
+                }
                 AppEvent::VaultUnlocked(res) => {
-                    self.unlock.busy = false;
+                    self.end_unlock_busy();
                     match res {
                         Ok((v, k)) => {
                             self.vault = v;
@@ -1557,7 +1586,7 @@ impl App {
                     }
                 }
                 AppEvent::VaultCreated(res) => {
-                    self.unlock.busy = false;
+                    self.end_unlock_busy();
                     match res {
                         Ok(k) => {
                             self.vault = Vault::default();
@@ -3919,7 +3948,10 @@ impl App {
         match key.code {
             KeyCode::Esc => self.done = true,
             KeyCode::Char('c') if ctrl => self.done = true,
-            KeyCode::Char(c) if !ctrl && !self.unlock.busy => {
+            // Tab 只改回显方式，不动输入内容：看清自己敲了什么比"防偷看"更要紧，
+            // 而密码要不要显示由用户自己按出来的这个键决定，不落到任何设置里。
+            KeyCode::Tab => self.unlock.reveal = !self.unlock.reveal,
+            KeyCode::Char(c) if !ctrl && !c.is_control() && !self.unlock.busy => {
                 self.unlock.input.push(c);
                 self.unlock.error = None;
             }
@@ -3931,6 +3963,34 @@ impl App {
         }
     }
 
+    /// 进入忙态：记下起点并布防第一帧动画。三处入口（自动解锁 / 解锁 / 建库）共用。
+    fn begin_unlock_busy(&mut self) {
+        self.unlock.busy = true;
+        self.unlock.busy_since = Some(std::time::Instant::now());
+        self.arm_unlock_tick();
+    }
+
+    /// 忙态结束：这次的真实耗时留给下一次当基准（太快就按下限，免得条一帧就冲满）。
+    fn end_unlock_busy(&mut self) {
+        self.unlock.busy = false;
+        if let Some(since) = self.unlock.busy_since.take() {
+            let spent = since.elapsed().as_millis() as u64;
+            self.unlock_estimate = std::time::Duration::from_millis(spent.max(UNLOCK_ESTIMATE_FLOOR_MS));
+        }
+    }
+
+    /// 一次性定时器 + 代号作废，与会话页指标、自动重连同一套路：全局仍然没有常驻 tick，
+    /// 只有解锁在忙的那一两秒里才有帧。
+    fn arm_unlock_tick(&mut self) {
+        self.unlock_tick += 1;
+        let seq = self.unlock_tick;
+        let tx = self.event_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(UNLOCK_TICK_MS)).await;
+            let _ = tx.send(AppEvent::UnlockTick { seq });
+        });
+    }
+
     fn unlock_submit(&mut self) {
         if self.unlock.busy {
             return;
@@ -3938,7 +3998,7 @@ impl App {
         let input = self.unlock.input.clone();
         match self.unlock.stage {
             UnlockStage::Open => {
-                self.unlock.busy = true;
+                self.begin_unlock_busy();
                 let tx = self.event_tx.clone();
                 let input = Zeroizing::new(input);
                 tokio::spawn(async move {
@@ -3963,7 +4023,7 @@ impl App {
                 // 比对完就抹掉暂存的这份明文：后面用不上了
                 self.unlock.pending_master = None;
                 if matched {
-                    self.unlock.busy = true;
+                    self.begin_unlock_busy();
                     let tx = self.event_tx.clone();
                     let input = Zeroizing::new(input);
                     tokio::spawn(async move {
