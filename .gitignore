@@ -5,6 +5,10 @@
 tests/fake_sshd.log
 tests/sftp_root/
 tests/test_host_key
+tests/__pycache__/
+
+# 本地临时稿（草稿、抽取的发布说明、统计脚本），不进版本库
+/tmp/
 
 # 通用
 **/*.rs.bk

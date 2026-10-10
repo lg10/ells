@@ -17,6 +17,7 @@ fn test_host() -> Host {
         password: Some("test123".into()),
         jump: None,
         note: None,
+        ..Default::default()
     }
 }
 

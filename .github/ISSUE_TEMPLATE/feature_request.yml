@@ -57,7 +57,7 @@ body:
     attributes:
       label: ells 版本 / Version
       description: 运行 `ells --version` 后原样粘贴。
-      placeholder: "ells 0.1.9"
+      placeholder: "ells 0.2.0"
     validations:
       required: true
 

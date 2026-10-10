@@ -168,6 +168,44 @@ pub async fn mkdir(sftp: &SftpSession, path: &str) -> Result<()> {
         .with_context(|| format!("无法创建远端目录 {path}"))
 }
 
+/// 把用户写的八进制权限串解析成 `chmod` 要的数值。
+///
+/// 界面里手打、CLI 里参数、脚本里拼字符串都会走到这里，所以规则只有一份：
+/// `644` / `0644` / `0o644` / `0` / `0000` 都合法；`7778`、`abc`、空串是错的。
+/// 特别留意全零：`trim_start_matches('0')` 会把它削成空串，那是一次合法的
+/// `chmod 000`，不能当成"没填"。
+pub fn parse_mode(text: &str) -> Option<u32> {
+    let trimmed = text.trim();
+    let cleaned = trimmed.strip_prefix("0o").unwrap_or(trimmed);
+    if cleaned.is_empty() || !cleaned.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    // 全零会被 trim_start_matches('0') 削成空串：那是合法的 0000，不是"没填"
+    let bits = if cleaned.chars().all(|c| c == '0') {
+        0
+    } else {
+        u32::from_str_radix(cleaned.trim_start_matches('0'), 8).ok()?
+    };
+    (bits <= 0o7777).then_some(bits)
+}
+
+/// 改远端权限（八进制数字，如 `0o600`）。
+///
+/// 只送权限位：属主、大小、时间全部留 `None`，SFTP 的 `setstat` 对缺省字段不动，
+/// 一次 chmod 不该顺手把文件改成别人的或把 mtime 抹平。
+pub async fn chmod(sftp: &SftpSession, path: &str, mode: u32) -> Result<()> {
+    if mode > 0o7777 {
+        bail!("权限超出 07777：{mode:o}");
+    }
+    let attrs = russh_sftp::protocol::FileAttributes {
+        permissions: Some(mode),
+        ..Default::default()
+    };
+    sftp.set_metadata(path, attrs)
+        .await
+        .with_context(|| format!("无法修改 {path} 的权限"))
+}
+
 pub async fn rename(sftp: &SftpSession, from: &str, to: &str) -> Result<()> {
     sftp.rename(from, to)
         .await
@@ -517,6 +555,29 @@ pub fn local_exists(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn modes_parse_the_ways_people_type_them() {
+        assert_eq!(parse_mode("644"), Some(0o644));
+        assert_eq!(parse_mode(" 0644 "), Some(0o644));
+        assert_eq!(parse_mode("0o600"), Some(0o600));
+        assert_eq!(parse_mode("755"), Some(0o755));
+        assert_eq!(parse_mode("4755"), Some(0o4755), "setuid 位要留得住");
+    }
+
+    #[test]
+    fn all_zeros_is_a_real_mode_not_an_empty_field() {
+        assert_eq!(parse_mode("0"), Some(0));
+        assert_eq!(parse_mode("000"), Some(0));
+        assert_eq!(parse_mode("0000"), Some(0));
+    }
+
+    #[test]
+    fn nonsense_modes_are_rejected() {
+        for bad in ["", "  ", "abc", "64x", "7778", "0o", "6.4", "-1", "177777"] {
+            assert_eq!(parse_mode(bad), None, "{bad} 不该被接受");
+        }
+    }
 
     #[test]
     fn join_and_parent_roundtrip() {

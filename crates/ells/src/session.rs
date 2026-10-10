@@ -20,6 +20,9 @@ pub struct SessionState {
     pub emu: Emulator,
     pub mode: TermMode,
     header_rows: u16,
+    /// 底部指标行占用的行数（0 = 那一行已经让给终端：设置里关了，或这台机器采不到）。
+    /// 必须与 `ui::draw_session` 真的画几行保持同步 —— 对不上就正好把远端最后一行裁掉。
+    footer_rows: u16,
     /// 向上回看的行数（0=实时底部），滚轮驱动，历史来自 vt100 scrollback。
     pub scroll: usize,
     /// 鼠标拖选：锚点与当前点（终端绝对坐标 col,row）。
@@ -36,14 +39,22 @@ pub struct SessionState {
 pub enum SessionAction {
     Keep,
     Detach,
+    /// 整屏重绘：内嵌仿真器这边已经复位，界面那边还要作废 ratatui 的差分基线。
+    Redraw,
 }
 
 impl SessionState {
-    pub fn new(label: String, session: RemoteSession, rows: u16, cols: u16) -> Self {
-        // 与会话页顶部标题栏的行数保持一致（见 ui::HEADER_ROWS）
+    pub fn new(
+        label: String,
+        session: RemoteSession,
+        rows: u16,
+        cols: u16,
+        footer_rows: u16,
+    ) -> Self {
+        // 与会话页顶部标题栏/底部指标栏的行数保持一致（见 ui::HEADER_ROWS）
         let header_rows = crate::ui::HEADER_ROWS;
         let cols = cols.max(20);
-        let term_rows = rows.saturating_sub(header_rows).max(1);
+        let term_rows = rows.saturating_sub(header_rows + footer_rows).max(1);
         let emu = Emulator::new(term_rows, cols);
         // PTY was requested with full terminal size at connect time; correct
         // it to the embedded viewport now that chrome is known.
@@ -54,12 +65,28 @@ impl SessionState {
             emu,
             mode: TermMode::Embedded,
             header_rows,
+            footer_rows,
             scroll: 0,
             selection: None,
             zmodem: Watcher::new(),
             intercepting: false,
             abort_retries: 0,
         }
+    }
+
+    /// 底部指标行的行数变了（判定这台采不到、或设置里开关了）：内嵌视口要跟着缩，
+    /// 且要发两次 window-change —— 全屏程序（htop/vim）只靠 SIGWINCH 自绘。
+    /// 直通模式整块屏幕本来就是远端的，改这个数没有任何效果。
+    pub fn set_footer_rows(&mut self, footer_rows: u16) {
+        if self.footer_rows == footer_rows {
+            return;
+        }
+        self.footer_rows = footer_rows;
+        if self.mode != TermMode::Embedded {
+            return;
+        }
+        let (cols, rows) = term_size();
+        self.handle_resize(cols, rows);
     }
 
     pub fn handle_key(&mut self, key: &KeyEvent, binds: &KeyBinds) -> SessionAction {
@@ -78,7 +105,7 @@ impl SessionState {
         }
         if binds.matches(Action::Redraw, key) {
             self.request_full_redraw();
-            return SessionAction::Keep;
+            return SessionAction::Redraw;
         }
         if let Some(bytes) = key_to_bytes(key) {
             self.feed_input(bytes);
@@ -189,7 +216,7 @@ impl SessionState {
                 TermMode::Passthrough
             }
             TermMode::Passthrough => {
-                let term_rows = rows.saturating_sub(self.header_rows).max(1);
+                let term_rows = rows.saturating_sub(self.header_rows + self.footer_rows).max(1);
                 self.emu.resize(term_rows, cols);
                 // Two window-changes: apps repaint on SIGWINCH even when the
                 // final size matches what the embedded viewport already has.
@@ -213,7 +240,7 @@ impl SessionState {
         let cols = cols.max(20);
         match self.mode {
             TermMode::Embedded => {
-                let term_rows = rows.saturating_sub(self.header_rows).max(1);
+                let term_rows = rows.saturating_sub(self.header_rows + self.footer_rows).max(1);
                 self.emu.resize(term_rows, cols);
                 self.session.resize(cols, term_rows);
             }

@@ -1,7 +1,7 @@
 use crossterm::event::{Event as CrosstermEvent, KeyEvent, MouseEventKind};
 use ells_core::ssh::{RemoteEvent, RemoteSession};
 use ells_core::vault::VaultKey;
-use ells_core::{Host, HostKeyPrompt, Vault};
+use ells_core::{Host, HostKeyPrompt, Probe, Vault, tunnel::TunnelEvent};
 use ells_transfer::{FileEntry, Progress};
 use futures::StreamExt;
 use tokio::sync::mpsc;
@@ -35,10 +35,35 @@ pub enum AppEvent {
     },
     /// 用户在"连接已断开"弹窗里点了重连。
     Reconnect { slot: u32, host: Host },
+    /// 自动重连定时器到点。`seq` 是这一路的代号：期间用户 Ctrl-]、关标签或
+    /// 自己重连过，代号就对不上，这条定时就作废（同 `ZmodemClear`）。
+    AutoReconnect {
+        slot: u32,
+        host: Host,
+        attempt: u32,
+        seq: u64,
+    },
+    /// 会话页底部那排指标：5 秒定时器到点（磁盘那一路每 12 轮才真问一次）。同样带 `seq` —— 断开、关标签、
+    /// 或设置里关掉指标都会顶掉代号，这条定时因此作废（不会出现"你以为停了、
+    /// 它还在每条连接上开采集通道"）。
+    MetricsTick { slot: u32, seq: u64 },
+    /// 采集通道回来了。`Err` 是通道级失败（开不了通道、执行失败、超时），
+    /// `Ok` 里哪项是 `None` 表示这台机器没给这项数据。
+    MetricsProbe {
+        slot: u32,
+        seq: u64,
+        res: std::result::Result<Probe, String>,
+    },
     /// 传输目标已存在，等用户选择覆盖 / 改名 / 取消。
     Conflict { slot: u32, prompt: ConflictPrompt },
     /// 用户在导入确认框里点了"导入"（空列表 = 取消）。
     ImportHosts(Vec<Host>),
+    /// 用户在导出确认框里点了"导出"（列表页 `x`）。同样不带 slot：
+    /// 写的是本机 `~/.ells` 下的一个文件，与哪个标签无关。
+    ExportSshConfig,
+    /// 隧道状态变化（连接中 / 就绪 / 重连退避 / 失败 / 已停止）。不属于任何标签：
+    /// 一台主机一条隧道，跨标签、跨会话存活，所以不带 slot。
+    Tunnel(TunnelEvent),
     /// Result of the native file dialog: path selected for a form field
     /// (None when the dialog was cancelled).
     PickedFile { field: usize, path: Option<String> },

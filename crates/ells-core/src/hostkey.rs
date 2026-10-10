@@ -4,7 +4,6 @@
 //! 并只读地参考 `~/.ssh/known_hosts`：用户已经用 OpenSSH 信任过的机器
 //! 不会在 ells 里再问一次。`~/.ssh/known_hosts` 永不被 ells 修改。
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use russh::keys::{HashAlg, PublicKey};
@@ -49,19 +48,52 @@ pub enum KeyTrust {
 #[derive(Clone)]
 pub struct HostKeyPolicy {
     prompts: mpsc::UnboundedSender<HostKeyPrompt>,
+    /// 待确认时问谁：界面弹窗、终端一问，还是根本没法问。
+    ask: Ask,
     accept_new: bool,
     trust_all: bool,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Ask {
+    /// TUI：把问题发到事件环上的弹窗通道。
+    Channel,
+    /// 无头 CLI：直接在终端上问一句 y/N（stdin 是 tty 时才可能）。
+    Terminal,
+    /// 管道里跑、没人能回答：只能拒绝，并在日志里说清原因。
+    Never,
+}
+
 impl HostKeyPolicy {
     pub fn new(prompts: mpsc::UnboundedSender<HostKeyPrompt>, accept_new: bool) -> Self {
-        Self { prompts, accept_new, trust_all: false }
+        Self {
+            prompts,
+            ask: Ask::Channel,
+            accept_new,
+            trust_all: false,
+        }
+    }
+
+    /// 无头 CLI 用：`accept_new`（`-y`）时首次见到直接记录，否则在终端问一句。
+    /// stdin 不是 tty（脚本里跑、输出被重定向）就绝不开口——那会读走用户的管道数据。
+    pub fn headless(accept_new: bool) -> Self {
+        Self {
+            prompts: mpsc::unbounded_channel().0,
+            ask: if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+                Ask::Terminal
+            } else {
+                Ask::Never
+            },
+            accept_new,
+            trust_all: false,
+        }
     }
 
     /// 全部放行：既不询问也不落盘。仅供冒烟测试连接本地 fake_sshd 使用。
     pub fn trust_all() -> Self {
         Self {
             prompts: mpsc::unbounded_channel().0,
+            ask: Ask::Never,
             accept_new: false,
             trust_all: true,
         }
@@ -82,21 +114,44 @@ impl HostKeyPolicy {
             }
             return true;
         }
-        let (tx, rx) = oneshot::channel();
-        let prompt = HostKeyPrompt {
-            host: host.to_string(),
-            port,
-            algorithm: key.algorithm().as_str().to_string(),
-            fingerprint: key.fingerprint(HashAlg::Sha256).to_string(),
-            trust,
-            responder: tx,
+        let fingerprint = key.fingerprint(HashAlg::Sha256).to_string();
+        let algorithm = key.algorithm().as_str().to_string();
+        let accepted = match self.ask {
+            Ask::Terminal => {
+                ask_terminal(host, port, &algorithm, &fingerprint, trust).await
+            }
+            Ask::Never => {
+                // 管道里跑、没人能回答：把原因和指纹打到 stderr，用户至少能拿它去核对
+                eprintln!(
+                    "拒绝连接 {host}:{port}：{}（{algorithm} {fingerprint}）。\
+                     标准输入不是终端，问不了你；确认这台机器可信可加 --yes（只放行首次，密钥变更仍然拒绝）。",
+                    if trust == KeyTrust::Changed {
+                        "主机密钥与记录不一致"
+                    } else {
+                        "首次见到这台主机"
+                    }
+                );
+                tracing::warn!("无法确认主机密钥（没有界面也没有终端），拒绝连接");
+                return false;
+            }
+            Ask::Channel => {
+                let (tx, rx) = oneshot::channel();
+                let prompt = HostKeyPrompt {
+                    host: host.to_string(),
+                    port,
+                    algorithm,
+                    fingerprint,
+                    trust,
+                    responder: tx,
+                };
+                if self.prompts.send(prompt).is_err() {
+                    // UI 已退出：宁可断开也不盲信
+                    tracing::warn!("没有可用的主机密钥确认界面，拒绝连接");
+                    return false;
+                }
+                rx.await.unwrap_or(false)
+            }
         };
-        if self.prompts.send(prompt).is_err() {
-            // UI 已退出：宁可断开也不盲信
-            tracing::warn!("没有可用的主机密钥确认界面，拒绝连接");
-            return false;
-        }
-        let accepted = rx.await.unwrap_or(false);
         if accepted {
             if let Err(err) = replace(host, port, key) {
                 tracing::warn!(%err, "更新 known_hosts 失败");
@@ -106,9 +161,106 @@ impl HostKeyPolicy {
     }
 }
 
+/// 终端上的那句 y/N。读的是真实的 stdin，所以放到阻塞线程里，不卡住运行时。
+async fn ask_terminal(
+    host: &str,
+    port: u16,
+    algorithm: &str,
+    fingerprint: &str,
+    trust: KeyTrust,
+) -> bool {
+    use std::io::{BufRead, Write};
+    let changed = trust == KeyTrust::Changed;
+    let text = if changed {
+        format!(
+            "警告：{host}:{port} 的主机密钥与记录不一致（{algorithm} {fingerprint}）。\
+             可能是服务器重装，也可能是中间人攻击。\n确认无误后才输入 yes 更新记录 [输入 yes 接受 / 其它拒绝]：",
+        )
+    } else {
+        format!(
+            "首次连接 {host}:{port}（{algorithm} {fingerprint}）。\
+             请与云控制台或管理员核对指纹。接受并记录？[输入 yes 接受 / 其它拒绝]：",
+        )
+    };
+    let answer = tokio::task::spawn_blocking(move || {
+        print!("{text}");
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        if std::io::stdin().lock().read_line(&mut line).is_err() {
+            return false;
+        }
+        matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+    })
+    .await
+    .unwrap_or(false);
+    if !answer {
+        eprintln!("已拒绝该主机密钥，连接中止。");
+    }
+    answer
+}
+
 /// ells 自己的 known_hosts 路径。
 pub fn our_known_hosts() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".ells").join("known_hosts"))
+}
+
+/// 管理界面里的一条记录。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KnownEntry {
+    /// 主机字段原文（可能是 `a,b` 或 `[host]:2222`），删除时按它精确匹配
+    pub hosts: String,
+    pub algorithm: String,
+    /// `SHA256:…`
+    pub fingerprint: String,
+    /// 能否被 ells 删除：`~/.ssh/known_hosts` 只读，不是 ells 的东西
+    pub writable: bool,
+}
+
+/// 列出两个文件里的全部记录（ells 的在前）。解析不出密钥的行不显示——
+/// 界面里删不掉的东西只会让人以为功能坏了。
+pub fn list_entries() -> Vec<KnownEntry> {
+    let ours = our_known_hosts();
+    let mut out = Vec::new();
+    for path in search_paths() {
+        let writable = Some(path.clone()) == ours;
+        let Ok(text) = std::fs::read_to_string(&path) else { continue };
+        for line in text.lines() {
+            let Some(record) = parse_line(line) else { continue };
+            let Some(key) = record.key else { continue };
+            out.push(KnownEntry {
+                hosts: record.hosts.to_string(),
+                algorithm: record.algorithm,
+                fingerprint: key.fingerprint(HashAlg::Sha256).to_string(),
+                writable,
+            });
+        }
+    }
+    out
+}
+
+/// 删除 ells 记录里主机字段完全等于 `hosts`、算法相同的那一行。
+///
+/// 要求 `hosts` 精确相等（而不是"包含该主机"）：`a,b` 这种共享一行有两个主机，
+/// 按包含删除会连带删掉别人不想删的那条。
+pub fn delete_entry(hosts: &str, algorithm: &str) -> anyhow::Result<()> {
+    let path = our_known_hosts().ok_or_else(|| anyhow::anyhow!("无法定位用户主目录"))?;
+    delete_entry_at(&path, hosts, algorithm)
+}
+
+fn delete_entry_at(path: &Path, hosts: &str, algorithm: &str) -> anyhow::Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let kept: String = text
+        .lines()
+        .filter(|l| match parse_line(l) {
+            Some(record) => !(record.hosts == hosts && record.algorithm == algorithm),
+            None => true,
+        })
+        .map(|l| format!("{l}\n"))
+        .collect();
+    write_secret_file(path, kept.as_bytes())
 }
 
 /// 查询顺序：ells 的记录优先，其次 OpenSSH 的（只读）。
@@ -266,22 +418,7 @@ fn append_line(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
 }
 
 fn write_secret_file(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut f = opts.open(path)?;
-    f.write_all(bytes)?;
-    f.flush()?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-    }
-    Ok(())
+    crate::secure_fs::write_atomic(path, bytes)
 }
 
 #[cfg(test)]
@@ -377,5 +514,48 @@ mod tests {
         assert!(record.key.is_none());
         assert!(parse_line("# 注释").is_none());
         assert!(parse_line("只有两个字段").is_none());
+    }
+
+    /// 管理界面删一行：只删同一主机字段 + 同一算法的那条，共享一行里的别的算法留着。
+    #[test]
+    fn delete_entry_removes_exactly_one_rule() {
+        let dir = std::env::temp_dir().join(format!("ells-kh-del-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("known_hosts");
+        record_at(&path, "h1", 22, &sample_key(1)).unwrap();
+        record_at(&path, "h2", 22, &sample_key(2)).unwrap();
+        let line = format!(
+            "h1 {} {}\n",
+            "ssh-rsa", "AAAAB3NzaC1yc2EAAAADAQABAAABgQDfake=="
+        );
+        std::fs::write(&path, format!("{}{}", std::fs::read_to_string(&path).unwrap(), line))
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 3);
+
+        delete_entry_at(&path, "h1", "ssh-ed25519").unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.lines().count(), 2, "只该少一行: {text}");
+        assert!(!text.lines().any(|l| l.starts_with("h1 ssh-ed25519")), "h1 的 ed25519 应被删除: {text}");
+        // 同主机的 rsa 记录与另一台主机都还在
+        assert!(text.contains("h1 ssh-rsa"));
+        assert!(text.contains("h2 ssh-ed25519"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn known_entry_fingerprint_matches_the_key() {
+        let key = sample_key(3);
+        let dir = std::env::temp_dir().join(format!("ells-kh-fp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("known_hosts");
+        record_at(&path, "h1", 2222, &key).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let record = parse_line(text.lines().next().unwrap()).unwrap();
+        let fingerprint = record.key.unwrap().fingerprint(HashAlg::Sha256).to_string();
+        assert_eq!(fingerprint, key.fingerprint(HashAlg::Sha256).to_string());
+        assert_eq!(record.hosts, "[h1]:2222");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -5,15 +5,17 @@ use crossterm::event::{
 use crossterm::terminal::enable_raw_mode;
 use crossterm::execute;
 use crossterm::terminal::EnterAlternateScreen;
-use ells_core::host::{Auth, Host};
+use ells_core::host::{Auth, Forward, Host};
 use ells_core::ssh::RemoteSession;
 use ells_core::vault::{self, VaultKey};
-use ells_core::{HostKeyPolicy, HostKeyPrompt, KeyTrust, Vault};
+use ells_core::{HostKeyPolicy, HostKeyPrompt, KeyTrust, PortMap, TunnelEvent, TunnelManager, TunnelState, Vault, audit, filter, hostkey, sessionlog};
+use ells_core::audit::AuditKind;
 use ells_transfer::{self, Cancel, FileEntry, Progress};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
 use ratatui::Terminal;
 use russh_sftp::client::SftpSession;
+use std::collections::HashMap;
 use std::io::stdout;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -65,6 +67,163 @@ pub struct UnlockState {
 
 pub struct ListState {
     pub selected: usize,
+    /// 折叠起来的分组名（会话内状态，不落盘：折叠是"这会儿不想看"，不是配置）。
+    pub folded: Vec<String>,
+}
+
+/// 「折叠全部」折的是哪些段：保险库里出现过的分组名，去重后按分组视图的先后排。
+pub(crate) fn foldable_groups(hosts: &[Host]) -> Vec<String> {
+    let order = order_hosts(hosts, "", ListSort::Section);
+    let mut out: Vec<String> = Vec::new();
+    for &i in &order {
+        let g = group_of(&hosts[i]);
+        if !out.contains(&g) {
+            out.push(g);
+        }
+    }
+    out
+}
+
+/// 列表排序方式：列表页 `o` 循环，选中的那个写进 `settings.ini` 的 `list_sort=`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListSort {
+    /// 分组 → 组内收藏 → 组内最近使用 → 别名
+    Grouped,
+    /// 最近使用优先，不看分组
+    Recent,
+    /// 纯按别名排
+    Alias,
+    /// 分组 → 别名（组织架构视角，忽略收藏与最近使用）
+    Section,
+}
+
+impl ListSort {
+    const ALL: [ListSort; 4] = [ListSort::Grouped, ListSort::Recent, ListSort::Alias, ListSort::Section];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Grouped => "默认",
+            Self::Recent => "最近使用",
+            Self::Alias => "别名",
+            Self::Section => "分组",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        let i = Self::ALL.iter().position(|&m| m == self).unwrap_or(0);
+        Self::ALL[(i + 1) % Self::ALL.len()]
+    }
+
+    /// 只有真的按分组排的两种模式才画段头，折叠也随着段头一起生效。
+    pub fn groups_ordered(self) -> bool {
+        matches!(self, Self::Grouped | Self::Section)
+    }
+
+    pub fn ini_value(self) -> &'static str {
+        match self {
+            Self::Grouped => "grouped",
+            Self::Recent => "recent",
+            Self::Alias => "alias",
+            Self::Section => "section",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|m| m.ini_value() == text.trim())
+    }
+}
+
+/// 列表页的一行。段头只是装饰，光标永远落在 `Host` 行上，所以 `list.selected`
+/// 数的是主机而不是行——绘制时用 `selected_row()` 换算。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ListRow {
+    Header { group: String, count: usize, folded: bool },
+    Host(usize),
+}
+
+/// 主机所属分组的段头名：`None`、空串、纯空格都归到「未分组」，与排序键一致。
+pub(crate) fn group_of(host: &Host) -> String {
+    match host.group.as_deref().map(str::trim) {
+        Some(g) if !g.is_empty() => g.to_string(),
+        _ => filter::group_label(None).to_string(),
+    }
+}
+
+/// 排序 + 过滤后的 `hosts` 下标序列。**包含**被折叠分组里的主机：段头要写出
+/// 「组名 (n)」的 n，而且折叠掉的段还得留在列表上。
+pub(crate) fn order_hosts(hosts: &[Host], query: &str, sort: ListSort) -> Vec<usize> {
+    let query = query.trim();
+    let mut idx: Vec<usize> = if query.is_empty() {
+        (0..hosts.len()).collect()
+    } else {
+        (0..hosts.len())
+            .filter(|&i| filter::fuzzy_score(query, &filter::haystack(&hosts[i])).is_some())
+            .collect()
+    };
+    idx.sort_by(|&a, &b| {
+        let (ha, hb) = (&hosts[a], &hosts[b]);
+        if !query.is_empty() {
+            let sa = filter::fuzzy_score(query, &filter::haystack(ha)).unwrap_or(0);
+            let sb = filter::fuzzy_score(query, &filter::haystack(hb)).unwrap_or(0);
+            return sb.cmp(&sa).then_with(|| ha.alias.cmp(&hb.alias));
+        }
+        match sort {
+            ListSort::Grouped => group_rank(ha.group.as_deref())
+                .cmp(&group_rank(hb.group.as_deref()))
+                .then_with(|| hb.favorite.cmp(&ha.favorite))
+                .then_with(|| hb.last_connected.cmp(&ha.last_connected))
+                .then_with(|| ha.alias.cmp(&hb.alias)),
+            ListSort::Recent => ha
+                .last_connected
+                .cmp(&hb.last_connected)
+                .reverse()
+                .then_with(|| ha.alias.cmp(&hb.alias)),
+            ListSort::Alias => ha.alias.cmp(&hb.alias),
+            ListSort::Section => group_rank(ha.group.as_deref())
+                .cmp(&group_rank(hb.group.as_deref()))
+                .then_with(|| ha.alias.cmp(&hb.alias)),
+        }
+    });
+    idx
+}
+
+/// 把排好序的主机下标铺成要绘制的行，顺带算出"没被折叠"的那份主机序列。
+/// 两个返回值必须同源：段头按分组连号插入，可见主机又要跳过折叠段，分开算
+/// 迟早会对不上，光标就会指到隔壁组去。
+pub(crate) fn build_list_rows(
+    hosts: &[Host],
+    order: &[usize],
+    headers: bool,
+    folded: &[String],
+) -> (Vec<ListRow>, Vec<usize>) {
+    if !headers {
+        let visible: Vec<usize> = order.to_vec();
+        return (visible.iter().copied().map(ListRow::Host).collect(), visible);
+    }
+    let mut rows: Vec<ListRow> = Vec::with_capacity(order.len() + 4);
+    let mut visible: Vec<usize> = Vec::with_capacity(order.len());
+    let mut current: Option<String> = None;
+    let mut header_at = 0usize;
+    for &i in order {
+        let g = group_of(&hosts[i]);
+        let is_folded = folded.iter().any(|f| f == &g);
+        if current.as_deref() != Some(g.as_str()) {
+            current = Some(g.clone());
+            header_at = rows.len();
+            rows.push(ListRow::Header { group: g, count: 0, folded: is_folded });
+        }
+        // 计数连折叠起来的那些一起算：段头写「生产 (3)」时被藏的 3 台也得在里面，
+        // 否则展开前后数字会变，用户以为丢了两台。
+        if let ListRow::Header { count, .. } = &mut rows[header_at] {
+            *count += 1;
+        }
+        if is_folded {
+            continue;
+        }
+        rows.push(ListRow::Host(i));
+        visible.push(i);
+    }
+    (rows, visible)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,6 +245,9 @@ pub enum FieldRole {
     KeyPath,
     KeyPass,
     Jump,
+    Group,
+    Tags,
+    Forwards,
 }
 
 pub struct Field {
@@ -93,6 +255,212 @@ pub struct Field {
     pub label: &'static str,
     pub value: String,
     pub kind: FieldKind,
+}
+
+impl FieldRole {
+    /// 这三项决定"连不连得上"，缺一个都存不下去——表单里用 ＊ 标出来，
+    /// 提交失败时也只点这几项的名，不再报一句笼统的"必填项"。
+    pub(crate) fn required(self) -> bool {
+        matches!(self, Self::Alias | Self::Hostname | Self::User)
+    }
+}
+
+/// 已有分组及各组主机数，按分组视图里的先后排。表单敲分组名时当提示用：
+/// "生产"、"生产 "、"prod" 混着写，列表页就会裂成三个段头。
+pub(crate) fn group_counts(hosts: &[Host]) -> Vec<(String, usize)> {
+    foldable_groups(hosts)
+        .into_iter()
+        .map(|g| {
+            let n = hosts.iter().filter(|h| group_of(h) == g).count();
+            (g, n)
+        })
+        .collect()
+}
+
+/// 规则表格的一行（`t` 面板按 Enter 进来编辑的就是它）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleRow {
+    /// `L` / `D` / `R`，大写存着显示用；输入不分大小写。
+    pub kind: String,
+    pub bind: String,
+    /// 留空（或写 `0`）= 本地口交给系统分配，这样两台主机想要同一个口就不会互挤。
+    pub listen: String,
+    pub dest_host: String,
+    pub dest_port: String,
+}
+
+/// 表格的列名，`RuleRow` 的下标语义以这里的顺序为准。
+pub const RULE_COLS: [&str; 5] = ["类型", "绑定", "本地端口", "目标主机", "目标端口"];
+
+impl RuleRow {
+    pub fn empty() -> Self {
+        Self { kind: "L".into(), bind: String::new(), listen: String::new(), dest_host: String::new(), dest_port: String::new() }
+    }
+
+    pub fn cell(&self, col: usize) -> &str {
+        match col {
+            0 => &self.kind,
+            1 => &self.bind,
+            2 => &self.listen,
+            3 => &self.dest_host,
+            _ => &self.dest_port,
+        }
+    }
+
+    fn set_cell(&mut self, col: usize, v: String) {
+        match col {
+            0 => self.kind = v,
+            1 => self.bind = v,
+            2 => self.listen = v,
+            3 => self.dest_host = v,
+            _ => self.dest_port = v,
+        }
+    }
+
+    /// 这行的本地口是否自动分配。
+    fn auto(&self) -> bool {
+        let t = self.listen.trim();
+        t.is_empty() || t == "0"
+    }
+
+    /// 它占住的固定本地口；自动口返回 `None`，永远不参与撞口判定。
+    fn port(&self) -> Option<u16> {
+        if self.auto() { None } else { self.listen.trim().parse().ok() }
+    }
+
+    /// 这一行是不是还没开始填。`kind` 默认就是 `L`，只按了 `Ctrl-N` 的行不算填过东西——
+    /// 把它当"填了一半"拦下来，用户会看见一条自己根本没写过的规则在报错。
+    fn blank(&self) -> bool {
+        let kind = self.kind.trim();
+        (kind.is_empty() || kind == "L")
+            && [self.bind.as_str(), self.listen.as_str(), self.dest_host.as_str(), self.dest_port.as_str()]
+                .iter()
+                .all(|s| s.trim().is_empty())
+    }
+}
+
+/// 主机的规则 → 表格行。`-R` 也照原样列出：它存得进来（`~/.ssh/config` 会带），
+/// 只是起不来，编辑器不该顺手把它抹掉。
+pub(crate) fn rules_from_forwards(forwards: &[Forward]) -> Vec<RuleRow> {
+    forwards
+        .iter()
+        .map(|f| RuleRow {
+            kind: match f {
+                Forward::Local { .. } => "L".into(),
+                Forward::Remote { .. } => "R".into(),
+                Forward::Dynamic { .. } => "D".into(),
+            },
+            bind: f.bind().unwrap_or_default().to_string(),
+            listen: listen_text(f),
+            dest_host: match f {
+                Forward::Local { dest_host, .. } | Forward::Remote { dest_host, .. } => dest_host.clone(),
+                Forward::Dynamic { .. } => String::new(),
+            },
+            dest_port: match f {
+                Forward::Local { dest_port, .. } | Forward::Remote { dest_port, .. } => dest_port.to_string(),
+                Forward::Dynamic { .. } => String::new(),
+            },
+        })
+        .collect()
+}
+
+/// 端口格显示文本：自动口显示成空格，界面上再补一句"自动"。
+/// `Remote` 没有本地口，但它的服务器侧端口同样要能显示和编辑。
+fn listen_text(f: &Forward) -> String {
+    if f.auto_port() {
+        return String::new();
+    }
+    match f {
+        Forward::Local { listen_port, .. }
+        | Forward::Remote { listen_port, .. }
+        | Forward::Dynamic { listen_port, .. } => listen_port.to_string(),
+    }
+}
+
+/// 表格行 → 规则。逐行给原因，且只给有问题的行号：整表拦成一句"格式不对"没人改得动。
+///
+/// 全空的行直接丢掉（多半是刚按了 `n` 还没填）；填了一半的必须报错，静默丢规则比不保存更糟。
+pub(crate) fn rules_to_forwards(rows: &[RuleRow]) -> (Vec<Forward>, Vec<String>) {
+    let mut ok = Vec::new();
+    let mut bad = Vec::new();
+    for (i, r) in rows.iter().enumerate() {
+        if r.blank() {
+            continue;
+        }
+        let n = i + 1;
+        let kind = r.kind.trim().to_ascii_uppercase();
+        if !matches!(kind.as_str(), "L" | "D" | "R") {
+            bad.push(format!("第 {n} 行：类型只能是 L、D 或 R"));
+            continue;
+        }
+        let listen = match r.listen.trim() {
+            "" | "0" => 0,
+            other => match other.parse::<u16>() {
+                Ok(p) => p,
+                Err(_) => {
+                    bad.push(format!("第 {n} 行：本地端口要么留空（自动分配），要么写成数字"));
+                    continue;
+                }
+            },
+        };
+        let bind = (!r.bind.trim().is_empty()).then(|| r.bind.trim().to_string());
+        let dest_host = r.dest_host.trim().to_string();
+        let dest_port = match r.dest_port.trim() {
+            "" => None,
+            other => match other.parse::<u16>() {
+                Ok(p) => Some(p),
+                Err(_) => {
+                    bad.push(format!("第 {n} 行：目标端口要写成数字"));
+                    continue;
+                }
+            },
+        };
+        if kind == "D" {
+            ok.push(Forward::Dynamic { bind, listen_port: listen });
+            continue;
+        }
+        let mut missing: Vec<&str> = Vec::new();
+        if dest_host.is_empty() {
+            missing.push("目标主机");
+        }
+        if dest_port.is_none() {
+            missing.push("目标端口");
+        }
+        if !missing.is_empty() {
+            bad.push(format!("第 {n} 行：{}不能空着", missing.join("、")));
+            continue;
+        }
+        let (dest_host, dest_port) = (dest_host, dest_port.unwrap());
+        ok.push(match kind.as_str() {
+            "L" => Forward::Local { bind, listen_port: listen, dest_host, dest_port },
+            _ => Forward::Remote { bind, listen_port: listen, dest_host, dest_port },
+        });
+    }
+    (ok, bad)
+}
+
+/// 这一行的本地口和谁撞：本表其他行 + 其他主机的规则。自动口什么都不撞。
+///
+/// 只比端口、不比 bind（与 `ells_core::host::ports_clash` 同一口径）：`*:8080` 和
+/// `127.0.0.1:8080` 实际上也只能起来一个，提示多了不比漏了安全。
+pub(crate) fn row_clash_text(rows: &[RuleRow], hosts: &[Host], alias: &str, idx: usize) -> String {
+    let Some(port) = rows.get(idx).and_then(RuleRow::port) else { return String::new() };
+    let mut names: Vec<String> = Vec::new();
+    for (i, r) in rows.iter().enumerate() {
+        if i != idx && r.port() == Some(port) {
+            names.push(format!("本表第 {} 行", i + 1));
+        }
+    }
+    for h in hosts {
+        if h.alias != alias && h.forwards.iter().any(|f| f.fixed_local_port() == Some(port)) {
+            names.push(h.alias.clone());
+        }
+    }
+    if names.is_empty() {
+        String::new()
+    } else {
+        format!("⚠ 与 {} 同用 {port} — 留空本地口即可自动分配", names.join("、"))
+    }
 }
 
 pub struct JumpPicker {
@@ -109,6 +477,8 @@ pub struct FormState {
     pub editing_alias: Option<String>,
     pub error: Option<String>,
     pub jump_picker: Option<JumpPicker>,
+    /// Ctrl-R 暂时显形：密码写错了看不见是最常见的一类"存完连不上"。
+    pub reveal_secret: bool,
 }
 
 #[derive(Debug)]
@@ -181,6 +551,282 @@ pub struct Slot {
     pub status: Option<String>,
     /// 本标签所有传输共享的取消位（Ctrl-C 一次停本标签）
     pub cancel: Cancel,
+    /// 会话输出落盘（`~/.ells/logs/<别名>-<时间>.log`）；没连上或关了记录就是 None。
+    /// 跟着标签走：重连会换新的一条，旧文件留在磁盘上可回看。
+    pub log: Option<ells_core::sessionlog::Recorder>,
+    /// 自动重连：本轮已用到的第几次尝试（0 = 没有在等重连）
+    pub reconnect_attempt: u32,
+    /// 自动重连定时器代号：每次布防/主动断开都 +1，到点的旧定时器因此作废
+    pub reconnect_seq: u64,
+    /// 等重连的那台主机（`host` 在连接失败时会被清掉，这份是它自己的副本）
+    pub reconnect_host: Option<Host>,
+    /// 这次会话连上的时刻，用来判断断开算不算"站稳之后偶发的一次"
+    pub connected_at: Option<std::time::Instant>,
+    /// 会话页底部那排 CPU / 内存 / 磁盘条的数据与采集状态（每标签一份）
+    pub metrics: Metrics,
+}
+
+/// 采集周期。5 秒是"CPU 这根条看着像活的"和"把服务器打穿"之间的位置：CPU 那一格
+/// 本来就是两次 `/proc/stat` 做差，5 秒的窗口足够分辨"有人在跑东西"和"这根条坏了"，
+/// 而内存和负载本来也是秒级的事。真正贵的是磁盘那一路，它单独按 60 秒走。
+pub const METRICS_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// 磁盘**普查**每这么多轮才做一次：12 × 5 秒 = 60 秒。
+///
+/// 注意这不再是"磁盘 60 秒才问一次"：磁盘那一格跟着 5 秒的节奏换数，中间那些轮只对
+/// 缓存里最满那块问一次 `statvfs`（挂载点表住在连接上，见 `ells_core::metrics::DiskState`）。
+/// 分频分的是**普查** —— 读 `/proc/mounts` 再逐块问，是最贵的一条腿，而挂载点集合
+/// 一分钟里几乎不动；真要说动，动的是"哪块最满"，那个答案本来就该等到下一个普查点。
+/// 一台没有 `statvfs@openssh.com` 的服务器上，跟单轮什么都不问，`df` 只在这个普查点兜底。
+pub const METRICS_DISK_EVERY_ROUNDS: u32 = 12;
+
+/// 连上之后第一轮的等待：**不给延迟**。
+///
+/// 内存、负载、磁盘在连接建立的那一瞬间就已经能拿了：SFTP 子系统是在 `connect()` 里
+/// 先于 PTY 打开的（服务器不支持时只会让文件传输降级，不会挡住会话），所以第一轮过去
+/// 就有线上的数。让人对着空行等两秒，看着就像这一行坏了。
+pub const METRICS_FIRST_DELAY: std::time::Duration = std::time::Duration::ZERO;
+
+/// CPU 从基线到第二个点之间等多久：两秒。
+///
+/// CPU 那一格本来就是两次 `/proc/stat` 做差，第一个点只是基线、差不出数。刚连上时
+/// 用户最想看到的偏偏就是它，所以拿到基线的那一轮之后单独用两秒接力；从第二轮起回到
+/// `METRICS_EVERY`。这台机器没有 `/proc/stat` 时 `cpu_pending` 永远是 false，不会出现
+/// "两秒一次猛采还差不出数"的空转。
+pub const METRICS_CPU_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// 单轮采集的超时：比 5 秒的周期短，才不会两轮叠在一起。远端 `df` 卡在失效的 NFS
+/// 挂载点上是真实场景，卡住的那一轮要被丢掉。
+pub const METRICS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// 一轮回包的字节上限：几百个挂载点的 `df` 也就几十 KB，留足量的同时挡住
+/// 那种把登录横幅写成几 MB 的机器。
+pub const METRICS_MAX_BYTES: usize = 256 * 1024;
+
+/// 连续这么多轮回包是空的（这台机器什么都不给），就认定它采不到：停止轮询，把那一行
+/// 还给终端。
+const METRICS_GIVE_UP: u32 = 3;
+
+/// 背景标签的节奏：用户没在看的那几格降到一分钟一轮。
+///
+/// 一排标签各开一条采集通道时，服务器看到的是"每五秒一轮 × 标签数"，而其中绝大部分
+/// 结果没人看 —— 换回去的时候再快采就行。一分钟这个数取的是磁盘那一档：一个后台标签
+/// 每分钟一次 SFTP 读，和它本来就有的 keepalive 一个量级。
+pub const METRICS_IDLE_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// 通道级失败（开不了通道、执行失败、超时）之后的间隔阶梯：5 → 10 → 30 → 60 封顶。
+///
+/// 这类失败说的是"这条连接这会儿不方便"，不是"这台机器没有可采的东西"：网络抖一下、
+/// 服务器瞬间过载、被跳板机掐了一下，都不该让底部那一行永久消失。所以只退避、不判死 ——
+/// 最慢一分钟一次，多个标签一起开着也压不出负载，而恢复是自动的：任意一轮拿到数就回到 5 秒。
+pub const METRICS_BACKOFF: [std::time::Duration; 4] = [
+    METRICS_EVERY,
+    std::time::Duration::from_secs(10),
+    std::time::Duration::from_secs(30),
+    std::time::Duration::from_secs(60),
+];
+
+/// 连着失败这么多轮就退到阶梯的顶（60 秒）：这一刻值得说一句，因为数字从此每分钟才动一次。
+const METRICS_CAPPED_AT: u32 = (METRICS_BACKOFF.len() as u32) - 1;
+
+/// 分频与退避合成出下一次该等的时长：唯一的额外输入是"这一格是不是用户正看着的那一格"。
+///
+/// 正看着的按 `fast`（5 秒，连着失败就沿 `METRICS_BACKOFF` 退）；背景那几格不早于
+/// `METRICS_IDLE_EVERY`。写成自由函数是为了让这条规则本身能被单测钉住 —— 它需要 `App`
+/// 的标签表，而 `App` 的构造会去动真实的 `~/.ells`。
+pub fn metrics_every(active: bool, fast: std::time::Duration) -> std::time::Duration {
+    if active {
+        fast
+    } else {
+        fast.max(METRICS_IDLE_EVERY)
+    }
+}
+
+/// 一次回包之后下一轮该等多久。在 `metrics_every` 之上只多一条抢跑的规则：
+///
+/// 这一轮只拿到 CPU 基线、还差一个数才能做差，而用户正看着这一格 —— 那就两秒后接力，
+/// 让他进会话时不必为了一格 CPU 多等三轮。背景那几格不抢（它本来就是分钟级），一台没有
+/// `/proc/stat` 的机器 `pending_cpu` 永远是 false（见 `Metrics::adopt`），也不会两秒一次
+/// 空转。写成自由函数同样是为了让这条规则本身能被单测钉住。
+pub fn metrics_next(
+    pending_cpu: bool,
+    active: bool,
+    fast: std::time::Duration,
+) -> std::time::Duration {
+    if pending_cpu && active {
+        METRICS_CPU_WINDOW
+    } else {
+        metrics_every(active, fast)
+    }
+}
+
+/// 磁盘那一格：使用率最高的那块**真实**挂载点（挑法见 `ells_core::metrics::Probe::worst_disk`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiskGauge {
+    pub mount: String,
+    pub percent: u8,
+    pub used_kb: u64,
+    pub total_kb: u64,
+}
+
+/// 一个标签的底部指标行：既有面向绘制的"最近一次结果"，也有面向调度的"代号 + 连续失败"。
+///
+/// 节奏沿用自动重连那套（**没有全局 tick**）：一次性定时器睡到点发一个带 `seq` 的
+/// 事件，结果回来后才布防下一轮；期间任何打断（断开、关标签、设置里关掉）都 +1 代号，
+/// 在途的旧定时器和旧回包因此全部作废。
+#[derive(Debug, Default)]
+pub struct Metrics {
+    /// CPU 使用率（%）；首轮没有基线，所以是 `None`
+    pub cpu: Option<u8>,
+    /// 内存使用率（%）
+    pub mem: Option<u8>,
+    /// 1/5/15 分钟平均负载；没有 `/proc/loadavg` 的机器是 `None`
+    pub load: Option<ells_core::LoadSample>,
+    /// 磁盘容量使用率（每一轮都跟着换数，但中间那些轮只跟单最满那块；见 `disk_rounds`）
+    pub disk: Option<DiskGauge>,
+    /// 上一轮 `/proc/stat` 快照：CPU 利用率是两次快照做差出来的
+    prev_cpu: Option<ells_core::CpuSample>,
+    /// 只拿到基线、还没差出 CPU 数：为 true 时下一轮用 `METRICS_CPU_WINDOW` 接力。
+    pub cpu_pending: bool,
+    /// 本轮采集的代号
+    seq: u64,
+    /// 有没有一轮在途（或已排期）。关掉指标、断开、换会话都要把它落回 false。
+    polling: bool,
+    /// 连续"回包是空的"的轮数（这台机器什么都不给）—— 只有这个计数能把采集判死
+    misses: u32,
+    /// 连续"通道级失败"的轮数：只用来退避，永远不参与判死
+    fails: u32,
+    /// 距下一轮**问磁盘**还剩几轮：0 就是这一轮要问。默认 0，所以连上的第一轮就有磁盘。
+    disk_rounds: u32,
+    /// 已判定这台机器采不到：不再布防，那一行也让给终端
+    pub unsupported: bool,
+}
+
+impl Metrics {
+    /// 布防下一轮：返回要写进定时器事件的代号。
+    fn arm(&mut self) -> u64 {
+        self.seq += 1;
+        self.polling = true;
+        self.seq
+    }
+
+    /// 作废在等的定时器与在途回包（断开、关标签、设置里关掉）。
+    pub fn cancel(&mut self) {
+        self.seq += 1;
+        self.polling = false;
+    }
+
+    /// 换了一条会话（或用户重新打开了开关）：把上一台机器的数清掉重新计。
+    /// 代号要留着继续往上走 —— 上一轮的在途回包不能对上新会话的代号。
+    fn reset(&mut self) {
+        let seq = self.seq;
+        *self = Metrics::default();
+        self.seq = seq;
+    }
+
+    /// 这一轮还该不该继续采。
+    pub fn is_polling(&self) -> bool {
+        self.polling
+    }
+
+    /// 这一轮要不要**普查**磁盘（重读 `/proc/mounts` + 逐块 `statvfs`，或兜底跑一次 `df`）。
+    ///
+    /// 每一轮都想要一个磁盘数，但普查不是：普查一轮有 `1 + 候选数` 个往返，而挂载点集合
+    /// 一分钟里几乎不动。所以中间那 11 轮只做一次跟单（`ProbeTarget::gather` 里由
+    /// `metrics::plan_disks` 决定跟哪块），到点这一轮才重排一次"谁最满"。
+    pub fn disk_survey_due(&self) -> bool {
+        self.disk_rounds == 0
+    }
+
+    /// 四项里有没有任何一项可用（决定那一行有没有内容可画）。
+    pub fn has_data(&self) -> bool {
+        self.cpu.is_some() || self.mem.is_some() || self.load.is_some() || self.disk.is_some()
+    }
+
+    /// 采纳一次解析结果，返回是否继续轮询。
+    pub fn adopt(&mut self, probe: &ells_core::Probe) -> bool {
+        match (self.prev_cpu, probe.cpu) {
+            (Some(prev), Some(now)) => {
+                self.cpu = ells_core::metrics::round_percent(ells_core::metrics::cpu_percent(
+                    &prev, &now,
+                ));
+                self.prev_cpu = Some(now);
+                self.cpu_pending = false;
+            }
+            // 首轮只有基线、没有可差的上一轮：这一格明说"还没数"，不填 0%
+            (None, Some(now)) => {
+                self.prev_cpu = Some(now);
+                self.cpu = None;
+                self.cpu_pending = true;
+            }
+            // 这台机器没有 /proc/stat（FreeBSD 之类）
+            _ => {
+                self.prev_cpu = None;
+                self.cpu = None;
+                self.cpu_pending = false;
+            }
+        }
+        self.mem = ells_core::metrics::round_percent(
+            probe.mem.as_ref().and_then(ells_core::metrics::mem_percent),
+        );
+        self.load = probe.load;
+        // 磁盘那一格：这一轮问到数就换上（跟单轮每 5 秒都问得到同一块盘的新数），
+        // 没问到就沿用上次的数 —— 那一格本来就该以"变化时才动"为主。
+        if let Some(d) = probe.worst_disk() {
+            self.disk = Some(DiskGauge {
+                mount: d.mount.clone(),
+                percent: d.used_percent,
+                used_kb: d.used_kb,
+                total_kb: d.total_kb,
+            });
+        }
+        // 普查点：到点的这一轮**不管问到没问到**都往后数 11 轮。没问到也要数，是因为
+        // "没问到"里就有这台没有 statvfs、df 又给不出盘的一类机器 —— 不数的话下一轮
+        // 又是一次普查加一条 df，60 秒的节奏当场退化成 5 秒。
+        if self.disk_rounds == 0 {
+            self.disk_rounds = METRICS_DISK_EVERY_ROUNDS - 1;
+        } else {
+            self.disk_rounds -= 1;
+        }
+        // "这一轮有没有拿到东西"看这一轮本身，不能被缓存的磁盘数糊过去：不然一台
+        // 早就什么都采不到的机器会靠着 60 秒前那块盘一直撑着轮询。
+        self.note(probe.has_data())
+    }
+
+    /// 通道级失败（开不了通道、执行失败、超时）：慢下来，但这一行留着。
+    ///
+    /// 这一类**不**计进判死：它说的是"这会儿采不到"，不是"这台机器没有可采的东西"。
+    /// 返回值仍是"继续轮询"，只是下一轮的间隔由 `interval()` 说了算。
+    pub fn missed(&mut self) -> bool {
+        self.fails += 1;
+        !self.unsupported
+    }
+
+    /// 下一次采集该等多久：连着失败就沿 `METRICS_BACKOFF` 往上退。
+    pub fn interval(&self) -> std::time::Duration {
+        METRICS_BACKOFF[(self.fails as usize).min(METRICS_BACKOFF.len() - 1)]
+    }
+
+    /// 正好退到阶梯顶端的那一刻（之前还没到过），值得为它说一句状态行。
+    pub fn just_capped(&self) -> bool {
+        self.fails == METRICS_CAPPED_AT
+    }
+
+    fn note(&mut self, got_anything: bool) -> bool {
+        if got_anything {
+            self.misses = 0;
+            // 拿到数就说明通道也是通的，退避同时结束
+            self.fails = 0;
+        } else {
+            self.misses += 1;
+            if self.misses >= METRICS_GIVE_UP {
+                // 判定采不到：这一轮之后不再占通道，那一行也还给终端
+                self.unsupported = true;
+                self.polling = false;
+            }
+        }
+        !self.unsupported
+    }
 }
 
 impl Slot {
@@ -375,8 +1021,51 @@ pub struct App {
     pub prompt: Option<Prompt>,
     /// 全键位帮助页（? / F1 打开，任意退出键关闭）。
     pub help_open: bool,
+    /// 帮助页滚动行数：章节变多后一屏装不下，不滚动就看不到下面的内容。
+    pub help_scroll: usize,
     /// 主机密钥策略：连接任务用它发问，UI 用它的通道回答。
     hostkey: HostKeyPolicy,
+    /// 端口转发管理器：一台主机一条 SSH 连接承载它的全部规则。放在 App 而不是
+    /// Slot 里——会话关闭不该把隧道一起带走（隧道有自己的重连退避）。
+    tunnels: TunnelManager,
+    /// 每台主机隧道的最新状态（列表标记 + 隧道面板）。只留最新一条：
+    /// 历史在 `~/.ells/audit.log` 里，面板要的是"现在到底通不通"。
+    pub tunnel_state: HashMap<String, TunnelState>,
+    /// 隧道面板（列表页按 t 打开）。
+    pub tunnels_open: bool,
+    pub tunnels_selected: usize,
+    /// 规则表格编辑器：隧道面板 Enter / 列表页 p 打开，改的是 `rules_alias` 那台的 forwards。
+    pub rules_open: bool,
+    pub rules_alias: String,
+    pub rules_rows: Vec<RuleRow>,
+    pub rules_row: usize,
+    pub rules_col: usize,
+    pub rules_error: Option<String>,
+    /// 端口映射总表（m 打开）。数据只能来自隧道事件：自动分配的口只有它自己知道。
+    pub ports_open: bool,
+    pub tunnel_ports: HashMap<String, Vec<PortMap>>,
+    /// known_hosts 管理页（列表页按 h 打开）。
+    pub known_open: bool,
+    pub known_entries: Vec<hostkey::KnownEntry>,
+    pub known_selected: usize,
+    /// 审计日志页（列表页按 l 打开）。
+    pub audit_open: bool,
+    pub audit_lines: Vec<String>,
+    /// 审计面板的滚动行（记录是"末尾若干行"，所以从 0 往上翻是往更早看）。
+    pub audit_scroll: usize,
+    /// 会话记录页（列表页按 v 打开）：先列文件，Enter 看内容。
+    pub sessions_open: bool,
+    pub sessions_rows: Vec<sessionlog::Entry>,
+    pub sessions_selected: usize,
+    /// 正在查看的那份日志（已去掉控制序列的正文）。
+    pub sessions_text: Option<String>,
+    pub sessions_scroll: usize,
+    /// 主机列表过滤词（`/` 输入，空 = 全显示）。
+    pub filter: String,
+    /// 过滤词正在被编辑（`/` 进入，Enter/Esc 退出）：此时按键进过滤框而不是列表键位。
+    pub filtering: bool,
+    /// known_hosts 页的一次性提示（删不掉 ~/.ssh 记录时要说清原因）。
+    pub known_msg: Option<String>,
     /// 传输详情弹窗是否打开（顶部聚合进度条触发）。
     pub transfer_popup: bool,
     /// 自更新状态（启动后台查一次，徽标点开才下载）。
@@ -397,6 +1086,14 @@ pub struct App {
     pub quit_confirm: bool,
     /// 关闭标签二次确认（存待关标签的 id）：该标签还在传输时，第一次只提示。
     pub close_tab_confirm: Option<u32>,
+    /// 下一帧画之前要不要先整屏重绘。`Ctrl-L` 直接置位；屏幕换主（直通交回来、
+    /// 原生文件框关掉、最后一层弹窗关闭）由主循环自己判。
+    repaint: bool,
+    /// 上一帧有没有盖模态层、是不是直通、原生文件框在不在——这三样决定
+    /// "上一帧那块屏幕是谁画的"，从有到无的那一刻必须全量重画一次。
+    overlay_last: bool,
+    passthrough_last: bool,
+    dialog_last: bool,
     /// 上一次写入终端标签名的文本（变化才重发 OSC 0）。
     term_title: Option<String>,
     event_tx: mpsc::UnboundedSender<AppEvent>,
@@ -429,7 +1126,20 @@ pub async fn run(alias: Option<String>, dev: bool, yes: bool) -> Result<bool> {
         }
     });
 
-    let mut app = App::startup(tx, rx, alias, dev, HostKeyPolicy::new(hkey_tx, yes));
+    // 隧道状态变化同样并进 UI 事件环：管理器在后台任务里跑，界面只收最新状态。
+    let (tun_tx, mut tun_rx) = mpsc::unbounded_channel::<TunnelEvent>();
+    let forward = tx.clone();
+    tokio::spawn(async move {
+        while let Some(event) = tun_rx.recv().await {
+            if forward.send(AppEvent::Tunnel(event)).is_err() {
+                return;
+            }
+        }
+    });
+    let policy = HostKeyPolicy::new(hkey_tx, yes);
+    let tunnels = TunnelManager::new(tun_tx, policy.clone());
+
+    let mut app = App::startup(tx, rx, alias, dev, policy, tunnels);
     let result = app.loop_run(&mut terminal).await;
     let restart = std::mem::take(&mut app.restart_after_exit);
 
@@ -442,6 +1152,31 @@ pub async fn run(alias: Option<String>, dev: bool, yes: bool) -> Result<bool> {
     Ok(false)
 }
 
+/// [0,1) 的伪随机数：重连抖动只要把"同一秒掉线的几路"错开，不需要好熵，
+/// 所以不为此引一个随机数依赖。
+fn pseudo_spread() -> f64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0);
+    let mixed = nanos ^ (std::process::id() as u64) << 17;
+    ((mixed % 1_000_000) as f64) / 1_000_000.0
+}
+
+/// 这次失败是不是卡在主机密钥上（我们自己打的文案 + russh 的文案）。
+fn key_trouble(err: &str) -> bool {
+    err.contains("主机密钥") || err.contains("server key") || err.contains("known_hosts")
+}
+
+/// 分组排序权重：有名字的组合并同类、按名字排，没分组的恒排最后。
+/// 返回元组而不是字符串，是为了让"未分组"不必真的占一个组名。
+fn group_rank(group: Option<&str>) -> (u8, String) {
+    match group {
+        Some(g) if !g.trim().is_empty() => (0, g.trim().to_lowercase()),
+        _ => (1, String::new()),
+    }
+}
+
 impl App {
     fn startup(
         tx: mpsc::UnboundedSender<AppEvent>,
@@ -449,6 +1184,7 @@ impl App {
         alias: Option<String>,
         dev: bool,
         hostkey: HostKeyPolicy,
+        tunnels: TunnelManager,
     ) -> Self {
         let settings = Settings::load();
         // 保险库、known_hosts、自动解锁凭据都在 ~/.ells：先把它收紧到仅当前用户可读
@@ -456,6 +1192,8 @@ impl App {
         ells_core::ssh::set_keepalive_interval(settings.keepalive_secs);
         // 上一次更新留下的备份件与陈旧临时件：Windows 上运行中的 exe 删不掉，只能等这次
         update::cleanup_leftovers();
+        // 会话记录按天轮转：不主动清，一个月就是几百个文件，列表页翻不到重点
+        sessionlog::prune();
         let mut base = Self {
             screen: ScreenKind::List,
             unlock: UnlockState {
@@ -465,7 +1203,10 @@ impl App {
                 pending_master: None,
                 busy: false,
             },
-            list: ListState { selected: 0 },
+            list: ListState {
+                selected: 0,
+                folded: Vec::new(),
+            },
             form: FormState::blank(),
             slots: vec![Slot::new(0)],
             active: 0,
@@ -490,7 +1231,34 @@ impl App {
             choice: None,
             prompt: None,
             help_open: false,
+            help_scroll: 0,
             hostkey,
+            tunnels,
+            tunnel_state: HashMap::new(),
+            tunnels_open: false,
+            tunnels_selected: 0,
+            rules_open: false,
+            rules_alias: String::new(),
+            rules_rows: Vec::new(),
+            rules_row: 0,
+            rules_col: 0,
+            rules_error: None,
+            ports_open: false,
+            tunnel_ports: HashMap::new(),
+            known_open: false,
+            known_entries: Vec::new(),
+            known_selected: 0,
+            audit_open: false,
+            audit_lines: Vec::new(),
+            audit_scroll: 0,
+            sessions_open: false,
+            sessions_rows: Vec::new(),
+            sessions_selected: 0,
+            sessions_text: None,
+            sessions_scroll: 0,
+            filter: String::new(),
+            filtering: false,
+            known_msg: None,
             transfer_popup: false,
             update: UpdateState::default(),
             restart_after_exit: false,
@@ -504,6 +1272,10 @@ impl App {
             done: false,
             quit_confirm: false,
             close_tab_confirm: None,
+            repaint: false,
+            overlay_last: false,
+            passthrough_last: false,
+            dialog_last: false,
             term_title: None,
             event_tx: tx,
             event_rx: rx,
@@ -548,6 +1320,27 @@ impl App {
         app
     }
 
+    /// 这一帧是否盖着 ells 自己的模态层（`ui::draw` 里那些先用 `Clear` 铺底、
+    /// 再画边框面板的层）。必须与 `ui::draw` 的分层条件一致：漏一层就少一次
+    /// 收尾重绘，那一层的残影就留下来了。
+    fn overlays_open(&self) -> bool {
+        self.choice.is_some()
+            || self.prompt.is_some()
+            || self.help_open
+            || self.delete_confirm.is_some()
+            || self.tunnels_open
+            || self.rules_open
+            || self.ports_open
+            || self.known_open
+            || self.audit_open
+            || self.sessions_open
+            || self.settings_open
+            || self.keybinds_open
+            || self.transfer_popup
+            || self.update.modal()
+            || self.form.jump_picker.is_some()
+    }
+
     async fn loop_run(
         &mut self,
         terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
@@ -562,8 +1355,28 @@ impl App {
             }
             let passthrough = self.screen == ScreenKind::Session
                 && self.slots[self.active].session.as_ref().map(|s| s.mode) == Some(TermMode::Passthrough);
-            if !passthrough {
+            if passthrough {
+                // 直通期间整块屏幕归远端，ells 一个字节都不画：重绘请求攒着，等屏幕交回来再用
+                self.passthrough_last = true;
+            } else {
+                let overlays = self.overlays_open();
+                let dialog = self.dialog_open;
+                // 屏幕换主的这一帧必须整屏重画。直通期间是远端在往 stdout 直接写字、原生文件框
+                // 和弹窗各自盖住一片格子，而 ratatui 只补它以为变了的那几个格子；Windows 10 的
+                // 控制台在这些位置会把上一画面的残片（尤其被切断的全角字半个格子）一直留在那儿，
+                // 差分永远等不到有人重写它 —— 这就是"弹窗关掉后还有残留"。
+                // terminal.clear() 会清屏并作废差分基线，于是这一帧是真正的全量第一帧。
+                if self.repaint || self.passthrough_last
+                    || self.dialog_last && !dialog
+                    || self.overlay_last && !overlays
+                {
+                    terminal.clear()?;
+                    self.repaint = false;
+                }
                 terminal.draw(|f| ui::draw(f, self))?;
+                self.passthrough_last = false;
+                self.overlay_last = overlays;
+                self.dialog_last = dialog;
             }
             // Connect only AFTER the "正在连接…" frame is on screen.
             if let Some((host, idx)) = self.pending_connect.take() {
@@ -593,6 +1406,9 @@ impl App {
                 AppEvent::MouseRelease { column, row } => self.handle_mouse_release(column, row),
                 AppEvent::MouseScroll { delta } => self.handle_scroll(delta),
                 AppEvent::RemoteData { bytes, .. } => {
+                    if let Some(lg) = &mut self.slots[self.work].log {
+                        lg.record(&bytes);
+                    }
                     let mut zev = None;
                     let mut cmds = Vec::new();
                     if let Some(s) = &mut self.slots[self.work].session {
@@ -613,6 +1429,24 @@ impl App {
                     }
                 }
                 AppEvent::RemoteClosed { graceful, .. } => {
+                    let closed_alias = self.slots[self.work]
+                        .host
+                        .as_ref()
+                        .map(|h| h.alias.clone());
+                    if let Some(alias) = &closed_alias {
+                        let _ = audit::record(
+                            AuditKind::Disconnect,
+                            alias,
+                            if graceful { "远端退出" } else { "连接断开" },
+                        );
+                    }
+                    if let Some(mut lg) = self.slots[self.work].log.take() {
+                        lg.note(if graceful {
+                            "会话结束 · 远端退出"
+                        } else {
+                            "会话结束 · 连接断开"
+                        });
+                    }
                     let label = if let Some(mut s) = self.slots[self.work].session.take() {
                         s.close();
                         Some(s.label.clone())
@@ -625,6 +1459,9 @@ impl App {
                     slot.connecting = false;
                     slot.sftp = None;
                     slot.view = ScreenKind::List;
+                    slot.connected_at = None;
+                    // 在途的采集回包一并作废：会话都没了，不该再把数写进已经消失的那一行
+                    slot.metrics.cancel();
                     slot.remote_cwd.clear();
                     slot.sz_pending.clear();
                     slot.rz_pending = false;
@@ -646,8 +1483,10 @@ impl App {
                         // 远端 shell 正常退出（exit/logout）是主动行为，不弹重连；
                         // 只有没收到 exit-status 的异常关闭才提供一键重连。
                         // 已有弹窗时不再叠加：一次只弹一个，且会孤儿掉前一个的应答通道
-                        if !graceful && self.choice.is_none() {
-                            self.offer_reconnect(host);
+                        if graceful || self.choice.is_some() {
+                            self.slots[self.work].reconnect_attempt = 0;
+                        } else {
+                            self.on_session_lost(self.work, host);
                         }
                     }
                 }
@@ -665,8 +1504,17 @@ impl App {
                 AppEvent::UpdateDone(res) => self.on_update_done(res),
                 AppEvent::Connected { res, .. } => self.on_connected(res),
                 AppEvent::Reconnect { host, .. } => self.start_connect(host, Some(self.work)),
+                AppEvent::AutoReconnect { host, attempt, seq, .. } => {
+                    self.on_reconnect_timer(host, attempt, seq);
+                }
+                AppEvent::MetricsTick { seq, .. } => self.on_metrics_tick(self.work, seq),
+                AppEvent::MetricsProbe { seq, res, .. } => {
+                    self.on_metrics_probe(self.work, seq, res)
+                }
                 AppEvent::Conflict { prompt, .. } => self.ask_conflict(prompt),
                 AppEvent::ImportHosts(hosts) => self.import_hosts(hosts),
+                AppEvent::ExportSshConfig => self.export_ssh_config(),
+                AppEvent::Tunnel(event) => self.on_tunnel_event(event),
                 AppEvent::PickedFile { field, path } => {
                     if self.screen == ScreenKind::Form {
                         if let Some(p) = path {
@@ -740,6 +1588,7 @@ impl App {
                                 let _ = crate::settings::write_master_backup(new_master.as_str());
                             }
                             self.status = Some("主密码已修改，下次启动用新密码".to_string());
+                            let _ = audit::record(AuditKind::MasterPassword, "vault", "主密码已修改");
                         }
                         Err(msg) => {
                             self.status = Some(format!("修改主密码失败：{msg}"));
@@ -924,6 +1773,7 @@ impl App {
                                 "传输".to_string()
                             };
                             slot.status = Some(format!("{dir}完成：{label}"));
+                            let _ = audit::record(AuditKind::Transfer, &label, &dir);
                         }
                         Err((label, msg)) => {
                             if let Some(item) = slot
@@ -935,6 +1785,7 @@ impl App {
                                 item.done = true;
                                 item.error = Some(msg.clone());
                             }
+                            let _ = audit::record(AuditKind::Transfer, &label, &format!("失败：{msg}"));
                             slot.status = Some(msg);
                         }
                     }
@@ -984,13 +1835,17 @@ impl App {
             return;
         }
         if self.help_open {
-            // 帮助页是全屏信息层：只认退出键，其余一律不落到下层页面
+            // 帮助页是全屏信息层：除了退出与滚动，其余一律不落到下层页面
             match key.code {
                 KeyCode::Esc
-                | KeyCode::Enter
-                | KeyCode::Char('?')
                 | KeyCode::Char('q')
+                | KeyCode::Char('?')
                 | KeyCode::F(1) => self.help_open = false,
+                KeyCode::Up | KeyCode::Char('k') => self.help_scroll = self.help_scroll.saturating_sub(1),
+                KeyCode::Down | KeyCode::Char('j') => self.help_scroll += 1,
+                KeyCode::PageUp | KeyCode::Char('u') => self.help_scroll = self.help_scroll.saturating_sub(8),
+                KeyCode::PageDown | KeyCode::Char('d') | KeyCode::Enter => self.help_scroll += 8,
+                KeyCode::Home | KeyCode::Char('g') => self.help_scroll = 0,
                 _ => {}
             }
             return;
@@ -1014,6 +1869,34 @@ impl App {
         }
         if self.delete_confirm.is_some() {
             self.handle_delete_confirm_key(&key);
+            return;
+        }
+        // 只读面板：隧道、主机密钥记录、审计日志、会话记录。放在删除确认之后，
+        // 保证"正在等二级确认"时不会被面板抢走按键。
+        // 叠着开的按层从最上面那个开始吃键：端口映射弹窗是从隧道面板里按 m 开出来的，
+        // 两个标记同时为真时先判弹窗，否则 Esc 关掉的是背后那个面板、弹窗留在屏幕上。
+        if self.ports_open {
+            self.handle_ports_key(&key);
+            return;
+        }
+        if self.rules_open {
+            self.handle_rules_key(&key, ctrl);
+            return;
+        }
+        if self.tunnels_open {
+            self.handle_tunnels_key(&key);
+            return;
+        }
+        if self.known_open {
+            self.handle_known_key(&key);
+            return;
+        }
+        if self.audit_open {
+            self.handle_audit_key(&key);
+            return;
+        }
+        if self.sessions_open {
+            self.handle_sessions_key(&key);
             return;
         }
         // 标签页控制在列表/会话/浏览器页都可用；弹窗、帮助页和表单里不抢键。
@@ -1107,6 +1990,8 @@ impl App {
         };
         if action == SessionAction::Detach {
             self.detach_or_close_tab();
+        } else if action == SessionAction::Redraw {
+            self.repaint = true;
         }
     }
 
@@ -1197,6 +2082,9 @@ impl App {
             | AppEvent::RemoteClosed { slot, .. }
             | AppEvent::Connected { slot, .. }
             | AppEvent::Reconnect { slot, .. }
+            | AppEvent::AutoReconnect { slot, .. }
+            | AppEvent::MetricsTick { slot, .. }
+            | AppEvent::MetricsProbe { slot, .. }
             | AppEvent::Conflict { slot, .. }
             | AppEvent::SftpCwd { slot, .. }
             | AppEvent::ZmodemClear { slot, .. }
@@ -1270,6 +2158,8 @@ impl App {
         self.settings_open = false;
         self.transfer_popup = false;
         self.status = None;
+        // 切回来就要看得见数：这一格在背景时是一分钟一轮，那 58 秒的旧数不该继续挂着
+        self.revive_metrics(idx);
         // 后台标签的目录可能已经被它自己的传输改过：切回来先重扫一次
         let slot = &self.slots[idx];
         if self.screen == ScreenKind::Browser
@@ -1392,6 +2282,9 @@ impl App {
         if let Some(mut s) = self.slots[self.active].session.take() {
             s.close();
         }
+        if let Some(mut lg) = self.slots[self.active].log.take() {
+            lg.note("会话结束 · 关闭标签");
+        }
         self.slots.remove(self.active);
         if self.slots.is_empty() {
             self.push_tab();
@@ -1402,6 +2295,8 @@ impl App {
         self.settings_open = false;
         self.transfer_popup = false;
         self.status = None;
+        // 落到的那一格现在是用户在看的那一格，别让它继续按背景的分钟节奏供数
+        self.revive_metrics(self.active);
     }
 
     /// Ctrl-]：结束这一路会话。标签不止一个时关掉这个，只剩一个才退回列表。
@@ -1522,8 +2417,20 @@ impl App {
                 }
                 return;
             }
-            let [hl_r, ka_r, mp_r, change_r, kb_r, theme_r, update_r, save_r, cancel_r] =
-                ui::settings_hit_rects(self.last_area);
+            let [
+                hl_r,
+                ka_r,
+                mp_r,
+                change_r,
+                kb_r,
+                theme_r,
+                update_r,
+                slog_r,
+                mt_r,
+                rc_r,
+                save_r,
+                cancel_r,
+            ] = ui::settings_hit_rects(self.last_area);
             if hit(hl_r, column, row) {
                 self.settings_focus = 0;
                 self.settings.highlight = !self.settings.highlight;
@@ -1542,6 +2449,16 @@ impl App {
             } else if hit(update_r, column, row) {
                 self.settings_focus = 6;
                 self.run_update_row();
+            } else if hit(slog_r, column, row) {
+                self.settings_focus = 7;
+                self.settings.session_log = !self.settings.session_log;
+            } else if hit(mt_r, column, row) {
+                self.settings_focus = 8;
+                self.set_metrics_setting(!self.settings.metrics);
+            } else if hit(rc_r, column, row) {
+                self.settings_focus = 9;
+                self.settings.reconnect.max_attempts =
+                    cycle_reconnect_attempts(self.settings.reconnect.max_attempts);
             } else if hit(save_r, column, row) {
                 self.save_settings();
             } else if hit(cancel_r, column, row) {
@@ -1578,6 +2495,49 @@ impl App {
             }
             return;
         }
+        // 端口映射弹窗：点外面就关，表本身只读不必选。
+        if self.ports_open {
+            if !hit(ui::ports_rect(self.last_area), column, row) {
+                self.ports_open = false;
+            }
+            return;
+        }
+        // 规则表格：只有点中某个格子才移动光标；点面板外不关——编辑到一半误点一下
+        // 就把改动丢了，比"关不掉"糟得多。要退出请用 Esc（放弃）或 Enter（保存）。
+        // 格子矩形来自 rules_cell_rects，里面已经算好滚动窗口，所以点到的行号就是表内行号。
+        if self.rules_open {
+            let (_, window) = ui::rules_cell_rects(self.last_area, self.rules_rows.len(), self.rules_row);
+            for (i, cols) in window {
+                for (j, r) in cols.iter().enumerate() {
+                    if hit(*r, column, row) {
+                        self.rules_row = i;
+                        self.rules_col = j;
+                        self.rules_error = None;
+                        return;
+                    }
+                }
+            }
+            return;
+        }
+        if self.tunnels_open {
+            let (panel, _chip, list) = ui::tunnel_rects(self.last_area);
+            if hit(ui::tunnel_ports_chip_rect(self.last_area), column, row) {
+                self.open_ports();
+                return;
+            }
+            if hit(list, column, row) {
+                let rows = self.tunnel_rows();
+                let idx = (row - list.y) as usize;
+                if idx < rows.len() {
+                    self.tunnels_selected = idx;
+                }
+                return;
+            }
+            if !hit(panel, column, row) {
+                self.tunnels_open = false;
+            }
+            return;
+        }
         match self.screen {
             ScreenKind::Session => {
                 if hit(ui::homepage_rect(self.last_area), column, row) {
@@ -1600,7 +2560,11 @@ impl App {
                     self.toggle_host_list();
                 } else if hit(progress_r, column, row) && !self.slots[self.work].browser.transfers.is_empty() {
                     self.transfer_popup = true;
-                } else if hit(ui::session_emu_rect(self.last_area), column, row) {
+                } else if hit(
+                    ui::session_emu_rect(self.last_area, self.footer_rows(self.work)),
+                    column,
+                    row,
+                ) {
                     // 终端区按下 = 开始拖选（鼠标捕获后原生选择失效，由 ells 自绘）
                     if let Some(s) = &mut self.slots[self.work].session {
                         s.begin_selection(column, row);
@@ -1675,7 +2639,7 @@ impl App {
         if self.screen != ScreenKind::Session {
             return;
         }
-        let area = ui::session_emu_rect(self.last_area);
+        let area = ui::session_emu_rect(self.last_area, self.footer_rows(self.work));
         let text = match &mut self.slots[self.work].session {
             Some(s) => {
                 s.update_selection(column, row);
@@ -1756,7 +2720,7 @@ impl App {
                 self.settings_focus = self.settings_focus.saturating_sub(1);
             }
             KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
-                self.settings_focus = (self.settings_focus + 1).min(8);
+                self.settings_focus = (self.settings_focus + 1).min(11);
             }
             KeyCode::Enter | KeyCode::Char(' ') => self.apply_settings_focus(),
             KeyCode::Left => match self.settings_focus {
@@ -1768,6 +2732,14 @@ impl App {
                 2 => self.toggle_master_setting(),
                 5 => self.step_theme(true),
                 6 => self.settings.auto_update = false,
+                7 => self.settings.session_log = false,
+                8 => {
+                    self.set_metrics_setting(false);
+                }
+                9 => {
+                    self.settings.reconnect.max_attempts =
+                        step_reconnect_attempts(self.settings.reconnect.max_attempts, false);
+                }
                 _ => {}
             },
             KeyCode::Right => match self.settings_focus {
@@ -1779,6 +2751,14 @@ impl App {
                 2 => self.toggle_master_setting(),
                 5 => self.step_theme(false),
                 6 => self.settings.auto_update = true,
+                7 => self.settings.session_log = true,
+                8 => {
+                    self.set_metrics_setting(true);
+                }
+                9 => {
+                    self.settings.reconnect.max_attempts =
+                        step_reconnect_attempts(self.settings.reconnect.max_attempts, true);
+                }
                 _ => {}
             },
             KeyCode::Char('h') => self.settings.highlight = !self.settings.highlight,
@@ -1885,7 +2865,15 @@ impl App {
             4 => self.open_keybinds(),
             5 => self.step_theme(false),
             6 => self.run_update_row(),
-            7 => self.save_settings(),
+            7 => self.settings.session_log = !self.settings.session_log,
+            8 => {
+                self.set_metrics_setting(!self.settings.metrics);
+            }
+            9 => {
+                self.settings.reconnect.max_attempts =
+                    cycle_reconnect_attempts(self.settings.reconnect.max_attempts);
+            }
+            10 => self.save_settings(),
             _ => self.cancel_settings(),
         }
     }
@@ -2145,7 +3133,24 @@ impl App {
 
     fn save_settings(&mut self) {
         self.settings.save();
+        let _ = audit::record(
+            AuditKind::Settings,
+            "settings",
+            &format!(
+                "主题={} 保活={}s 高亮={} 自动更新={} 会话记录={} 主机指标={} 自动重连={}次",
+                self.settings.theme.ini_value(),
+                self.settings.keepalive_secs,
+                self.settings.highlight,
+                self.settings.auto_update,
+                self.settings.session_log,
+                self.settings.metrics,
+                self.settings.reconnect.attempts_label()
+            ),
+        );
         ells_core::ssh::set_keepalive_interval(self.settings.keepalive_secs);
+        // 指标开关立刻生效：关掉就收回那一行、停掉所有采集通道；
+        // 打开就给已经连上的标签补上，不必重连
+        self.sync_metrics();
         // 主密码开关联动本地自动解锁凭据：关闭=写入，开启=删除
         if self.settings.master_password_enabled {
             crate::settings::clear_master_backup();
@@ -2170,6 +3175,9 @@ impl App {
         // 丢弃未保存的改动，回到磁盘上的当前值
         self.settings = Settings::load();
         ells_core::ssh::set_keepalive_interval(self.settings.keepalive_secs);
+        // 指标开关立刻生效：关掉就收回那一行、停掉所有采集通道；
+        // 打开就给已经连上的标签补上，不必重连
+        self.sync_metrics();
         self.settings_open = false;
         self.keybinds_open = false;
         self.keybinds_recording = None;
@@ -2185,6 +3193,8 @@ impl App {
 
     fn detach_session(&mut self, status: &str) {
         // 主动断开：不给"连接已断开 / 重连"弹窗，这条会话到此为止
+        // 等在表里的自动重连一起作废（用户说了不要，就不能还在后台偷偷连）
+        self.stop_reconnect(self.work);
         let label = if let Some(mut s) = self.slots[self.work].session.take() {
             s.close();
             Some(s.label.clone())
@@ -2192,6 +3202,11 @@ impl App {
             None
         };
         let slot = &mut self.slots[self.work];
+        if let Some(mut lg) = slot.log.take() {
+            lg.note(&format!("会话结束 · {status}"));
+        }
+        // 主动断开：采集的那条链一起停掉，别让在途回包写进已经没有了的那一行
+        slot.metrics.cancel();
         slot.host = None;
         slot.connecting = false;
         slot.sftp = None;
@@ -2542,6 +3557,66 @@ impl App {
         });
     }
 
+    /// c：改选中项的权限（八进制，如 600 / 0644）。只送权限位，不动属主和时间。
+    fn prompt_chmod(&mut self) {
+        let Some(sftp) = self.slots[self.work].sftp.clone() else {
+            self.slots[self.work].status = Some("该服务器不支持 SFTP 文件传输".to_string());
+            return;
+        };
+        let Some(entry) = self
+            .slots[self.work]
+            .browser
+            .entries
+            .get(self.slots[self.work].browser.selected)
+            .cloned()
+        else {
+            self.slots[self.work].status = Some("请先选中要改权限的项".to_string());
+            return;
+        };
+        let alias = self
+            .slots[self.work]
+            .host
+            .as_ref()
+            .map(|h| h.alias.clone())
+            .unwrap_or_else(|| "?".to_string());
+        let tx = self.event_tx.clone();
+        let slot = self.slot_id();
+        self.prompt = Some(Prompt {
+            title: format!("改权限 {}", entry.name),
+            label: "八进制(如 600)",
+            buffer: String::new(),
+            error: None,
+            hint: None,
+            allow_empty: false,
+            on_done: Box::new(move |mode| {
+                let Some(mode) = mode else { return };
+                let Some(bits) = ells_transfer::parse_mode(&mode) else {
+                    let _ = tx.send(AppEvent::SftpOp {
+                        slot,
+                        res: Err(format!("权限要八进制，如 600 / 0644（写的是 {mode}）")),
+                    });
+                    return;
+                };
+                let path = entry.path.clone();
+                let shown = format!("{bits:o}");
+                tokio::spawn(async move {
+                    let res = ells_transfer::chmod(&sftp, &path, bits)
+                        .await
+                        .map(|_| format!("已把 {path} 改成 {shown}"))
+                        .map_err(|e| format!("{e:#}"));
+                    if res.is_ok() {
+                        let _ = audit::record(
+                            AuditKind::Transfer,
+                            &alias,
+                            &format!("chmod {shown} {path}"),
+                        );
+                    }
+                    let _ = tx.send(AppEvent::SftpOp { slot, res });
+                });
+            }),
+        });
+    }
+
     /// D：删除选中项。目录会递归删除且不可恢复，因此永远先问一次。
     fn ask_delete_entry(&mut self) {
         let Some(sftp) = self.slots[self.work].sftp.clone() else {
@@ -2830,6 +3905,7 @@ impl App {
             }
             KeyCode::Char('m') => self.prompt_mkdir(),
             KeyCode::Char('n') => self.prompt_rename(),
+            KeyCode::Char('c') if !ctrl => self.prompt_chmod(),
             KeyCode::Char('D') => self.ask_delete_entry(),
             KeyCode::Char('c') if ctrl => self.cancel_transfers(),
             _ => {
@@ -2954,6 +4030,64 @@ impl App {
         });
     }
 
+    /// x：反向操作——把保险库写成一段 ssh_config。写盘在 `export_ssh_config`。
+    fn ask_export_ssh_config(&mut self) {
+        if self.vault.hosts.is_empty() {
+            self.status = Some("保险库里还没有可导出的主机".to_string());
+            return;
+        }
+        let Some(path) = ells_core::sshconfig::export_path() else {
+            self.status = Some("无法定位用户主目录".to_string());
+            return;
+        };
+        let count = self.vault.hosts.len();
+        let tx = self.event_tx.clone();
+        self.choice = Some(Choice {
+            title: "导出 ssh_config".to_string(),
+            lines: vec![
+                format!("把保险库里的 {count} 台主机写成一段 ssh_config："),
+                path.display().to_string(),
+                String::new(),
+                "只写别名 / 主机 / 端口 / 用户 / 私钥路径 / 转发，密码一条都不写。".to_string(),
+                "写的是 ells 目录下的导出件，~/.ssh/config 本体一个字都不动。".to_string(),
+                "已有同名文件会被覆盖。".to_string(),
+            ],
+            options: vec!["取 消".to_string(), "导 出".to_string()],
+            selected: 0,
+            shortcuts: &[('n', 0), ('y', 1)],
+            danger: false,
+            on_pick: Box::new(move |idx| {
+                if matches!(idx, Some(1)) {
+                    let _ = tx.send(AppEvent::ExportSshConfig);
+                }
+            }),
+        });
+    }
+
+    /// 真正落盘：原子写，失败只影响这份可重生成的导出件，不碰保险库。
+    fn export_ssh_config(&mut self) {
+        let Some(path) = ells_core::sshconfig::export_path() else {
+            self.status = Some("无法定位用户主目录".to_string());
+            return;
+        };
+        let text = ells_core::sshconfig::to_config_text(&self.vault.hosts);
+        let count = self.vault.hosts.len();
+        match ells_core::write_atomic(&path, text.as_bytes()) {
+            Ok(()) => {
+                self.status = Some(format!(
+                    "已导出 {count} 台 → {}（不含任何密码）",
+                    path.display()
+                ));
+                let _ = audit::record(
+                    AuditKind::Export,
+                    "ssh-config",
+                    &format!("导出 {count} 台 → {}", path.display()),
+                );
+            }
+            Err(err) => self.status = Some(format!("导出失败：{err}")),
+        }
+    }
+
     fn import_hosts(&mut self, hosts: Vec<Host>) {
         let mut imported = 0usize;
         let mut backed_up = 0usize;
@@ -2973,6 +4107,7 @@ impl App {
         }
         if imported > 0 {
             self.save_vault();
+            let _ = audit::record(AuditKind::Import, "ssh-config", &format!("导入 {imported} 台"));
         }
         self.status = match key_errors.is_empty() {
             true => Some(format!(
@@ -2992,7 +4127,12 @@ impl App {
     }
 
     fn handle_list_key(&mut self, key: &KeyEvent, ctrl: bool) {
-        let len = self.vault.hosts.len();
+        // 过滤词编辑态优先：此时除了退出/退格/字符，其它键位都不该动列表
+        if self.filtering {
+            return self.handle_filter_key(key);
+        }
+        let rows = self.visible();
+        let len = rows.len();
         if matches!(key.code, KeyCode::Esc | KeyCode::Char('q'))
             || (ctrl && matches!(key.code, KeyCode::Char('c')))
         {
@@ -3022,30 +4162,651 @@ impl App {
                 }
             }
             KeyCode::Char('a') => {
-                self.form = FormState::new(None);
+                // 新增：从当前选中的那台带上结构性字段；没选中就是空表
+                let tpl = self.selected_host();
+                self.form = FormState::template(tpl.as_ref());
                 self.screen = ScreenKind::Form;
             }
             KeyCode::Char('e') => {
-                if let Some(host) = self.vault.hosts.get(self.list.selected).cloned() {
+                if let Some(host) = self.selected_host() {
                     self.form = FormState::new(Some(&host));
                     self.screen = ScreenKind::Form;
                 }
             }
             KeyCode::Char('d') => {
                 // 二级确认：先弹确认框，真正删除在 confirm_delete()
-                if let Some(host) = self.vault.hosts.get(self.list.selected) {
+                if let Some(host) = self.selected_host() {
                     self.delete_confirm = Some(host.alias.clone());
                     self.confirm_index = 0;
                 }
             }
             KeyCode::Char('s') => self.open_settings(),
             KeyCode::Char('i') => self.import_ssh_config(),
+            KeyCode::Char('x') => self.ask_export_ssh_config(),
+            KeyCode::Char('/') => {
+                self.filtering = true;
+            }
+            KeyCode::Char('t') => {
+                self.tunnels_open = true;
+                self.tunnels_selected = 0;
+            }
+            KeyCode::Char('p') => {
+                if let Some(alias) = self.selected_host().map(|h| h.alias.clone()) {
+                    self.open_rules_for(alias);
+                } else {
+                    self.status = Some("先选中一台主机，再按 p 编辑它的端口转发".into());
+                }
+            }
+            KeyCode::Char('m') => self.open_ports(),
+            KeyCode::Char('h') => self.open_known(),
+            KeyCode::Char('l') => self.open_audit(),
+            KeyCode::Char('v') => self.open_sessions(),
+            KeyCode::Char('f') => self.toggle_favorite(),
+            KeyCode::Char(' ') => self.toggle_fold(),
+            KeyCode::Char('z') => self.toggle_fold_all(),
+            KeyCode::Char('o') => self.cycle_sort(),
             KeyCode::Char('?') | KeyCode::F(1) => self.help_open = true,
             KeyCode::Enter => {
-                if let Some(host) = self.vault.hosts.get(self.list.selected).cloned() {
+                if let Some(host) = self.selected_host() {
                     self.open_host(host);
                 }
             }
+            _ => {}
+        }
+    }
+
+    /// `/` 之后的按键：全部进过滤框。Esc 清空并退出，Enter 只退出（保留过滤词）。
+    fn handle_filter_key(&mut self, key: &KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.filtering = false;
+                self.filter.clear();
+                self.list.selected = 0;
+            }
+            KeyCode::Enter | KeyCode::Tab => {
+                self.filtering = false;
+                self.list.selected = 0;
+            }
+            KeyCode::Backspace => {
+                self.filter.remove(self.filter.chars().count().saturating_sub(1));
+                self.list.selected = 0;
+            }
+            KeyCode::Char(c) => {
+                self.filter.push(c);
+                self.list.selected = 0;
+            }
+            _ => {}
+        }
+    }
+
+    /// 段头（以及配套的折叠）只在没有过滤词、且排序真的按分组走时出现：
+    /// 过滤时结果按模糊分数拍平，分组只会把命中顺序切碎。
+    pub(crate) fn headers_shown(&self) -> bool {
+        self.filter.trim().is_empty() && self.settings.list_sort.groups_ordered()
+    }
+
+    /// 一次算出"画什么"和"哪几台没被折叠"，两者必须同源。绘制帧里直接用它，
+    /// 别调 `list_rows()` + `visible()` + `selected_row()` 各算一遍。
+    pub(crate) fn rows_and_visible(&self) -> (Vec<ListRow>, Vec<usize>) {
+        let order = order_hosts(&self.vault.hosts, &self.filter, self.settings.list_sort);
+        build_list_rows(
+            &self.vault.hosts,
+            &order,
+            self.headers_shown(),
+            &self.list.folded,
+        )
+    }
+
+    /// 当前可见主机的顺序（列表下标 → `vault.hosts` 下标，段头不占位）。
+    pub(crate) fn visible(&self) -> Vec<usize> {
+        self.rows_and_visible().1
+    }
+
+    /// 光标挪到主机行上：段头能被 ↑↓ 经过，但不停留。
+    fn clamp_selection(&mut self) {
+        let len = self.visible().len();
+        if len == 0 {
+            self.list.selected = 0;
+        } else if self.list.selected >= len {
+            self.list.selected = len - 1;
+        }
+    }
+
+    /// Space：折叠/展开光标所在的那一段。折叠只在分组视图里生效，别的排序按
+    /// 一下给句提示，不然用户只会觉得"这台机器怎么自己消失了"。
+    fn toggle_fold(&mut self) {
+        if !self.headers_shown() {
+            self.status = Some(
+                "当前排序不分段，折叠无效（按 o 换到「默认」或「分组」）".to_string(),
+            );
+            return;
+        }
+        if self.visible().is_empty() && !self.list.folded.is_empty() {
+            // 全折起来的时候没有光标可用，Space 就是"把他们都放出来"
+            self.list.folded.clear();
+            self.status = Some("所有分组都被折叠了，已全部展开".to_string());
+            return;
+        }
+        let Some(host) = self.selected_host() else { return };
+        let g = group_of(&host);
+        if self.list.folded.iter().any(|f| f == &g) {
+            self.list.folded.retain(|f| f != &g);
+            self.status = Some(format!("已展开 {g}"));
+        } else {
+            self.list.folded.push(g.clone());
+            self.status = Some(format!("已折叠 {g}（Space 展开，z 展开全部）"));
+        }
+        self.clamp_selection();
+    }
+
+    /// z：一次收起/放出所有分组。全折叠时列表只剩段头，正好用来看"我有几组"。
+    fn toggle_fold_all(&mut self) {
+        if !self.headers_shown() {
+            self.status = Some("当前排序不分段，按 o 换到「默认」或「分组」".to_string());
+            return;
+        }
+        if !self.list.folded.is_empty() {
+            self.list.folded.clear();
+            self.status = Some("已展开全部分组".to_string());
+        } else {
+            self.list.folded = foldable_groups(&self.vault.hosts);
+            self.status = Some("已折叠全部分组（z 展开）".to_string());
+        }
+        self.clamp_selection();
+    }
+
+    /// o：循环排序方式，选择立刻写进 settings.ini，下次启动还是它。
+    fn cycle_sort(&mut self) {
+        self.settings.list_sort = self.settings.list_sort.next();
+        self.settings.save();
+        self.list.selected = 0;
+        self.status = Some(format!(
+            "列表排序：{}（按 o 切换）",
+            self.settings.list_sort.label()
+        ));
+    }
+
+    /// 当前可见行对应的主机（越界返回 None：删除最后一台之后就会这样）。
+    fn selected_host(&self) -> Option<Host> {
+        let i = *self.visible().get(self.list.selected)?;
+        self.vault.hosts.get(i).cloned()
+    }
+
+    /// 把列表光标移到某台主机上（列表下标是 `visible()` 的顺序，不能直接用房
+    /// 主在 `vault.hosts` 里的下标）。过滤词可能把它藏起来，所以一并清空；
+    /// 它所在的那一段被折叠过也要先展开，否则光标只会夹到别的主机上。
+    fn focus_host(&mut self, alias: &str) {
+        self.filter.clear();
+        self.filtering = false;
+        if let Some(g) = self.vault.hosts.iter().find(|h| h.alias == alias).map(group_of) {
+            self.list.folded.retain(|f| f != &g);
+        }
+        if let Some(row) = self
+            .visible()
+            .iter()
+            .position(|&i| self.vault.hosts[i].alias == alias)
+        {
+            self.list.selected = row;
+        } else {
+            self.list.selected = self
+                .list
+                .selected
+                .min(self.visible().len().saturating_sub(1));
+        }
+    }
+
+    fn toggle_favorite(&mut self) {
+        let Some(host) = self.selected_host() else { return };
+        let alias = host.alias.clone();
+        let now = host.favorite;
+        if let Some(h) = self.vault.hosts.iter_mut().find(|h| h.alias == alias) {
+            h.favorite = !now;
+        }
+        self.save_vault();
+        self.status = Some(if now {
+            format!("已取消收藏 {alias}")
+        } else {
+            format!("已收藏 {alias}（列表置顶）")
+        });
+    }
+
+    /// 隧道面板里对选中主机做的事：没跑就起，在跑就停。
+    fn toggle_tunnel(&mut self) {
+        let Some(alias) = self.tunnel_rows().get(self.tunnels_selected).cloned() else { return };
+        if self.tunnels.is_running(&alias) {
+            self.tunnels.stop_one(&alias);
+            self.tunnel_state.insert(alias.clone(), TunnelState::Stopped);
+            // 监听口随隧道一起没了，映射表不能再显示旧端口
+            self.tunnel_ports.remove(&alias);
+            let _ = audit::record(AuditKind::Tunnel, &alias, "手动停止");
+            self.status = Some(format!("已停止 {alias} 的隧道"));
+            return;
+        }
+        let Some(host) = self.vault.hosts.iter().find(|h| h.alias == alias).cloned() else {
+            return;
+        };
+        if host.forwards.is_empty() {
+            self.status = Some(format!("{alias} 没有转发规则，按 Enter 建一条"));
+            return;
+        }
+        self.start_tunnel_for(&host);
+    }
+
+    fn stop_all_tunnels(&mut self) {
+        let running = self.tunnels.running();
+        self.tunnels.stop_all();
+        for alias in &running {
+            self.tunnel_state.insert(alias.clone(), TunnelState::Stopped);
+            self.tunnel_ports.remove(alias);
+            let _ = audit::record(AuditKind::Tunnel, alias, "全部停止");
+        }
+        self.status = Some(format!("已停止 {} 条隧道", running.len()));
+    }
+
+    /// 进这台主机的规则表格。没有规则的主机也进得来（列表页 p），否则"添加"没有入口。
+    pub(crate) fn open_rules_for(&mut self, alias: String) {
+        let forwards = self
+            .vault
+            .hosts
+            .iter()
+            .find(|h| h.alias == alias)
+            .map(|h| h.forwards.clone())
+            .unwrap_or_default();
+        self.rules_alias = alias;
+        self.rules_rows = if forwards.is_empty() {
+            vec![RuleRow::empty()]
+        } else {
+            rules_from_forwards(&forwards)
+        };
+        self.rules_row = 0;
+        self.rules_col = 0;
+        self.rules_error = None;
+        self.rules_open = true;
+    }
+
+    /// 表格里的撞口提示（每行都要显示，不只看选中行）：编辑器打开时按行算一次。
+    pub(crate) fn rules_clashes(&self) -> Vec<String> {
+        (0..self.rules_rows.len())
+            .map(|i| row_clash_text(&self.rules_rows, &self.vault.hosts, &self.rules_alias, i))
+            .collect()
+    }
+
+    fn new_rule_row(&mut self) {
+        self.rules_rows.push(RuleRow::empty());
+        self.rules_row = self.rules_rows.len() - 1;
+        self.rules_col = 0;
+        self.rules_error = None;
+    }
+
+    fn delete_rule_row(&mut self) {
+        if self.rules_rows.is_empty() {
+            return;
+        }
+        self.rules_rows.remove(self.rules_row.min(self.rules_rows.len() - 1));
+        self.rules_row = self.rules_row.min(self.rules_rows.len().saturating_sub(1));
+        self.rules_error = None;
+    }
+
+    /// 类型列用 ←/→ 切换，不占按键：目标主机那一格要能打出任意字母。
+    fn cycle_rule_kind(&mut self, row: usize, forward: bool) {
+        const KINDS: [&str; 3] = ["L", "D", "R"];
+        let cur = self.rules_rows[row].kind.to_ascii_uppercase();
+        let idx = KINDS.iter().position(|k| *k == cur.as_str()).unwrap_or(0);
+        let next = if forward { (idx + 1) % KINDS.len() } else { (idx + KINDS.len() - 1) % KINDS.len() };
+        self.rules_rows[row].kind = KINDS[next].to_string();
+    }
+
+    /// 往当前格追加一个字符。表格里的格全是文本，合法性留到保存时统一判。
+    fn push_rule_char(&mut self, row: usize, ch: char) {
+        let mut v = self.rules_rows[row].cell(self.rules_col).to_string();
+        v.push(ch);
+        self.rules_rows[row].set_cell(self.rules_col, v);
+    }
+
+    fn handle_rules_key(&mut self, key: &KeyEvent, ctrl: bool) {
+        if self.rules_rows.is_empty() {
+            // 空表也要能起手：Ctrl-N 建行，Esc 离开（等于清空规则并放弃）
+            match key.code {
+                KeyCode::Esc => self.rules_open = false,
+                KeyCode::Char('n') if ctrl => self.new_rule_row(),
+                _ => {}
+            }
+            return;
+        }
+        let row = self.rules_row.min(self.rules_rows.len() - 1);
+        match key.code {
+            KeyCode::Esc => {
+                self.rules_open = false;
+                self.rules_error = None;
+            }
+            KeyCode::Enter => self.save_rules(),
+            KeyCode::Up => self.rules_row = row.saturating_sub(1),
+            KeyCode::Down => {
+                if row + 1 < self.rules_rows.len() {
+                    self.rules_row = row + 1;
+                }
+            }
+            KeyCode::Left => {
+                if self.rules_col == 0 {
+                    self.cycle_rule_kind(row, false);
+                } else {
+                    self.rules_col -= 1;
+                }
+            }
+            KeyCode::Right => {
+                // 最后一格再往右必须停住：越界后焦点画不出来，打字也像是丢了
+                if self.rules_col == 0 {
+                    self.cycle_rule_kind(row, true);
+                } else if self.rules_col + 1 < RULE_COLS.len() {
+                    self.rules_col += 1;
+                }
+            }
+            KeyCode::Tab => {
+                self.rules_col = (self.rules_col + 1) % RULE_COLS.len();
+                if self.rules_col == 0 && row + 1 < self.rules_rows.len() {
+                    self.rules_row = row + 1;
+                }
+            }
+            KeyCode::BackTab => {
+                if self.rules_col == 0 {
+                    self.rules_col = RULE_COLS.len() - 1;
+                    self.rules_row = row.saturating_sub(1);
+                } else {
+                    self.rules_col -= 1;
+                }
+            }
+            KeyCode::Char('n') if ctrl => self.new_rule_row(),
+            KeyCode::Char('d') if ctrl => self.delete_rule_row(),
+            KeyCode::Char('c') if ctrl => {
+                self.rules_rows[row].set_cell(self.rules_col, String::new());
+                self.rules_error = None;
+            }
+            KeyCode::Backspace => {
+                let v = self.rules_rows[row].cell(self.rules_col).to_string();
+                if let Some(c) = v.chars().next_back() {
+                    let mut t = v;
+                    t.truncate(t.len() - c.len_utf8());
+                    self.rules_rows[row].set_cell(self.rules_col, t);
+                }
+                self.rules_error = None;
+            }
+            KeyCode::Char(ch) if self.rules_col == 0 => {
+                // 类型列只认 L/D/R，打别的字母等于没按——留个非法值在表里不如不让进
+                let up = ch.to_ascii_uppercase();
+                if matches!(up, 'L' | 'D' | 'R') {
+                    self.rules_rows[row].kind = up.to_string();
+                    self.rules_error = None;
+                }
+            }
+            KeyCode::Char(ch) if !ctrl => {
+                self.push_rule_char(row, ch);
+                self.rules_error = None;
+            }
+            _ => {}
+        }
+    }
+
+    /// 保存：把表格写回这台主机的 forwards。正在跑的隧道拿的是启动时刻的快照，
+    /// 规则改了不重启就等于没改（端口也不会跟着变），所以这里主动重启一次。
+    fn save_rules(&mut self) {
+        let (forwards, errors) = rules_to_forwards(&self.rules_rows);
+        if !errors.is_empty() {
+            self.rules_error = Some(errors.join("；"));
+            return;
+        }
+        let alias = self.rules_alias.clone();
+        let Some(found) = self.vault.hosts.iter().find(|h| h.alias == alias).cloned() else {
+            self.rules_error = Some(format!("{alias} 已不在保险库里"));
+            return;
+        };
+        let running = self.tunnels.is_running(&alias);
+        let changed = found.forwards != forwards;
+        let mut host = found;
+        host.forwards = forwards;
+        let empty = host.forwards.is_empty();
+        self.vault.upsert(host.clone());
+        self.save_vault();
+        let _ = audit::record(AuditKind::VaultSaved, &alias, "转发规则已更新");
+        self.rules_open = false;
+        self.status = Some(if running && changed && !empty {
+            self.tunnels.stop_one(&alias);
+            self.tunnel_ports.remove(&alias);
+            self.start_tunnel_for(&host);
+            format!("{alias}：规则已保存，隧道按新规则重启")
+        } else if running && empty {
+            self.tunnels.stop_one(&alias);
+            self.tunnel_state.insert(alias.clone(), TunnelState::Stopped);
+            self.tunnel_ports.remove(&alias);
+            format!("{alias}：规则已清空，隧道随之停止")
+        } else if running {
+            format!("{alias}：规则没变，隧道继续跑")
+        } else {
+            format!("{alias}：已保存 {} 条规则（按 t 打开面板、空格启停）", host.forwards.len())
+        });
+    }
+
+    fn open_ports(&mut self) {
+        self.ports_open = true;
+    }
+
+    fn handle_ports_key(&mut self, key: &KeyEvent) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('m') => self.ports_open = false,
+            _ => {}
+        }
+    }
+
+    /// 面板上的行：有转发规则的主机（没规则的不显示，否则整台机器列表都在）。
+    pub(crate) fn tunnel_rows(&self) -> Vec<String> {
+        let mut rows: Vec<String> = self
+            .vault
+            .hosts
+            .iter()
+            .filter(|h| !h.forwards.is_empty())
+            .map(|h| h.alias.clone())
+            .collect();
+        rows.sort();
+        rows
+    }
+
+    fn on_tunnel_event(&mut self, event: TunnelEvent) {
+        let _ = audit::record(AuditKind::Tunnel, &event.alias, &event.label());
+        // 停止/终局时监听口已经不在了，映射表里必须一起消失，不能留个"看起来还在听"的旧端口
+        if event.ports.is_empty() || matches!(event.state, TunnelState::Stopped) {
+            self.tunnel_ports.remove(&event.alias);
+        } else {
+            self.tunnel_ports.insert(event.alias.clone(), event.ports.clone());
+        }
+        self.tunnel_state.insert(event.alias.clone(), event.state.clone());
+        // 面板开着就给一行即时反馈；失败必须让用户看见，不能只改状态色
+        if matches!(event.state, TunnelState::Failed(_)) {
+            self.status = Some(event.label());
+        }
+    }
+
+    fn open_known(&mut self) {
+        self.known_entries = hostkey::list_entries();
+        self.known_selected = 0;
+        self.known_open = true;
+    }
+
+    /// 删除选中的一条 `~/.ells/known_hosts` 记录（`~/.ssh` 的那些只读、删不掉）。
+    /// 删了下次连这台会重新问一次指纹——这正是它存在的用途（密钥换了又不想留着旧的）。
+    fn delete_known_entry(&mut self) {
+        let Some(entry) = self.known_entries.get(self.known_selected).cloned() else { return };
+        if !entry.writable {
+            self.known_msg = Some("来自 ~/.ssh/known_hosts，ells 不修改它".to_string());
+            return;
+        }
+        match hostkey::delete_entry(&entry.hosts, &entry.algorithm) {
+            Ok(()) => {
+                let _ = audit::record(
+                    AuditKind::HostKeyTrusted,
+                    &entry.hosts,
+                    &format!("删除记录 {}", entry.algorithm),
+                );
+                self.known_entries = hostkey::list_entries();
+                self.known_selected = self
+                    .known_selected
+                    .min(self.known_entries.len().saturating_sub(1));
+                self.known_msg = None;
+                self.status = Some(format!("已删除 {} 的 {} 记录", entry.hosts, entry.algorithm));
+            }
+            Err(err) => self.known_msg = Some(format!("删除失败：{err}")),
+        }
+    }
+
+    fn open_audit(&mut self) {
+        self.audit_lines = audit::read_last(200);
+        self.audit_scroll = 0;
+        self.audit_open = true;
+    }
+
+    fn handle_known_key(&mut self, key: &KeyEvent) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('h') => {
+                self.known_open = false;
+                self.known_msg = None;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.known_selected = self.known_selected.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if self.known_selected + 1 < self.known_entries.len() {
+                    self.known_selected += 1;
+                }
+            }
+            KeyCode::Char('d') => self.delete_known_entry(),
+            _ => {}
+        }
+    }
+
+    fn handle_audit_key(&mut self, key: &KeyEvent) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('l') => self.audit_open = false,
+            KeyCode::Up => self.audit_scroll = self.audit_scroll.saturating_sub(1),
+            KeyCode::Down => {
+                let max = self.audit_lines.len().saturating_sub(1);
+                self.audit_scroll = (self.audit_scroll + 1).min(max);
+            }
+            KeyCode::PageUp => self.audit_scroll = self.audit_scroll.saturating_sub(10),
+            KeyCode::PageDown => {
+                let max = self.audit_lines.len().saturating_sub(1);
+                self.audit_scroll = (self.audit_scroll + 10).min(max);
+            }
+            _ => {}
+        }
+    }
+
+    /// 打开会话记录页：列最近 50 个日志文件，Enter 看内容。
+    fn open_sessions(&mut self) {
+        self.sessions_rows = sessionlog::list(50);
+        self.sessions_selected = 0;
+        self.sessions_text = None;
+        self.sessions_scroll = 0;
+        self.sessions_open = true;
+    }
+
+    /// 读入选中那一份的正文（去掉控制序列，界面里看着干净）。
+    fn open_session_preview(&mut self) {
+        let Some(row) = self.sessions_rows.get(self.sessions_selected) else {
+            self.status = Some("没有可看的会话记录".to_string());
+            return;
+        };
+        let path = row.path.clone();
+        self.sessions_text = sessionlog::read_plain(&path).or_else(|| {
+            self.status = Some(format!("读不了 {}（文件可能已被清理）", row.name));
+            None
+        });
+        self.sessions_scroll = 0;
+    }
+
+    fn handle_sessions_key(&mut self, key: &KeyEvent) {
+        // 正在看正文：这一层只翻页，Esc 回到文件列表
+        if self.sessions_text.is_some() {
+            let lines = self
+                .sessions_text
+                .as_ref()
+                .map(|t| t.lines().count())
+                .unwrap_or(0);
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {
+                    self.sessions_text = None;
+                    self.sessions_scroll = 0;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.sessions_scroll = self.sessions_scroll.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.sessions_scroll = (self.sessions_scroll + 1).min(lines.saturating_sub(1));
+                }
+                KeyCode::PageUp | KeyCode::Char('u') => {
+                    self.sessions_scroll = self.sessions_scroll.saturating_sub(10);
+                }
+                KeyCode::PageDown | KeyCode::Char('d') | KeyCode::Char(' ') => {
+                    self.sessions_scroll = (self.sessions_scroll + 10).min(lines.saturating_sub(1));
+                }
+                _ => {}
+            }
+            return;
+        }
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('v') => self.sessions_open = false,
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.sessions_selected = self.sessions_selected.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if self.sessions_selected + 1 < self.sessions_rows.len() {
+                    self.sessions_selected += 1;
+                }
+            }
+            KeyCode::Enter => self.open_session_preview(),
+            KeyCode::Char('d') => self.delete_session_log(),
+            _ => {}
+        }
+    }
+
+    /// 删掉选中的那份日志：只删 `~/.ells/logs` 里我们自己去认的文件名。
+    fn delete_session_log(&mut self) {
+        let Some(row) = self.sessions_rows.get(self.sessions_selected).cloned() else {
+            return;
+        };
+        match std::fs::remove_file(&row.path) {
+            Ok(()) => {
+                let _ = audit::record(AuditKind::Settings, "logs", &format!("删除会话记录 {}", row.name));
+                self.sessions_rows = sessionlog::list(50);
+                self.sessions_selected = self
+                    .sessions_selected
+                    .min(self.sessions_rows.len().saturating_sub(1));
+                self.status = Some(format!("已删除 {}", row.name));
+            }
+            Err(err) => self.status = Some(format!("删除失败：{err}")),
+        }
+    }
+
+    fn handle_tunnels_key(&mut self, key: &KeyEvent) {
+        let rows = self.tunnel_rows();
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('t') => self.tunnels_open = false,
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.tunnels_selected = self.tunnels_selected.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if self.tunnels_selected + 1 < rows.len() {
+                    self.tunnels_selected += 1;
+                }
+            }
+            // 启停挪到空格/s：Enter 现在是"进这台主机的规则表格"，
+            // 与"Enter = 进入/确认"在全程序一致（表单、会话、标签页都是这个语义）。
+            KeyCode::Char(' ') | KeyCode::Char('s') => self.toggle_tunnel(),
+            KeyCode::Enter => {
+                if let Some(alias) = rows.get(self.tunnels_selected).cloned() {
+                    self.tunnels_open = false;
+                    self.open_rules_for(alias);
+                }
+            }
+            KeyCode::Char('m') => self.open_ports(),
+            KeyCode::Char('x') => self.stop_all_tunnels(),
             _ => {}
         }
     }
@@ -3074,9 +4835,12 @@ impl App {
         if let Some(alias) = self.delete_confirm.take() {
             self.vault.remove(&alias);
             self.save_vault();
+            let _ = audit::record(AuditKind::VaultSaved, &alias, "主机已删除");
             self.status = Some(format!("已删除 {alias}"));
-            self.list.selected =
-                self.list.selected.min(self.vault.hosts.len().saturating_sub(1));
+            self.list.selected = self
+                .list
+                .selected
+                .min(self.visible().len().saturating_sub(1));
         }
     }
 
@@ -3123,6 +4887,8 @@ impl App {
             let slot = &mut self.slots[idx];
             slot.host = Some(host.clone());
             slot.connecting = true;
+            // 谁发起这一路都一样：先把还在等表的定时器作废
+            slot.reconnect_seq += 1;
             slot.view = ScreenKind::List;
             slot.status = Some(format!("正在连接 {}…", host.alias));
         }
@@ -3132,7 +4898,28 @@ impl App {
         self.settings_open = false;
         self.transfer_popup = false;
         self.status = Some(format!("正在连接 {}…", host.alias));
+        // 带了转发规则的主机：连接时就顺手把隧道拉起来，不等用户去面板按 Enter。
+        // 隧道用自己的连接，会话挂了它也不挂（见 TunnelManager）。
+        if !host.forwards.is_empty() && !self.tunnels.is_running(&host.alias) {
+            self.start_tunnel_for(&host);
+        }
         self.pending_connect = Some((host, idx));
+    }
+
+    /// 起某台主机的隧道（连接时自动、面板里手动都走这里）。
+    fn start_tunnel_for(&mut self, host: &Host) {
+        if host.forwards.is_empty() {
+            return;
+        }
+        let alias = host.alias.clone();
+        let vault = Arc::new(self.vault.clone());
+        self.tunnels.start(host, vault);
+        self.tunnel_state.insert(alias.clone(), TunnelState::Connecting);
+        let _ = audit::record(AuditKind::Tunnel, &alias, "启动");
+        self.status = Some(format!(
+            "正在启动 {alias} 的隧道（{} 条规则）",
+            host.forwards.len()
+        ));
     }
 
     /// `ells <别名>` / `s <别名>`：解锁后按别名直连，只尝试一次。
@@ -3170,17 +4957,15 @@ impl App {
 
     /// 连接意外结束：一键重连同一主机（用户按 Ctrl-] 主动断开、或在远端敲
     /// exit/logout 正常退出都不会走到这里）。
-    fn offer_reconnect(&mut self, host: Host) {
-        if let Some(idx) = self.vault.hosts.iter().position(|h| h.alias == host.alias) {
-            self.list.selected = idx;
-        }
+    fn offer_reconnect(&mut self, host: Host, reason: Option<String>) {
+        self.focus_host(&host.alias);
         let tx = self.event_tx.clone();
         let slot = self.slot_id();
         self.choice = Some(Choice {
             title: "连接已断开".to_string(),
             lines: vec![
                 format!("主机：{}", host.target()),
-                "可能是网络中断、服务器重启或空闲超时。".to_string(),
+                reason.unwrap_or_else(|| "可能是网络中断、服务器重启或空闲超时。".to_string()),
             ],
             options: vec!["重 连".to_string(), "返 回 列 表".to_string()],
             selected: 0,
@@ -3194,12 +4979,322 @@ impl App {
         });
     }
 
+    /// 异常掉线：先按退避自动重连，关掉自动或次数用尽才弹窗问用户。
+    fn on_session_lost(&mut self, idx: usize, host: Host) {
+        let params = self.settings.reconnect;
+        let up = self.slots[idx]
+            .connected_at
+            .map(|at| at.elapsed().as_secs())
+            .unwrap_or(u64::MAX);
+        // 站稳过之后的一次偶发断开从第 1 次重头算；连上就掉的那种"抖"继续往上爬，
+        // 否则退避永远停在 1 秒，等于对着一个坏链路猛撞。
+        let start = if params.was_stable(up) {
+            1
+        } else {
+            self.slots[idx].reconnect_attempt.saturating_add(1).max(1)
+        };
+        self.stop_reconnect(idx);
+        if params.max_attempts == 0 {
+            self.offer_reconnect(host, None);
+            return;
+        }
+        if start > params.max_attempts {
+            self.offer_reconnect(
+                host,
+                Some(format!(
+                    "已自动重连 {} 次都没接上，先停下来问一下。",
+                    params.max_attempts
+                )),
+            );
+            return;
+        }
+        self.arm_reconnect(idx, host, start, None);
+    }
+
+    /// 布防一次自动重连：睡到点再发 `AutoReconnect`。期间任何主动操作都会顶掉
+    /// 代号（`reconnect_seq`），到点的旧定时器因此作废，不会出现"你以为停了、
+    /// 它还在后台一遍遍连"。
+    fn arm_reconnect(&mut self, idx: usize, host: Host, attempt: u32, reason: Option<String>) {
+        let params = self.settings.reconnect;
+        let wait = params.delay_with_jitter(attempt, pseudo_spread());
+        let slot = &mut self.slots[idx];
+        slot.reconnect_seq += 1;
+        slot.reconnect_attempt = attempt;
+        slot.reconnect_host = Some(host.clone());
+        let seq = slot.reconnect_seq;
+        let id = slot.id;
+        let secs = wait.as_millis().div_ceil(1000).max(1);
+        let head = reason.unwrap_or_else(|| "连接已断开".to_string());
+        let text = format!(
+            "{head} · {secs} 秒后自动重连（第 {attempt}/{} 次）· 按 Ctrl-] 停止",
+            params.max_attempts
+        );
+        slot.status = Some(text.clone());
+        if idx == self.active {
+            self.status = Some(text);
+        }
+        let _ = audit::record(
+            AuditKind::Connect,
+            &host.alias,
+            &format!("自动重连排队 第 {attempt}/{} 次", params.max_attempts),
+        );
+        let tx = self.event_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(wait).await;
+            let _ = tx.send(AppEvent::AutoReconnect {
+                slot: id,
+                host,
+                attempt,
+                seq,
+            });
+        });
+    }
+
+    /// 撤掉这一路在等的自动重连。
+    fn stop_reconnect(&mut self, idx: usize) {
+        let slot = &mut self.slots[idx];
+        slot.reconnect_seq += 1;
+        slot.reconnect_attempt = 0;
+        slot.reconnect_host = None;
+    }
+
+    /// 这一标签下一次该等多久：用户正在看的这一格按 5 秒（连着失败就沿阶梯往上退），
+    /// 背景那几格降到 `METRICS_IDLE_EVERY`。
+    ///
+    /// 判据用 `active` 而不是 `work`：处理事件时 `work` 会被挪到这条事件所属的标签上，
+    /// 那不代表用户在看它。间隔是在**回包时**定的，所以换标签不必打断任何在途轮次 ——
+    /// 后台那一轮回来自然按慢节奏重接。
+    fn metrics_interval(&self, idx: usize) -> std::time::Duration {
+        metrics_every(idx == self.active, self.slots[idx].metrics.interval())
+    }
+
+    /// 这一标签重新被用户看见：那一分钟的等待不该让他对着旧数看，作废在等的定时器、
+    /// 立刻接一轮采集（代号一 +1，在途的旧回包一并作废）。切回去就见到新鲜的数。
+    fn revive_metrics(&mut self, idx: usize) {
+        {
+            let slot = &mut self.slots[idx];
+            if slot.session.is_none() || slot.metrics.unsupported {
+                return;
+            }
+            slot.metrics.cancel();
+        }
+        self.arm_metrics(idx, METRICS_FIRST_DELAY);
+    }
+
+    /// 布防这一标签的下一次采集：睡 `every` 再发一个带代号的 `MetricsTick`。
+    /// 与自动重连同一套路 —— 一次性定时器 + 代号作废，全局没有 tick。
+    fn arm_metrics(&mut self, idx: usize, every: std::time::Duration) {
+        if !self.settings.metrics {
+            return;
+        }
+        let slot = &mut self.slots[idx];
+        if slot.session.is_none() || slot.metrics.unsupported {
+            return;
+        }
+        let seq = slot.metrics.arm();
+        let id = slot.id;
+        let tx = self.event_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(every).await;
+            let _ = tx.send(AppEvent::MetricsTick { slot: id, seq });
+        });
+    }
+
+    /// 定时器到点：代号对得上才真的去开采集通道。会话已经没了就把这条链断在这里，
+    /// 不再布防 —— 一排进度条不值得在已断的连接上重试。
+    fn on_metrics_tick(&mut self, idx: usize, seq: u64) {
+        {
+            let slot = &self.slots[idx];
+            if slot.metrics.seq != seq || slot.metrics.unsupported {
+                return;
+            }
+        }
+        let Some(target) = self.slots[idx]
+            .session
+            .as_ref()
+            .and_then(|s| s.session.probe_target())
+        else {
+            self.slots[idx].metrics.cancel();
+            return;
+        };
+        let id = self.slots[idx].id;
+        // 磁盘每一轮都要数，但不是每一轮都普查：普查按 60 秒的节奏数轮次（`disk_rounds`），
+        // 中间那几轮采集那边只对"当前最满那块"问一次 statvfs。
+        let want_survey = self.slots[idx].metrics.disk_survey_due();
+        let tx = self.event_tx.clone();
+        tokio::spawn(async move {
+            let res = target
+                .gather(METRICS_TIMEOUT, METRICS_MAX_BYTES, true, want_survey)
+                .await
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(AppEvent::MetricsProbe { slot: id, seq, res });
+        });
+    }
+
+    /// 采集回来：先认数，再布防下一轮（所以每条会话任何时刻至多一轮在途）。
+    /// 代号对不上说明这期间断开过 / 关过标签 / 改过设置，这一包直接丢，
+    /// 绝不能让它把已经消失的那一行又画回来。
+    fn on_metrics_probe(
+        &mut self,
+        idx: usize,
+        seq: u64,
+        res: std::result::Result<ells_core::Probe, String>,
+    ) {
+        let keep_polling = {
+            let slot = &mut self.slots[idx];
+            if slot.metrics.seq != seq {
+                return;
+            }
+            match res {
+                Ok(probe) => slot.metrics.adopt(&probe),
+                Err(_) => slot.metrics.missed(),
+            }
+        };
+        if keep_polling {
+            // 通道连着失败到退避顶端时说一句：数字从此一分钟才动一次，不说明原因
+            // 就会被当成"这根条坏了"。除此之外不打扰 —— 断开有自己的状态行。
+            if self.slots[idx].metrics.just_capped() {
+                self.slots[idx].status = Some(
+                    "这台主机的指标通道连续采集失败，已放慢到 60 秒一轮 · 恢复后自动回到 5 秒"
+                        .to_string(),
+                );
+            }
+            // 刚差出基线、还欠一个 CPU 数：这一轮之后两秒就接力（用户正看着的才值得抢）。
+            let every = metrics_next(
+                self.slots[idx].metrics.cpu_pending,
+                idx == self.active,
+                self.slots[idx].metrics.interval(),
+            );
+            self.arm_metrics(idx, every);
+        } else {
+            // 一行忽然消失总得说句为什么：这一格的状态行本来就说不清是网络还是机器
+            self.slots[idx].status = Some(
+                "这台主机采不到指标，已停止轮询 · 底部那一行还给终端".to_string(),
+            );
+        }
+        self.sync_footer_rows(idx);
+    }
+
+    /// 指标开关（含"这台采不到"）变了：把每一标签的视口高度对齐到实际会画的行数，
+    /// 并按需接上/停掉采集。切标签不改 —— 行数本来就是按每个标签自己的状态算的。
+    ///
+    /// 这里**不**把判定采不到的机器救回来：判一次就停手，只有用户特意重新打开
+    /// （`set_metrics_setting`）才再给那台一次机会。否则改个主题都要那台机器重采三轮、
+    /// 那一行闪回来又消失。
+    fn sync_metrics(&mut self) {
+        for idx in 0..self.slots.len() {
+            let on = self.settings.metrics && self.slots[idx].session.is_some();
+            if !on {
+                self.slots[idx].metrics.cancel();
+            }
+            if on && !self.slots[idx].metrics.is_polling() {
+                // 只有用户看得见的那一格抢第一轮；背景那几格按自己的降频节奏接上
+                let every = if idx == self.active {
+                    METRICS_FIRST_DELAY
+                } else {
+                    self.metrics_interval(idx)
+                };
+                self.arm_metrics(idx, every);
+            }
+            self.sync_footer_rows(idx);
+        }
+    }
+
+    /// 设置页那一行的唯一入口：打开时把"采不到"的判定收回（用户特意再开一次，
+    /// 就当新机器待见一回），关掉就把所有在途轮次作废。
+    fn set_metrics_setting(&mut self, on: bool) {
+        self.settings.metrics = on;
+        if on {
+            for idx in 0..self.slots.len() {
+                if self.slots[idx].metrics.unsupported {
+                    self.slots[idx].metrics.reset();
+                }
+            }
+        }
+        self.sync_metrics();
+    }
+
+    /// 底部指标行占不占那一行：连着、开着、且还没判定采不到。
+    /// 判定采不到之后要把这一行还给终端 —— 白占一行高度比看不到数字更糟。
+    pub(crate) fn footer_rows(&self, idx: usize) -> u16 {
+        let slot = &self.slots[idx];
+        if self.settings.metrics && slot.session.is_some() && !slot.metrics.unsupported {
+            1
+        } else {
+            0
+        }
+    }
+
+    fn sync_footer_rows(&mut self, idx: usize) {
+        let rows = self.footer_rows(idx);
+        if let Some(s) = self.slots[idx].session.as_mut() {
+            s.set_footer_rows(rows);
+        }
+    }
+
+    /// 定时器到点：代号和次数都对得上才真的去连，否则这就是条过期定时器。
+    fn on_reconnect_timer(&mut self, host: Host, attempt: u32, seq: u64) {
+        let idx = self.work;
+        {
+            let slot = &self.slots[idx];
+            if slot.reconnect_seq != seq || slot.reconnect_attempt != attempt {
+                return;
+            }
+        }
+        // start_connect 会顶掉代号（让这条链上更早的定时器全部作废），所以这里
+        // 连完再把"本轮第几次"补回去：连接失败时才知道该接着爬哪一档退避。
+        let for_next = host.clone();
+        self.start_connect(host, Some(idx));
+        let slot = &mut self.slots[idx];
+        slot.reconnect_attempt = attempt;
+        slot.reconnect_host = Some(for_next);
+    }
+
+    /// 连接失败后接着爬退避：还有额度就继续自动，用完才弹窗。
+    fn on_connect_failed(&mut self, idx: usize, err: &str) {
+        if self.slots[idx].reconnect_attempt == 0 {
+            return;
+        }
+        // 主机密钥没过：那是要用户拍板的事，自动重试等于把同一个确认框连着弹三次
+        if key_trouble(err) {
+            self.stop_reconnect(idx);
+            return;
+        }
+        let params = self.settings.reconnect;
+        let Some(host) = self.slots[idx].reconnect_host.clone() else {
+            self.stop_reconnect(idx);
+            return;
+        };
+        let next = self.slots[idx].reconnect_attempt.saturating_add(1);
+        if next <= params.max_attempts {
+            self.arm_reconnect(idx, host, next, Some(format!("重连失败：{err}")));
+            return;
+        }
+        self.stop_reconnect(idx);
+        if idx == self.active {
+            self.offer_reconnect(
+                host,
+                Some(format!(
+                    "已自动重连 {} 次都没接上，先停下来问一下。",
+                    params.max_attempts
+                )),
+            );
+        }
+    }
+
     fn on_connected(&mut self, res: std::result::Result<RemoteSession, String>) {
         let event_tx = self.event_tx.clone();
         let idx = self.work;
         // 后台标签连上了不该抢界面：用户可能正在另一路上打字
         let foreground = idx == self.active;
+        // 记一笔要用别名，而失败分支会把 slot.host 清空，所以在动任何状态前抄下来。
+        let alias = self.slots[idx]
+            .host
+            .as_ref()
+            .map(|h| h.alias.clone())
+            .unwrap_or_else(|| "?".to_string());
         let mut connected = false;
+        let mut failed: Option<String> = None;
         match res {
             Ok(mut session) => {
                 let slot = &mut self.slots[idx];
@@ -3211,12 +5306,25 @@ impl App {
                     .as_ref()
                     .map(|h| format!("{} · {}", h.alias, h.target()))
                     .unwrap_or_else(|| "会话".to_string());
+                // 会话落盘：连着就开一个文件，用户关了就收；写不进去只少一份记录
+                slot.log = if self.settings.session_log {
+                    sessionlog::Recorder::start(&alias).map(|mut lg| {
+                        lg.note(&format!("会话已建立 · {label}"));
+                        lg
+                    })
+                } else {
+                    None
+                };
                 if let Some(rx) = session.take_output() {
                     events::spawn_remote_pump(rx, event_tx, id);
                 }
                 slot.sftp = session.sftp();
                 let (cols, rows) = term_size();
-                slot.session = Some(SessionState::new(label, session, rows, cols));
+                // 新会话先归零上一台机器的数；那一行的位置从连上就占好，
+                // 免得出数的一瞬间视口高度跳一行
+                slot.metrics.reset();
+                let footer = if self.settings.metrics { 1 } else { 0 };
+                slot.session = Some(SessionState::new(label, session, rows, cols, footer));
                 slot.remote_cwd.clear();
                 slot.sz_pending.clear();
                 slot.rz_pending = false;
@@ -3226,21 +5334,46 @@ impl App {
                 slot.cancel = Cancel::default();
                 slot.status = None;
                 slot.view = ScreenKind::Session;
+                // 连上了：这一轮退避到此为止，并记下时刻 —— 下次断开算不算
+                // "站稳后的偶发"就看这个
+                slot.connected_at = Some(std::time::Instant::now());
+                slot.reconnect_attempt = 0;
+                slot.reconnect_host = None;
                 connected = true;
             }
             Err(err) => {
                 let msg = format!("连接失败: {err}");
+                let _ = audit::record(AuditKind::ConnectFailed, &alias, &err);
                 let slot = &mut self.slots[idx];
                 slot.connecting = false;
                 slot.host = None;
                 slot.status = Some(msg.clone());
                 self.status = Some(msg);
+                failed = Some(err);
             }
+        }
+        if connected {
+            // "最近使用"排序靠这个时间戳，连上就写，不写列表永远排不出新旧
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            if let Some(h) = self.vault.hosts.iter_mut().find(|h| h.alias == alias) {
+                h.last_connected = now;
+            }
+            self.save_vault();
+            let _ = audit::record(AuditKind::Connect, &alias, "会话已建立");
+            // 底部那排指标：连上立刻探一次（内存/负载/磁盘当场有数），差出基线后两秒
+            // 补上 CPU，之后 5 秒一轮（磁盘那条腿 60 秒一次）
+            self.arm_metrics(idx, METRICS_FIRST_DELAY);
         }
         if foreground && connected {
             self.screen = ScreenKind::Session;
             self.status = None;
             self.transfer_popup = false;
+        }
+        if let Some(err) = failed {
+            self.on_connect_failed(idx, &err);
         }
         self.refresh_remote_cwd();
     }
@@ -3260,6 +5393,13 @@ impl App {
             .to_string(),
         ];
         let responder = prompt.responder;
+        // 决策落在弹窗回调里（回调碰不到 App），审计就在那里直接写文件
+        let (audit_host, audit_algo, audit_fp) = (
+            format!("{}:{}", prompt.host, prompt.port),
+            prompt.algorithm.clone(),
+            prompt.fingerprint.clone(),
+        );
+        let audit_changed = changed;
         self.choice = Some(Choice {
             title: if changed { "主机密钥已变更" } else { "确认主机密钥" }.to_string(),
             lines,
@@ -3273,7 +5413,21 @@ impl App {
             shortcuts: &[('n', 0), ('y', 1)],
             danger: changed,
             on_pick: Box::new(move |idx| {
-                let _ = responder.send(matches!(idx, Some(1)));
+                let accept = matches!(idx, Some(1));
+                let _ = responder.send(accept);
+                let _ = audit::record(
+                    if audit_changed {
+                        AuditKind::HostKeyChanged
+                    } else {
+                        AuditKind::HostKeyTrusted
+                    },
+                    &audit_host,
+                    &format!(
+                        "{} {audit_algo} {}{audit_fp}",
+                        if accept { "接受" } else { "拒绝" },
+                        if audit_changed && !accept { "（拒绝更新）" } else { "" }
+                    ),
+                );
             }),
         });
     }
@@ -3461,6 +5615,11 @@ impl App {
             }
             KeyCode::Char('f') if ctrl => {
                 self.open_picker();
+            }
+            KeyCode::Char('r') if ctrl && kind == Some(FieldKind::Secret) => {
+                // Ctrl-R 显形/遮回：十次"存完连不上"有八次是密码末尾多敲了一个字符，
+                // 不让用户看一眼自己敲的东西就只能反复重填。
+                self.form.reveal_secret = !self.form.reveal_secret;
             }
             KeyCode::Char('j') if ctrl && role == Some(FieldRole::Jump) => {
                 self.open_jump_picker();
@@ -3733,7 +5892,13 @@ impl App {
     }
 
     fn form_submit(&mut self) {
-        match self.form.build_host() {
+        let prior = self
+            .form
+            .editing_alias
+            .as_ref()
+            .and_then(|old| self.vault.hosts.iter().find(|h| &h.alias == old))
+            .cloned();
+        match self.form.build_host(prior.as_ref()) {
             Ok(mut host) => {
                 let alias = host.alias.clone();
                 match self.backup_key(&mut host) {
@@ -3741,14 +5906,14 @@ impl App {
                         if let Some(old) = self.form.editing_alias.take() {
                             self.vault.remove(&old);
                         }
-                        self.list.selected = self
-                            .vault
-                            .hosts
-                            .iter()
-                            .position(|h| h.alias == alias)
-                            .unwrap_or(0);
                         self.vault.upsert(host);
                         self.save_vault();
+                        let _ = audit::record(
+                            AuditKind::VaultSaved,
+                            &alias,
+                            if prior.is_some() { "主机已更新" } else { "主机已新增" },
+                        );
+                        self.focus_host(&alias);
                         self.status = Some(if copied {
                             format!("已保存 {alias}（私钥已备份到 ~/.ells/keys）")
                         } else {
@@ -3786,6 +5951,7 @@ impl FormState {
             editing_alias: None,
             error: None,
             jump_picker: None,
+            reveal_secret: false,
         }
     }
 
@@ -3823,13 +5989,51 @@ impl FormState {
                 field(FieldRole::KeyPath, "私钥路径 ctrl-f", FieldKind::Text, key_path),
                 field(FieldRole::KeyPass, "私钥口令(可选)", FieldKind::Secret, key_pass),
                 field(FieldRole::Jump, "跳板机(可选) ctrl-j", FieldKind::Text, host.and_then(|h| h.jump.clone()).unwrap_or_default()),
+                field(FieldRole::Group, "分组(可选)", FieldKind::Text, host.and_then(|h| h.group.clone()).unwrap_or_default()),
+                field(FieldRole::Tags, "标签(逗号分隔)", FieldKind::Text, host.map(|h| h.tags.join(", ")).unwrap_or_default()),
+                field(
+                    FieldRole::Forwards,
+                    "转发 -L 8080:127.0.0.1:5432 -D 1080",
+                    FieldKind::Text,
+                    host.map(|h| {
+                        h.forwards
+                            .iter()
+                            .map(|f| f.label())
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    })
+                    .unwrap_or_default(),
+                ),
             ],
             focus: 0,
             footer: None,
             editing_alias: host.map(|h| h.alias.clone()),
             error: None,
             jump_picker: None,
+            reveal_secret: false,
         }
+    }
+
+    /// 从一台已有主机"新建同类"：带上结构性字段（用户/端口/认证方式/私钥路径/
+    /// 跳板/分组/标签/转发），别名、主机名和密码留空——身份和凭据必须自己填，
+    /// 免得把上一台的口令悄悄复制进新条目里。
+    fn template(host: Option<&Host>) -> Self {
+        let mut form = Self::new(host);
+        if host.is_some() {
+            form.editing_alias = None;
+            for f in &mut form.fields {
+                if matches!(
+                    f.role,
+                    FieldRole::Alias
+                        | FieldRole::Hostname
+                        | FieldRole::Password
+                        | FieldRole::KeyPass
+                ) {
+                    f.value.clear();
+                }
+            }
+        }
+        form
     }
 
     /// Field indices currently shown for the selected auth method.
@@ -3897,7 +6101,9 @@ impl FormState {
         }
     }
 
-    fn build_host(&self) -> std::result::Result<Host, String> {
+    /// `prior` 是编辑中的原主机：收藏、备注、最近连接时间这些不在表单里的字段
+    /// 必须从它继承，否则用户每编辑一次就把自己的标记清干净。
+    fn build_host(&self, prior: Option<&Host>) -> std::result::Result<Host, String> {
         let alias = self.value_of(FieldRole::Alias).trim().to_string();
         let hostname = self.value_of(FieldRole::Hostname).trim().to_string();
         let port: u16 = self
@@ -3906,8 +6112,20 @@ impl FormState {
             .parse()
             .map_err(|_| "端口必须是 1-65535 的数字".to_string())?;
         let user = self.value_of(FieldRole::User).trim().to_string();
-        if alias.is_empty() || hostname.is_empty() || user.is_empty() {
-            return Err("别名、主机、用户是必填项".to_string());
+        // 只点名缺的那几项：三个都填了只差用户时，报"别名、主机、用户是必填项"
+        // 等于让用户把已经填对的重新看一遍。
+        let mut missing: Vec<&str> = Vec::new();
+        if alias.is_empty() {
+            missing.push("别名");
+        }
+        if hostname.is_empty() {
+            missing.push("主机");
+        }
+        if user.is_empty() {
+            missing.push("用户");
+        }
+        if !missing.is_empty() {
+            return Err(format!("{}是必填项", missing.join("、")));
         }
         let auth = match self.auth_value() {
             "password" => {
@@ -3937,6 +6155,19 @@ impl FormState {
         if !jump.is_empty() && jump == alias {
             return Err("跳板机不能是该主机自身".to_string());
         }
+        let (forwards, bad) = Forward::parse_specs(self.value_of(FieldRole::Forwards));
+        if !bad.is_empty() {
+            return Err(format!("转发规则看不懂：{}", bad.join("、")));
+        }
+        let group = self.value_of(FieldRole::Group).trim().to_string();
+        let tags: Vec<String> = self
+            .value_of(FieldRole::Tags)
+            .split([',', '，', ' '])
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(|t| t.trim_start_matches('#').to_string())
+            .filter(|t| !t.is_empty())
+            .collect();
         Ok(Host {
             alias,
             hostname,
@@ -3949,7 +6180,12 @@ impl FormState {
                 None
             },
             jump: if jump.is_empty() { None } else { Some(jump) },
-            note: None,
+            note: prior.and_then(|p| p.note.clone()),
+            forwards,
+            group: if group.is_empty() { None } else { Some(group) },
+            tags,
+            favorite: prior.is_some_and(|p| p.favorite),
+            last_connected: prior.map(|p| p.last_connected).unwrap_or(0),
         })
     }
 }
@@ -4184,6 +6420,33 @@ fn cycle_keepalive(cur: u64) -> u64 {
     }
 }
 
+/// 自动重连的次数档位：`0` = 关掉自动重连（回到弹窗问），最后一档当"无限"。
+/// 只把"几次"这件事放进界面，退避的秒数/抖动留在 `settings.ini`：
+/// 前者人人要用，后者是少数人的调参，摆在弹窗里只会把设置页变成表单。
+const RECONNECT_LADDER: [u32; 6] = [0, 1, 2, 3, 5, ells_core::reconnect::MAX_ATTEMPTS_CAP];
+
+/// ←/→ 微调重连次数：不在档位上的值（手改过 ini）回到最近的一档。
+fn step_reconnect_attempts(cur: u32, up: bool) -> u32 {
+    if up {
+        RECONNECT_LADDER.iter().copied().find(|v| *v > cur).unwrap_or(cur)
+    } else {
+        RECONNECT_LADDER
+            .iter()
+            .copied()
+            .rev()
+            .find(|v| *v < cur)
+            .unwrap_or(cur)
+    }
+}
+
+/// Enter/点击：在档位里循环，越界回到"关"。
+fn cycle_reconnect_attempts(cur: u32) -> u32 {
+    match RECONNECT_LADDER.iter().position(|v| *v == cur) {
+        Some(i) => RECONNECT_LADDER[(i + 1) % RECONNECT_LADDER.len()],
+        None => RECONNECT_LADDER[1],
+    }
+}
+
 /// 去掉全部控制字符（含 \r \n \t）：单行输入框只接受可打印内容。
 fn sanitize_input(text: &str) -> String {
     text.chars().filter(|c| !c.is_control()).collect()
@@ -4202,5 +6465,815 @@ fn open_url(url: &str) {
     };
     if let Err(err) = spawned {
         tracing::warn!(%err, "打开默认浏览器失败");
+    }
+}
+
+#[cfg(test)]
+mod form_tests {
+    use super::*;
+
+    fn sample() -> Host {
+        Host {
+            alias: "web-prod".into(),
+            hostname: "10.0.0.1".into(),
+            port: 2222,
+            user: "deploy".into(),
+            auth: Auth::Agent,
+            password: Some("hunter2".into()),
+            jump: Some("bastion".into()),
+            group: Some("生产".into()),
+            tags: vec!["db".into(), "eu".into()],
+            forwards: vec![Forward::Local {
+                bind: None,
+                listen_port: 5432,
+                dest_host: "127.0.0.1".into(),
+                dest_port: 5432,
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn template_carries_structure_but_not_identity_or_secrets() {
+        let f = FormState::template(Some(&sample()));
+        assert_eq!(f.editing_alias, None, "模板必须是新增，不是编辑那台");
+        assert_eq!(f.value_of(FieldRole::User), "deploy");
+        assert_eq!(f.value_of(FieldRole::Port), "2222");
+        assert_eq!(f.value_of(FieldRole::Jump), "bastion");
+        assert_eq!(f.value_of(FieldRole::Group), "生产");
+        assert_eq!(f.value_of(FieldRole::Tags), "db, eu");
+        assert!(
+            f.value_of(FieldRole::Forwards).contains("-L 5432:127.0.0.1:5432"),
+            "转发作家没带过来: {}",
+            f.value_of(FieldRole::Forwards)
+        );
+        for role in [
+            FieldRole::Alias,
+            FieldRole::Hostname,
+            FieldRole::Password,
+            FieldRole::KeyPass,
+        ] {
+            assert_eq!(f.value_of(role), "", "{role:?} 应该留空让用户自己填");
+        }
+    }
+
+    #[test]
+    fn template_without_selection_is_blank() {
+        let f = FormState::template(None);
+        assert_eq!(f.editing_alias, None);
+        assert_eq!(f.value_of(FieldRole::Port), "22");
+        assert_eq!(f.value_of(FieldRole::Group), "");
+        // 空表提交要挡下来，不能写出一个没有别名的主机
+        assert_eq!(f.build_host(None).unwrap_err(), "别名、主机、用户是必填项");
+    }
+}
+
+#[cfg(test)]
+mod reconnect_tests {
+    use super::*;
+
+    #[test]
+    fn ladder_cycles_through_off_and_infinite() {
+        assert_eq!(cycle_reconnect_attempts(0), 1);
+        assert_eq!(cycle_reconnect_attempts(3), 5);
+        assert_eq!(cycle_reconnect_attempts(5), ells_core::reconnect::MAX_ATTEMPTS_CAP);
+        assert_eq!(cycle_reconnect_attempts(ells_core::reconnect::MAX_ATTEMPTS_CAP), 0);
+        // 手改 ini 改成档位外的值：Enter 回到"1 次"而不是停在野值上
+        assert_eq!(cycle_reconnect_attempts(4), 1);
+    }
+
+    #[test]
+    fn arrows_step_within_the_ladder() {
+        assert_eq!(step_reconnect_attempts(0, false), 0, "已经是最小还往左就停住");
+        assert_eq!(step_reconnect_attempts(0, true), 1);
+        assert_eq!(step_reconnect_attempts(3, true), 5);
+        assert_eq!(
+            step_reconnect_attempts(ells_core::reconnect::MAX_ATTEMPTS_CAP, true),
+            ells_core::reconnect::MAX_ATTEMPTS_CAP,
+            "无限再往右也不许绕回 0（那是关掉）"
+        );
+        assert_eq!(step_reconnect_attempts(4, false), 3);
+    }
+
+    #[test]
+    fn key_refusal_is_not_a_network_problem() {
+        // 用户在密钥确认弹窗里按"拒绝"后，russh 送回的就是这两句
+        assert!(key_trouble("建立连接失败: Unknown server key"));
+        assert!(key_trouble("The server key changed at line 12"));
+        assert!(key_trouble("主机密钥与记录不一致"));
+        assert!(!key_trouble("Connection refused (os error 10061)"));
+    }
+}
+
+#[cfg(test)]
+mod list_tests {
+    use super::*;
+
+    fn host(alias: &str, group: Option<&str>) -> Host {
+        Host {
+            alias: alias.into(),
+            hostname: "10.0.0.1".into(),
+            port: 22,
+            user: "root".into(),
+            group: group.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    fn rows(hosts: &[Host], query: &str, sort: ListSort, folded: &[&str]) -> Vec<ListRow> {
+        let folded: Vec<String> = folded.iter().map(|s| s.to_string()).collect();
+        let order = order_hosts(hosts, query, sort);
+        build_list_rows(hosts, &order, query.trim().is_empty() && sort.groups_ordered(), &folded).0
+    }
+
+    fn aliases<'h>(order: &[usize], hosts: &'h [Host]) -> Vec<&'h str> {
+        order.iter().map(|&i| hosts[i].alias.as_str()).collect()
+    }
+
+    /// 段头每组只出现一次，计数写的是这一段里的主机数。段与段之间按组名排，
+    /// 所以拉丁名（redis）在汉字名（生产）前面——这是 `group_rank` 的既有行为。
+    #[test]
+    fn one_header_per_group_with_counts() {
+        let hosts = vec![
+            host("web", Some("生产")),
+            host("db", Some("生产")),
+            host("cache", Some("redis")),
+        ];
+        let got = rows(&hosts, "", ListSort::Grouped, &[]);
+        assert_eq!(
+            got,
+            vec![
+                ListRow::Header { group: "redis".into(), count: 1, folded: false },
+                ListRow::Host(2),
+                ListRow::Header { group: "生产".into(), count: 2, folded: false },
+                ListRow::Host(1),
+                ListRow::Host(0),
+            ]
+        );
+    }
+
+    /// 折叠只藏主机行：段头留着，计数还是全段的数，展开前后数字不该变。
+    #[test]
+    fn folding_keeps_the_header_and_its_count() {
+        let hosts = vec![
+            host("web", Some("生产")),
+            host("db", Some("生产")),
+            host("cache", Some("redis")),
+        ];
+        let got = rows(&hosts, "", ListSort::Grouped, &["生产"]);
+        assert_eq!(
+            got,
+            vec![
+                ListRow::Header { group: "redis".into(), count: 1, folded: false },
+                ListRow::Host(2),
+                ListRow::Header { group: "生产".into(), count: 2, folded: true },
+            ]
+        );
+        let (_, visible) = {
+            let order = order_hosts(&hosts, "", ListSort::Grouped);
+            build_list_rows(&hosts, &order, true, &["生产".to_string()])
+        };
+        assert_eq!(aliases(&visible, &hosts), ["cache"], "折叠段的主机不能再占光标位");
+    }
+
+    /// 没分组的恒在最后一列，段头写「未分组」，和排序键同一套说法。
+    #[test]
+    fn ungrouped_hosts_share_the_tail_section() {
+        let hosts = vec![host("b", None), host("a", Some("  ")), host("c", Some("生产"))];
+        let got = rows(&hosts, "", ListSort::Grouped, &[]);
+        let headers: Vec<&str> = got
+            .iter()
+            .filter_map(|r| match r {
+                ListRow::Header { group, .. } => Some(group.as_str()),
+                ListRow::Host(_) => None,
+            })
+            .collect();
+        assert_eq!(headers, ["生产", "未分组"]);
+    }
+
+    /// 不分组排的两种模式没有段头可折：主机按那个键序一条不落铺平。
+    #[test]
+    fn non_group_sorts_have_no_headers_and_ignore_folds() {
+        let hosts = vec![host("web", Some("生产")), host("db", Some("生产")), host("a", None)];
+        for sort in [ListSort::Recent, ListSort::Alias] {
+            let got = rows(&hosts, "", sort, &["生产"]);
+            assert!(
+                got.iter().all(|r| matches!(r, ListRow::Host(_))),
+                "{sort:?} 不该画段头"
+            );
+            assert_eq!(got.len(), 3, "{sort:?} 折叠不该生效");
+        }
+        assert_eq!(
+            aliases(&order_hosts(&hosts, "", ListSort::Alias), &hosts),
+            ["a", "db", "web"]
+        );
+    }
+
+    /// 最近使用：连过的在前，从没连过（0）的落到最后。
+    #[test]
+    fn recent_sort_keeps_never_connected_last() {
+        let mut a = host("a", None);
+        let b = host("b", None);
+        let mut c = host("c", None);
+        a.last_connected = 100;
+        c.last_connected = 900;
+        let hosts = vec![a, b, c];
+        assert_eq!(
+            aliases(&order_hosts(&hosts, "", ListSort::Recent), &hosts),
+            ["c", "a", "b"]
+        );
+    }
+
+    /// 过滤时按分数拍平：分组、收藏、最近使用统统让位给命中顺序，而且折叠着的
+    /// 分组不能把命中主机藏起来——用户找的就是它。
+    #[test]
+    fn filter_flattens_to_score_order_without_headers() {
+        let mut fav = host("web-prod", Some("生产"));
+        fav.favorite = true;
+        let hosts = vec![fav, host("web", Some("redis")), host("note", None)];
+        let got = rows(&hosts, "web", ListSort::Grouped, &["生产"]);
+        assert!(got.iter().all(|r| matches!(r, ListRow::Host(_))));
+        let order: Vec<usize> = got
+            .iter()
+            .filter_map(|r| match r {
+                ListRow::Host(i) => Some(*i),
+                ListRow::Header { .. } => None,
+            })
+            .collect();
+        let mut hit = aliases(&order, &hosts);
+        hit.sort();
+        assert_eq!(hit, ["web", "web-prod"], "折叠段里的命中也得留在列表上");
+    }
+
+    #[test]
+    fn sort_cycle_returns_to_the_start() {
+        let mut sort = ListSort::Grouped;
+        for _ in 0..4 {
+            sort = sort.next();
+        }
+        assert_eq!(sort, ListSort::Grouped);
+        assert_eq!(ListSort::parse("recent"), Some(ListSort::Recent));
+        assert_eq!(ListSort::parse("写错了"), None);
+    }
+
+    #[test]
+    fn foldable_groups_lists_each_section_once() {
+        let hosts = vec![
+            host("web", Some("生产")),
+            host("db", Some("生产")),
+            host("x", None),
+        ];
+        assert_eq!(foldable_groups(&hosts), ["生产", "未分组"]);
+    }
+}
+
+#[cfg(test)]
+mod required_tests {
+    use super::*;
+
+    fn set(form: &mut FormState, role: FieldRole, value: &str) {
+        if let Some(field) = form.fields.iter_mut().find(|f| f.role == role) {
+            field.value = value.to_string();
+        }
+    }
+
+    /// 报错只点缺的那一项的名：已经填对的不该再被用户重看一遍。
+    #[test]
+    fn missing_field_error_names_only_what_is_empty() {
+        let mut form = FormState::new(None);
+        set(&mut form, FieldRole::Alias, "web");
+        set(&mut form, FieldRole::Hostname, "10.0.0.1");
+        set(&mut form, FieldRole::Auth, "agent");
+        assert_eq!(form.build_host(None).unwrap_err(), "用户是必填项");
+        set(&mut form, FieldRole::User, "root");
+        assert!(form.build_host(None).is_ok());
+        // 三项全空才是过去那句笼统的"别名、主机、用户是必填项"
+        let blank = FormState::new(None);
+        assert_eq!(blank.build_host(None).unwrap_err(), "别名、主机、用户是必填项");
+    }
+
+    /// ＊ 标的必须 exactly 是 build_host 会拦下来的那三项，多个少个都是骗人。
+    #[test]
+    fn stars_mark_exactly_the_checked_fields() {
+        for role in [FieldRole::Alias, FieldRole::Hostname, FieldRole::User] {
+            assert!(role.required(), "{role:?} 必须带 ＊");
+        }
+        for role in [
+            FieldRole::Port,
+            FieldRole::Auth,
+            FieldRole::Password,
+            FieldRole::KeyPath,
+            FieldRole::KeyPass,
+            FieldRole::Jump,
+            FieldRole::Group,
+            FieldRole::Tags,
+            FieldRole::Forwards,
+        ] {
+            assert!(!role.required(), "{role:?} 不该带 ＊");
+        }
+    }
+
+    /// 「生产」和「生产 」是同一个分组：提示里必须只出现一次、台数合在一起算，
+    /// 否则用户照着提示敲，列表页还是裂成两个段头。
+    #[test]
+    fn group_counts_merges_the_whitespace_variants() {
+        let mut a = Host { alias: "a".into(), ..Default::default() };
+        let mut b = Host { alias: "b".into(), ..Default::default() };
+        a.group = Some("生产".into());
+        b.group = Some("生产 ".into());
+        let c = Host { alias: "c".into(), ..Default::default() };
+        assert_eq!(
+            group_counts(&[a, b, c]),
+            vec![("生产".to_string(), 2), ("未分组".to_string(), 1)]
+        );
+    }
+}
+
+#[cfg(test)]
+mod rules_tests {
+    use super::*;
+
+    fn row(listen: &str, dest_host: &str, dest_port: &str) -> RuleRow {
+        RuleRow {
+            kind: "L".into(),
+            bind: String::new(),
+            listen: listen.into(),
+            dest_host: dest_host.into(),
+            dest_port: dest_port.into(),
+        }
+    }
+
+    fn host_with(alias: &str, port: u16) -> Host {
+        Host {
+            alias: alias.into(),
+            forwards: vec![Forward::Local {
+                bind: None,
+                listen_port: port,
+                dest_host: "10.0.0.9".into(),
+                dest_port: 22,
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// 表格存回规则必须一条不差：静态口、自动口、`-D`、`-R` 都要原样回去。
+    /// 自动口在表格里是"本地端口空着"，存回去是 `listen_port: 0`——留空=系统分配就靠这一条撑着。
+    #[test]
+    fn table_round_trips_every_kind() {
+        let forwards = vec![
+            Forward::Local { bind: None, listen_port: 8080, dest_host: "127.0.0.1".into(), dest_port: 5432 },
+            Forward::Local { bind: None, listen_port: 0, dest_host: "db".into(), dest_port: 5432 },
+            Forward::Dynamic { bind: Some("*".into()), listen_port: 1080 },
+            Forward::Dynamic { bind: None, listen_port: 0 },
+            Forward::Remote { bind: None, listen_port: 9090, dest_host: "internal".into(), dest_port: 22 },
+        ];
+        let rows = rules_from_forwards(&forwards);
+        assert_eq!(rows[1].listen, "", "自动口不能显示成 0");
+        assert_eq!(rows[3].kind, "D");
+        assert_eq!(rows[4].kind, "R", "-R 存得进来就该看得改，别抹掉");
+        assert_eq!(rows[2].bind, "*");
+        let (back, bad) = rules_to_forwards(&rows);
+        assert!(bad.is_empty(), "{bad:?}");
+        assert_eq!(back, forwards);
+    }
+
+    /// 全空的行直接丢掉，填了一半的必须拦住；报的行号是表里的位置，
+    /// 前面有空白行也不能错位——用户是对着屏幕第几行改的。
+    #[test]
+    fn blank_rows_vanish_but_half_filled_ones_report_their_own_line_number() {
+        let rows = vec![
+            RuleRow::empty(),
+            row("8080", "db", ""),
+            RuleRow { kind: "x".into(), ..RuleRow::empty() },
+            row("http", "db", "22"),
+        ];
+        let (ok, bad) = rules_to_forwards(&rows);
+        assert!(ok.is_empty());
+        assert_eq!(
+            bad,
+            vec![
+                "第 2 行：目标端口不能空着",
+                "第 3 行：类型只能是 L、D 或 R",
+                "第 4 行：本地端口要么留空（自动分配），要么写成数字",
+            ]
+        );
+    }
+
+    /// 只按了 `Ctrl-N`、一个字没敲的那一行不算"填了一半"：默认的类型 `L` 不是用户写的。
+    /// 这条挂了就等于告诉用户"你新增了一行错误"。
+    #[test]
+    fn a_fresh_row_alone_saves_as_nothing_at_all() {
+        let (ok, bad) = rules_to_forwards(&[RuleRow::empty()]);
+        assert!(ok.is_empty());
+        assert!(bad.is_empty(), "{bad:?}");
+    }
+
+    /// 只点缺的那一项的名：主机填了、端口空着，就不该再提"目标主机"。与 build_host 同一口径。
+    #[test]
+    fn missing_destination_names_only_what_is_empty() {
+        let (_, bad) = rules_to_forwards(&[RuleRow { dest_host: "db".into(), ..RuleRow::empty() }]);
+        assert_eq!(bad, vec!["第 1 行：目标端口不能空着"]);
+        let (_, bad) = rules_to_forwards(&[RuleRow { bind: "*".into(), ..RuleRow::empty() }]);
+        assert_eq!(bad, vec!["第 1 行：目标主机、目标端口不能空着"]);
+    }
+
+    /// `-D` 没有目标，光一个本地口就是完整规则；它不该被当成"填了一半"。
+    #[test]
+    fn dynamic_needs_no_destination() {
+        let rows = vec![RuleRow { kind: "D".into(), listen: "1080".into(), ..RuleRow::empty() }];
+        let (ok, bad) = rules_to_forwards(&rows);
+        assert!(bad.is_empty(), "{bad:?}");
+        assert_eq!(ok, vec![Forward::Dynamic { bind: None, listen_port: 1080 }]);
+    }
+
+    /// 撞口提示要把对手一次点全：本表另一行说"本表第 N 行"，别的主机说别名，顺序是先表内后表外。
+    #[test]
+    fn clash_text_lists_every_rival_in_one_breath() {
+        let rows = vec![row("8080", "a", "1"), row("8080", "b", "2")];
+        let hosts = vec![host_with("db-prod", 8080)];
+        assert_eq!(
+            row_clash_text(&rows, &hosts, "web", 0),
+            "⚠ 与 本表第 2 行、db-prod 同用 8080 — 留空本地口即可自动分配"
+        );
+    }
+
+    /// 正在编辑的这台主机自己在保险库里也有一条 8080，提示不能把它算成对手——
+    /// 自己跟自己"撞"是保存前就要停掉的旧规则，说成撞口会让人去改另一台。
+    #[test]
+    fn clash_text_never_names_the_host_being_edited() {
+        let rows = vec![row("8080", "db", "5432")];
+        let hosts = vec![host_with("web", 8080), host_with("db-prod", 8080)];
+        assert_eq!(
+            row_clash_text(&rows, &hosts, "web", 0),
+            "⚠ 与 db-prod 同用 8080 — 留空本地口即可自动分配"
+        );
+    }
+
+    /// 留空和显式写 0 都不该被标 ⚠：用户要的正是"谁也不撞"，标上反而像出错了。
+    #[test]
+    fn an_auto_row_never_clashes_with_anything() {
+        let rows = vec![row("", "a", "1"), row("0", "b", "2")];
+        let hosts = vec![host_with("db-prod", 8080)];
+        for (i, r) in rows.iter().enumerate() {
+            assert!(r.port().is_none(), "第 {} 行是自动口，不该有固定端口", i + 1);
+            assert!(row_clash_text(&rows, &hosts, "web", i).is_empty());
+        }
+    }
+
+    /// 没写口的行、越界的下标都要安静地返回空串：表格里每行都调它，panic 会把整个 TUI 打回 shell。
+    #[test]
+    fn clash_text_is_quiet_about_rows_it_cannot_look_at() {
+        let rows = vec![row("8080", "a", "1")];
+        let hosts = vec![host_with("db-prod", 8080)];
+        assert_eq!(row_clash_text(&rows, &hosts, "web", 7), "");
+        assert_eq!(row_clash_text(&[], &hosts, "web", 0), "");
+        // 只有自己、没有对手的一行也是干净的
+        assert_eq!(row_clash_text(&rows, &[], "web", 0), "");
+    }
+}
+
+#[cfg(test)]
+mod metrics_tests {
+    use super::*;
+    use ells_core::Probe;
+
+    /// 一轮完整数据：CPU 累计 1000 jiffies（闲 850）、内存用掉 75%、最满的盘 88%。
+    const ROUND1: &str = concat!(
+        "ellsm1\n",
+        "cpu  100 0 50 800 50 0 0 0\n",
+        "MemTotal: 1000 kB\n",
+        "MemAvailable: 250 kB\n",
+        "/dev/sda1 1000 880 120 88% /data\n",
+    );
+    /// 下一轮：总共走了 100 个 jiffies，其中 60 个在闲 ⇒ 忙碌 40%。
+    const ROUND2: &str = concat!(
+        "ellsm1\n",
+        "cpu  130 0 60 840 70 0 0 0\n",
+        "MemTotal: 1000 kB\n",
+        "MemAvailable: 250 kB\n",
+        "/dev/sda1 1000 880 120 88% /data\n",
+    );
+
+    /// 磁盘到点的那一轮：df 给了一个新数，界面上那一格要跟着换。
+    const ROUND_DISK_91: &str = concat!(
+        "ellsm1\n",
+        "cpu  130 0 60 840 70 0 0 0\n",
+        "MemTotal: 1000 kB\n",
+        "MemAvailable: 250 kB\n",
+        "/dev/sda1 1000 910 90 91% /data\n",
+    );
+    /// 没到点的那一轮：`gather` 不去读 mounts、也不跑 df，所以只有 /proc 那三样。
+    const ROUND_NO_DISK: &str = concat!(
+        "ellsm1\n",
+        "cpu  100 0 50 800 50 0 0 0\n",
+        "MemTotal: 1000 kB\n",
+        "MemAvailable: 250 kB\n",
+        "0.42 0.31 0.19 1/234 5678\n",
+    );
+
+    fn probe(text: &str) -> ells_core::Probe {
+        Probe::parse(text)
+    }
+
+    /// CPU 那一格必须是**两轮之差**：单看一轮只有开机以来的平均值，那根条几乎不动，
+    /// 看着像坏了。所以首轮宁可可空也不报那个假数。
+    #[test]
+    fn the_first_round_has_no_cpu_yet_but_the_rest_is_real() {
+        let mut m = Metrics::default();
+        assert!(m.adopt(&probe(ROUND1)));
+        assert_eq!(m.cpu, None, "没有可差的基线，就该空着");
+        assert_eq!(m.mem, Some(75));
+        let disk = m.disk.clone().expect("有 df 就该有磁盘");
+        assert_eq!((disk.mount.as_str(), disk.percent), ("/data", 88));
+        assert_eq!((disk.used_kb, disk.total_kb), (880, 1000));
+    }
+
+    #[test]
+    fn the_second_round_computes_cpu_from_the_diff() {
+        let mut m = Metrics::default();
+        m.adopt(&probe(ROUND1));
+        m.adopt(&probe(ROUND2));
+        assert_eq!(m.cpu, Some(40));
+    }
+
+    /// 没有 /proc 的机器（FreeBSD、某些容器）：CPU 这一格永远空着，但磁盘是真的 ——
+    /// 有真数据就不算失败轮，不能被计进"采不到"。
+    #[test]
+    fn a_machine_without_proc_keeps_the_disk_and_is_not_a_miss() {
+        let mut m = Metrics::default();
+        for _ in 0..METRICS_GIVE_UP {
+            assert!(m.adopt(&probe("ellsm1\n/dev/sda1 1000 500 500 50% /\n")));
+        }
+        assert!(!m.unsupported, "有数可画就不该停止轮询");
+        assert_eq!(m.cpu, None);
+        assert_eq!(m.disk.map(|d| d.percent), Some(50));
+    }
+
+    /// 整台机器什么都不给：连续这么多轮就认输，停止占那条连接的通道。
+    #[test]
+    fn three_empty_rounds_stop_polling() {
+        let mut m = Metrics::default();
+        assert!(m.adopt(&probe("")));
+        assert!(m.adopt(&probe("")));
+        assert!(!m.unsupported, "第二次还不算");
+        assert!(!m.adopt(&probe("")), "第三次该停了");
+        assert!(m.unsupported);
+        assert!(!m.is_polling(), "判定采不到之后不能还在轮询");
+    }
+
+    /// 中间成功一次就把"这台采不到"的计数清掉：偶发一次 df 卡住不该让用户永远看不到指标。
+    #[test]
+    fn one_good_round_clears_the_empty_counter() {
+        let mut m = Metrics::default();
+        assert!(m.adopt(&probe("")));
+        assert!(m.adopt(&probe("")));
+        assert!(m.adopt(&probe(ROUND1)), "成功一轮就把计数清掉");
+        assert!(m.adopt(&probe("")));
+        assert!(m.adopt(&probe("")));
+        assert!(!m.adopt(&probe("")), "重新数满三轮才判定采不到");
+        assert!(m.unsupported);
+    }
+
+    /// 通道级失败只退避、不判死：网络抖一下、服务器瞬间过载、跳板掐一下，都不该让
+    /// 底部那一行永远消失（判死只留给"回包是空的"那种真的没东西可采的机器）。
+    #[test]
+    fn transport_failures_back_off_instead_of_giving_up() {
+        let mut m = Metrics::default();
+        assert_eq!(m.interval(), METRICS_EVERY, "没失败过就是用户定的节奏");
+        for (round, secs) in [(1, 10u64), (2, 30), (3, 60), (4, 60), (5, 60)] {
+            assert!(m.missed(), "第 {round} 次通道失败之后还要接着采");
+            assert!(!m.unsupported, "通道失败不该被判成这台采不到");
+            assert_eq!(m.interval(), std::time::Duration::from_secs(secs));
+        }
+    }
+
+    /// 退到顶端的那一刻说一句，之后就闭嘴：状态行反复刷比数字慢一分钟更扰人。
+    #[test]
+    fn the_capped_moment_is_reported_once() {
+        let mut m = Metrics::default();
+        m.missed();
+        m.missed();
+        assert!(!m.just_capped());
+        m.missed();
+        assert!(m.just_capped(), "第三次失败正好退到 60 秒，该说一句");
+        m.missed();
+        assert!(!m.just_capped(), "第四次不该再重复那句话");
+    }
+
+    /// 恢复是自动的：任意一轮拿到数，间隔就落回 5 秒，不用用户去拨开关。
+    #[test]
+    fn one_good_round_ends_the_backoff() {
+        let mut m = Metrics::default();
+        for _ in 0..3 {
+            m.missed();
+        }
+        assert_eq!(m.interval(), std::time::Duration::from_secs(60));
+        assert!(m.adopt(&probe(ROUND1)));
+        assert_eq!(m.interval(), METRICS_EVERY, "拿到数就说明通道也是通的");
+        assert_eq!(
+            m.disk.as_ref().map(|d| d.percent),
+            Some(88),
+            "退避期间那一格保留的是上次的数"
+        );
+    }
+
+    /// 背景标签降到一分钟一轮：八个标签一起开着时，每台服务器看到的是"一分钟一次"，
+    /// 而不是"每五秒八次"。用户正看着的那一格一秒都不让 —— 那根条就是要跟着动。
+    #[test]
+    fn background_tabs_downshift_and_the_focused_one_does_not() {
+        assert_eq!(metrics_every(true, METRICS_EVERY), METRICS_EVERY);
+        assert_eq!(metrics_every(false, METRICS_EVERY), METRICS_IDLE_EVERY);
+        // 退避过的间隔照样降频，但绝不比一分钟更快
+        let mut m = Metrics::default();
+        m.missed();
+        m.missed();
+        assert_eq!(metrics_every(true, m.interval()), std::time::Duration::from_secs(30));
+        assert_eq!(metrics_every(false, m.interval()), METRICS_IDLE_EVERY);
+    }
+
+    /// 用户刚进来时最想要的就是 CPU：第一轮只拿到基线，所以那一轮之后**两秒**就接力，
+    /// 而不是让他等满三个 5 秒。背景那几格不抢（没人看），差完数之后也回到正常节奏。
+    #[test]
+    fn the_baseline_round_hands_the_cpu_cell_a_short_relay() {
+        let mut m = Metrics::default();
+        assert!(m.adopt(&probe(ROUND1)));
+        assert_eq!(m.cpu, None);
+        assert!(m.cpu_pending, "这一轮只有基线，下一轮该抢");
+        assert_eq!(
+            metrics_next(m.cpu_pending, true, m.interval()),
+            METRICS_CPU_WINDOW,
+            "正看着的这一格两秒后就出 CPU"
+        );
+        assert_eq!(
+            metrics_next(m.cpu_pending, false, m.interval()),
+            METRICS_IDLE_EVERY,
+            "没人看的那一格不该为了一格 CPU 抢起来"
+        );
+        assert!(m.adopt(&probe(ROUND2)));
+        assert_eq!(m.cpu, Some(40));
+        assert!(!m.cpu_pending, "数已经差出来了，节奏交回分频");
+        assert_eq!(metrics_next(m.cpu_pending, true, m.interval()), METRICS_EVERY);
+    }
+
+    /// 没有 `/proc/stat` 的机器（FreeBSD、被加固过的容器）永远不会 `cpu_pending`，
+    /// 所以不会两秒一次猛采还差不出数 —— 空转的代价由那条短窗口规则自己付掉。
+    #[test]
+    fn a_machine_without_a_cpu_never_spins_on_the_short_window() {
+        let mut m = Metrics::default();
+        let no_cpu = "ellsm1\nMemTotal: 1000 kB\nMemAvailable: 250 kB\n";
+        assert!(m.adopt(&probe(no_cpu)));
+        assert!(!m.cpu_pending, "没有基线可言，也就没有接力");
+        assert!(m.adopt(&probe(no_cpu)));
+        assert_eq!(metrics_next(m.cpu_pending, true, m.interval()), METRICS_EVERY);
+    }
+
+    /// 切回来时重接的那一条要用一个新代号：背景期间在途的那一轮（连同它 60 秒的旧定时器）
+    /// 都要作废，否则两轮回包抢同一格，晚到的那份会把数画旧。
+    #[test]
+    fn reviving_a_tab_invalidates_the_round_it_was_waiting_on() {
+        let mut m = Metrics::default();
+        let waiting = m.arm();
+        m.cancel();
+        let revived = m.arm();
+        assert_ne!(waiting, revived, "旧定时器和旧回包都对不上新代号了");
+        assert!(m.is_polling(), "重接之后这条链又有人在等了");
+    }
+
+    /// 代号必须跨会话单调往上走：重连后 seq 从 0 重来的话，上一台机器那只还在飞的
+    /// 回包就会对上新会话的代号，把已经消失的那一行画回去。
+    #[test]
+    fn reset_keeps_the_generation_running_forward() {
+        let mut m = Metrics::default();
+        let seq = m.arm();
+        m.adopt(&probe(ROUND1));
+        m.reset();
+        assert!(!m.has_data(), "上一台机器的数要清干净");
+        assert!(!m.is_polling());
+        let next = m.arm();
+        assert!(next > seq, "新会话的代号要比旧的大");
+    }
+
+    /// cancel 之后在途的那一包必须作废：会话都没了，不该再把数写进已经不存在的行。
+    #[test]
+    fn cancel_invalidates_the_round_in_flight() {
+        let mut m = Metrics::default();
+        let seq = m.arm();
+        m.cancel();
+        assert_ne!(m.seq, seq, "在途回包带的代号对不上了");
+        assert!(!m.is_polling());
+    }
+
+    /// 分频现在是两件事：每一轮都想要磁盘那个数（跟单：只问最满那块一次 statvfs），
+    /// 但**普查**（重读 mounts + 逐块 statvfs，兜底一条 df）仍然 12 轮才一次。
+    /// 普查是最贵的一条腿，而挂载点集合一分钟里几乎不动。
+    #[test]
+    fn only_every_twelfth_round_does_a_disk_survey() {
+        let mut m = Metrics::default();
+        let mut surveyed = Vec::new();
+        for round in 1..=(METRICS_DISK_EVERY_ROUNDS * 2 + 1) {
+            if m.disk_survey_due() {
+                surveyed.push(round);
+            }
+            assert!(m.adopt(&probe(ROUND_NO_DISK)));
+        }
+        assert_eq!(surveyed, vec![1, 13, 25], "连上的第一轮普查一次，之后每 12 轮一次");
+    }
+
+    /// 跟单轮也要换数：这才是方案 B 的意义 —— 那一格 5 秒一档，只是每档只问一块盘。
+    #[test]
+    fn a_followed_disk_refreshes_the_cell_without_a_survey() {
+        let mut m = Metrics::default();
+        m.adopt(&probe(ROUND1));
+        assert_eq!(m.disk.as_ref().map(|d| d.percent), Some(88));
+        assert!(!m.disk_survey_due(), "刚普查过，下一轮只跟单");
+        // 这一轮带回的是同一块盘的新数（有人往里写东西了）。
+        m.adopt(&probe(ROUND_DISK_91));
+        assert_eq!(
+            m.disk.as_ref().map(|d| (d.mount.as_str(), d.percent)),
+            Some(("/data", 91)),
+            "跟单的轮次也得把数换上去，否则 5 秒一档是假的"
+        );
+    }
+
+    /// 没数的那一轮要**留着上次的数**：那一格空掉比旧一秒看起来都像坏了。
+    #[test]
+    fn the_disk_cell_keeps_its_number_between_queries() {
+        let mut m = Metrics::default();
+        m.adopt(&probe(ROUND1));
+        assert_eq!(m.disk.as_ref().map(|d| d.percent), Some(88));
+        for _ in 0..(METRICS_DISK_EVERY_ROUNDS - 1) {
+            assert!(m.adopt(&probe(ROUND_NO_DISK)));
+            assert_eq!(m.disk.as_ref().map(|d| d.percent), Some(88));
+        }
+        assert!(m.disk_survey_due(), "11 轮之后正好到点");
+        m.adopt(&probe(ROUND_DISK_91));
+        assert_eq!(
+            m.disk.as_ref().map(|d| (d.mount.as_str(), d.percent)),
+            Some(("/data", 91)),
+            "到点的那一轮要换新数"
+        );
+    }
+
+    /// 普查轮到点就问完了，**问到没问到都往后数 12 轮**。
+    ///
+    /// 这条守的是方案 B 最坏的一种退化：一台没有 `statvfs@openssh.com` 的服务器上，
+    /// 如果"这一轮没数"就把倒计时留在 0，那下一轮又是一次普查 + 一条 `df` —— 60 秒的
+    /// 节奏当场变成 5 秒，每 5 秒 fork 一个 shell，正是这套 SFTP 主路径要避免的东西。
+    #[test]
+    fn a_survey_with_no_answer_still_counts_down() {
+        let mut m = Metrics::default();
+        assert!(m.disk_survey_due());
+        assert!(m.adopt(&probe(ROUND_NO_DISK)), "只有 /proc 的机器照样算拿到东西");
+        assert!(!m.disk_survey_due(), "没问到也要把普查点推回 60 秒之后");
+        assert!(m.adopt(&probe(ROUND_NO_DISK)));
+    }
+
+    /// 通道级失败的那一轮根本没走到 adopt，倒计时不能被一次超时偷偷推后。
+    #[test]
+    fn a_failed_round_leaves_the_disk_countdown_alone() {
+        let mut m = Metrics::default();
+        assert!(m.disk_survey_due());
+        assert!(m.missed());
+        assert!(m.disk_survey_due(), "通道失败的那一轮没问到，倒计时不该动");
+        m.adopt(&probe(ROUND1));
+        assert!(!m.disk_survey_due(), "问到之后就按节奏数着");
+        assert!(m.missed());
+        assert_eq!(m.disk.as_ref().map(|d| d.percent), Some(88), "旧数还在");
+    }
+
+    /// 反过来也得守住的：缓存里那块盘不能替一台已经什么都采不到的机器说话，
+    /// 否则"判定采不到"永远轮不到，那一行赖在底部一直不还给终端。
+    #[test]
+    fn a_cached_disk_does_not_keep_a_dead_machine_polling() {
+        let mut m = Metrics::default();
+        m.adopt(&probe(ROUND1));
+        assert!(m.adopt(&probe("")));
+        assert!(m.adopt(&probe("")));
+        assert!(!m.adopt(&probe("")), "三轮空手就该停，不管磁盘那一格缓存着谁");
+        assert!(m.unsupported);
+        assert!(m.has_data(), "轮询停了，但那一轮之前画过的数不该被抹掉");
+    }
+
+    #[test]
+    fn a_new_session_asks_for_the_disk_again() {
+        let mut m = Metrics::default();
+        m.adopt(&probe(ROUND1));
+        assert!(!m.disk_survey_due());
+        m.reset();
+        assert!(m.disk_survey_due(), "换了一条连接，第一轮就要重做普查");
+        assert_eq!(m.disk, None, "上一台机器的盘不能留给新会话");
+    }
+
+    /// 负载是第四个数，走的是快的那条腿：它和 CPU% 各说一件事（占用 vs 排队）。
+    #[test]
+    fn loadavg_fills_its_own_field_every_round() {
+        let mut m = Metrics::default();
+        m.adopt(&probe(ROUND_NO_DISK));
+        assert_eq!(
+            m.load.map(|l| l.display()),
+            Some("0.42/0.31/0.19".to_string())
+        );
+        m.adopt(&probe(ROUND1));
+        assert_eq!(m.load, None, "这台机器不给 loadavg 就该空着，不是 0");
     }
 }

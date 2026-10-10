@@ -24,6 +24,8 @@ rfd = "0.15"
 ring = "0.17.14"
 russh.workspace = true
 russh-sftp.workspace = true
+# 无头 `ells list --format json` 的输出；只用到 json!/to_string，不带任何网络特性
+serde_json = "1"
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter"] }

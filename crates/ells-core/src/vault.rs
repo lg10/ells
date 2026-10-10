@@ -5,7 +5,6 @@ use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::host::Host;
@@ -257,19 +256,7 @@ pub fn decode_vault(master: &str, bytes: &[u8]) -> Result<Vault> {
 }
 
 fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<()> {
-    let mut opts = fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut f = opts.open(path).with_context(|| {
-        format!("cannot write vault to {}", path.display())
-    })?;
-    f.write_all(bytes)?;
-    f.sync_all().ok();
-    Ok(())
+    crate::secure_fs::write_atomic(path, bytes)
 }
 
 /// Zeroize helper on arrays (zeroize crate's impl covers common types).
@@ -287,7 +274,12 @@ impl ZeroizeLocal for [u8; KEY_LEN] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::host::Auth;
+    use crate::host::{Auth, Forward};
+
+    /// 从指定路径读一份保险库（测试用：不碰 `~/.ells`）。
+    fn open_at(master: &str, path: &Path) -> Result<Vault> {
+        decode_vault(master, &fs::read(path)?)
+    }
 
     #[test]
     fn vault_roundtrip() {
@@ -301,6 +293,7 @@ mod tests {
             password: Some("s3cret".into()),
             jump: None,
             note: None,
+            ..Default::default()
         });
         let blob_master = "hunter2";
         let tmp = std::env::temp_dir().join("ells-test-vault.bin");
@@ -346,12 +339,93 @@ password = "test123"
             password: None,
             jump: Some("bastion".into()),
             note: None,
+            ..Default::default()
         });
         let text = toml::to_string_pretty(&v).unwrap();
         let back: Vault = toml::from_str(&text).unwrap();
         assert_eq!(back.hosts[0].auth, v.hosts[0].auth);
         assert_eq!(back.hosts[0].jump.as_deref(), Some("bastion"));
         assert_eq!(back.hosts[0].hostname, "203.0.113.7");
+    }
+
+    /// 转发规则、分组、标签、收藏都要能进出保险库——旧格式的 vault.bin 没有这些
+    /// 字段也必须解得开（全部 default）。
+    #[test]
+    fn forwards_tags_and_group_survive_the_vault() {
+        let mut v = Vault::default();
+        v.upsert(Host {
+            alias: "db".into(),
+            hostname: "10.0.0.9".into(),
+            port: 22,
+            user: "root".into(),
+            auth: Auth::Agent,
+            forwards: vec![
+                Forward::Local {
+                    bind: None,
+                    listen_port: 5432,
+                    dest_host: "localhost".into(),
+                    dest_port: 5432,
+                },
+                Forward::Dynamic { bind: Some("127.0.0.1".into()), listen_port: 1080 },
+            ],
+            group: Some("生产".into()),
+            tags: vec!["pg".into(), "重要".into()],
+            favorite: true,
+            last_connected: 1_700_000_000,
+            ..Default::default()
+        });
+        let text = toml::to_string_pretty(&v).unwrap();
+        let back: Vault = toml::from_str(&text).unwrap();
+        assert_eq!(back.hosts[0].forwards, v.hosts[0].forwards);
+        assert_eq!(back.hosts[0].group.as_deref(), Some("生产"));
+        assert_eq!(back.hosts[0].tags, ["pg", "重要"]);
+        assert!(back.hosts[0].favorite);
+        assert_eq!(back.hosts[0].last_connected, 1_700_000_000);
+
+        let legacy = " [[hosts]]\nalias = \"old\"\nhostname = \"h\"\nport = 22\nuser = \"u\"\nauth = { type = \"password\" }\n";
+        let old: Vault = toml::from_str(legacy).unwrap();
+        assert!(old.hosts[0].forwards.is_empty());
+        assert!(!old.hosts[0].favorite);
+    }
+
+    /// 保险库整体加密后写盘，中途失败不能把上一份好数据毁掉。
+    #[test]
+    fn a_failed_save_keeps_the_previous_vault_readable() {
+        let dir = std::env::temp_dir().join(format!(
+            "ells-vault-atomic-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("vault.bin");
+        let master = "hunter2";
+
+        let mut v1 = Vault::default();
+        v1.upsert(Host {
+            alias: "first".into(),
+            ..Default::default()
+        });
+        store_vault_key(&v1, &path, &create_vault_key(master).unwrap()).unwrap();
+
+        // 目标路径的父目录是个普通文件：临时文件都开不出来，rename 更无从谈起，
+        // 而已经存在的 vault.bin 必须还完好可读
+        let broken = dir.join("vault.bin").join("nested.bin");
+        let mut v2 = Vault::default();
+        v2.upsert(Host {
+            alias: "second".into(),
+            ..Default::default()
+        });
+        let vk = create_vault_key(master).unwrap();
+        assert!(store_vault_key(&v2, &broken, &vk).is_err());
+        assert_eq!(open_at(master, &path).unwrap().hosts[0].alias, "first");
+
+        // 正常保存覆盖后，旧内容不再可见
+        store_vault_key(&v2, &path, &vk).unwrap();
+        assert_eq!(open_at(master, &path).unwrap().hosts[0].alias, "second");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
 
