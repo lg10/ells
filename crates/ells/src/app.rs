@@ -1105,7 +1105,10 @@ pub struct App {
     /// 关闭标签二次确认（存待关标签的 id）：该标签还在传输时，第一次只提示。
     pub close_tab_confirm: Option<u32>,
     /// 下一帧画之前要不要先整屏重绘。`Ctrl-L` 直接置位；屏幕换主（直通交回来、
-    /// 原生文件框关掉、最后一层弹窗关闭）由主循环自己判。
+    /// 原生文件框关掉、最后一层弹窗关闭）由主循环自己判。启动时也是 `true`：
+    /// 新进程手里的"上一帧"是两张空缓冲，不先真清一次屏，终端里它没画到的格子
+    /// 会被差分当成"已经是这样"永远留着（更新重启后最明显 —— 备用屏交还的是
+    /// 上一个 ells 的画面，旧版本的字就压在新一版的空白边距上）。
     repaint: bool,
     /// 上一帧有没有盖模态层、是不是直通、原生文件框在不在——这三样决定
     /// "上一帧那块屏幕是谁画的"，从有到无的那一刻必须全量重画一次。
@@ -1294,7 +1297,8 @@ impl App {
             done: false,
             quit_confirm: false,
             close_tab_confirm: None,
-            repaint: false,
+            // 首帧走整屏重画，理由写在字段注释里
+            repaint: true,
             overlay_last: false,
             passthrough_last: false,
             dialog_last: false,
@@ -1539,6 +1543,8 @@ impl App {
                 AppEvent::ExportSshConfig => self.export_ssh_config(),
                 AppEvent::Tunnel(event) => self.on_tunnel_event(event),
                 AppEvent::PickedFile { field, path } => {
+                    // 取消也算回来：标志不清，下一次原生框关闭就没人再触发整屏重画
+                    self.dialog_open = false;
                     if self.screen == ScreenKind::Form {
                         if let Some(p) = path {
                             if let Some(f) = self.form.fields.get_mut(field) {
@@ -1973,7 +1979,11 @@ impl App {
 
     async fn handle_session_key(&mut self, key: &KeyEvent) {
         let binds = self.settings.keybinds;
-        if binds.matches(Action::Browser, key) {
+        // 文件浏览器是 ells 自己的画面，直通期间开它等于和远端抢同一块屏幕：
+        // 和下面 F1/F3 一样，这时这个键原样交给远端。
+        if binds.matches(Action::Browser, key)
+            && self.slots[self.work].session.as_ref().map(|s| s.mode) != Some(TermMode::Passthrough)
+        {
             self.open_browser();
             return;
         }
@@ -2164,6 +2174,30 @@ impl App {
             || self.help_open
     }
 
+    /// 当前这一格是不是被远端独占着（直通模式，且 ells 正看着那一格的会话）：
+    /// 直通期间会话的字节是裸写 stdout 的，谁在这时候走开去画别的画面（切标签 /
+    /// 新建标签 / 开文件浏览器 / 回列表 / 点顶部按钮），就等于和远端往同一块屏幕上写，
+    /// 而 ells 的差分基线根本不知道有人写过。
+    fn remote_holds_screen(&self) -> bool {
+        self.screen == ScreenKind::Session
+            && self.slots[self.active]
+                .session
+                .as_ref()
+                .is_some_and(|s| s.mode == TermMode::Passthrough)
+    }
+
+    /// 挡下"从远端手里抢屏幕"的操作，并说清该先按哪个键。真挡了才返回 true。
+    fn refuse_to_take_screen(&mut self) -> bool {
+        if !self.remote_holds_screen() {
+            return false;
+        }
+        self.status = Some(format!(
+            "直通模式下远端独占屏幕 · 先按 {} 回内嵌",
+            self.settings.keybinds.display(Action::Passthrough)
+        ));
+        true
+    }
+
     /// 追加一个空标签，返回它的下标。
     fn push_tab(&mut self) -> usize {
         let id = self.next_slot_id;
@@ -2175,6 +2209,10 @@ impl App {
     /// 切到某个标签：页面跟着它自己走，全局弹窗与状态行一律清掉。
     fn focus_tab(&mut self, idx: usize) {
         if idx >= self.slots.len() || self.tabs_locked() {
+            return;
+        }
+        // 点自己那一格 = 从主机列表回到本标签，不是走开，直通期间照样要能回
+        if idx != self.active && self.refuse_to_take_screen() {
             return;
         }
         // 点"自己那一格"= 从主机列表回到它当时的页面，所以只有真的换页才算一次切换
@@ -2224,16 +2262,7 @@ impl App {
             }
             return;
         }
-        if self.slots[self.active]
-            .session
-            .as_ref()
-            .is_some_and(|s| s.mode == TermMode::Passthrough)
-        {
-            // 直通模式由远端独占屏幕，此刻 ells 自己的界面画了也没人看得见
-            self.status = Some(format!(
-                "直通模式下远端独占屏幕 · 先按 {} 回内嵌再看列表",
-                self.settings.keybinds.display(Action::Passthrough)
-            ));
+        if self.refuse_to_take_screen() {
             return;
         }
         self.screen = ScreenKind::List;
@@ -2275,6 +2304,10 @@ impl App {
     /// F2：新建标签。已经有空标签就直接复用它，一路狂加空页没有意义。
     fn new_tab(&mut self) {
         if self.tabs_locked() {
+            return;
+        }
+        // 直通期间新开一格 = 换掉屏幕的主人，远端还在往这块 stdout 写字
+        if self.refuse_to_take_screen() {
             return;
         }
         let idx = match self.slots.iter().position(Slot::is_idle) {
@@ -2393,6 +2426,11 @@ impl App {
 
     /// 顶部按钮行/弹窗的鼠标命中测试。
     fn handle_mouse(&mut self, column: u16, row: u16) {
+        // 直通期间屏幕上没有属于 ells 的可点东西：此刻的命中测试用的还是交出去之前
+        // 那一帧的矩形，点下去等于从远端手里抢屏幕（而且抢完还看不见反馈）。
+        if self.remote_holds_screen() {
+            return;
+        }
         if self.choice.is_some() {
             let (lines, options) = match &self.choice {
                 Some(c) => (c.lines.len(), c.options.len()),
@@ -5873,6 +5911,9 @@ impl App {
             .get(field)
             .map(|f| f.value.clone())
             .unwrap_or_default();
+        // 和上传/下载那三个选择框一样登记"屏幕暂时归系统对话框"：
+        // 关掉之后主循环要凭这个标志整屏重画一次，否则原生窗口在终端上留下的残片没人擦。
+        self.dialog_open = true;
         let tx = self.event_tx.clone();
         tokio::spawn(async move {
             let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
