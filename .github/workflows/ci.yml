@@ -27,6 +27,10 @@ jobs:
             target: x86_64-pc-windows-msvc
             artifact: ells-windows-x86_64.exe
     runs-on: ${{ matrix.os }}
+    # 实测：mac-aarch64 构建 68 秒 + 测试 19 秒，ubuntu 整格 2 分钟（含两支 pty 守卫）。
+    # 卡住的那次 mac-aarch64 在守卫这一步转了 54 分钟还没结束，而 Actions 默认上限是 6 小时 ——
+    # 守卫脚本自己现在每步都有墙钟，这里再兜一层：宁可超时判失败，不许把 runner 挂到天荒地老。
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 

@@ -24,6 +24,7 @@ import os
 import pty
 import re
 import select
+import signal
 import subprocess
 import struct
 import sys
@@ -32,7 +33,13 @@ import termios
 import time
 import shutil
 
+# 整场探测的墙钟上限。每一处阻塞都只朝一个明确的截止时间要时间，没有任何一处是"等它自己结束"：
+# 首帧最多 12 秒、发键最多 2 秒、发送 q 后等退出最多 8 秒、读收尾最多 1 秒、强杀后 reap 最多 5 秒。
+# 最坏情况三十几秒必定返回，判 FAIL 而不是把 CI 挂住。
 TIME_LIMIT = 25.0
+EXIT_WAIT = 8.0
+KILL_WAIT = 5.0
+START = time.monotonic()
 DEV_HOSTS = """[[hosts]]
 alias = "smoke"
 hostname = "127.0.0.1"
@@ -49,6 +56,79 @@ def fail(msg, captured):
     print("--- 终端收到的字节（末尾）---")
     print(repr(tail))
     return 1
+
+
+def note(msg):
+    """把每一步的相对耗时打到日志里：守卫挂住时，日志得自己能说明卡在哪一步。"""
+    print("[%5.1fs] %s" % (time.monotonic() - START, msg))
+    sys.stdout.flush()
+
+
+def read_once(master, timeout=0.1):
+    """最多读一轮，到点没数据就返回 None；绝不会因为对端一直在写而自旋。"""
+    ready, _, _ = select.select([master], [], [], timeout)
+    if not ready:
+        return None
+    try:
+        return os.read(master, 65536)
+    except BlockingIOError:
+        return None
+    except OSError:
+        # 从端最后一个持有者没了（读会 EIO）：和"没数据"一样处理
+        return None
+
+
+def drain(master, captured, until):
+    """读到截止时间为止，用来把收尾字节收干净。"""
+    while time.monotonic() < until:
+        chunk = read_once(master)
+        if chunk == b"":
+            return
+        if chunk:
+            captured += chunk
+
+
+def send_key(master, key, until):
+    """往 pty 写一个键。写不进去（从端输入队列满）就放弃，返回 False。
+
+    master 是阻塞 fd：对端不排空输入时 `os.write` 会一直挂着。这一发是守卫里
+    唯一"反过来喂子进程"的动作，所以先用 select 确认可写、并且只在有限时间内试。
+    """
+    while time.monotonic() < until:
+        _, ready, _ = select.select([], [master], [], 0.2)
+        if ready:
+            try:
+                os.write(master, key)
+                return True
+            except BlockingIOError:
+                continue
+            except OSError:
+                return False
+    return False
+
+
+def kill_group(proc):
+    """干掉整个进程组：ells 自更新回滚时会 exec 自己，还得连带它可能拉起的后代。"""
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+
+
+def wait_code(proc, until):
+    """等到截止时间拿退出码；拿不到就杀干净，返回 None，绝不无限等。"""
+    while True:
+        code = proc.poll()
+        if code is not None:
+            return code
+        if time.monotonic() >= until:
+            break
+        time.sleep(0.05)
+    kill_group(proc)
+    try:
+        return proc.wait(timeout=KILL_WAIT)
+    except subprocess.TimeoutExpired:
+        return None
 
 
 def main():
@@ -79,54 +159,59 @@ def main():
         stderr=slave,
         env=env,
         close_fds=True,
+        # 自己一个会话：收尾时能整组带走，也保证不会把 SIGKILL 错发给 CI runner 的作业
+        start_new_session=True,
     )
     os.close(slave)
 
     captured = bytearray()
-    deadline = time.monotonic() + TIME_LIMIT
     started = time.monotonic()
+    deadline = started + TIME_LIMIT
+    frame_deadline = started + 12.0
     quit_sent = False
-
-    while time.monotonic() < deadline:
-        ready, _, _ = select.select([master], [], [], 0.2)
-        if ready:
-            try:
-                chunk = os.read(master, 65536)
-            except OSError:
-                chunk = b""
+    quit_blocked = False
+    quit_at = None
+    code = None
+    last_note = started
+    try:
+        note("已拉起 %s（pty 40x120）" % binary)
+        while time.monotonic() < deadline:
+            chunk = read_once(master, 0.2)
             if chunk:
                 captured += chunk
-            else:
-                # pty 从端已无进程持有
-                pass
-        if proc.poll() is not None:
-            # 进程退出后把剩余字节读干净，便于定位
-            while True:
-                ready, _, _ = select.select([master], [], [], 0.2)
-                if not ready:
-                    break
-                try:
-                    captured += os.read(master, 65536)
-                except OSError:
-                    break
-            break
-        text = bytes(captured)
-        if not quit_sent and b"smoke" in text:
-            # 画出来了：立刻验证能否正常退出
-            os.write(master, b"q")
-            quit_sent = True
-        if not quit_sent and time.monotonic() - started > 12.0:
-            break
-
-    code = proc.poll()
-    if code is None:
-        proc.kill()
-        proc.wait()
-    try:
-        os.close(master)
-    except OSError:
-        pass
-    shutil.rmtree(home, ignore_errors=True)
+            now = time.monotonic()
+            if now - last_note > 5.0:
+                last_note = now
+                note("仍在等待收尾：已捕获 %d 字节，进程%s" % (len(captured), "还在跑" if proc.poll() is None else "已退出"))
+            if proc.poll() is not None:
+                # 进程退出后把剩余字节读干净，便于定位
+                note("进程先退出（码 %s），把收尾字节读干净" % proc.poll())
+                drain(master, captured, time.monotonic() + 1.0)
+                break
+            text = bytes(captured)
+            if not quit_sent and b"smoke" in text:
+                # 画出来了：立刻验证能否正常退出
+                note("首帧已出（捕获 %d 字节）：发送 q 验证能否干净退出" % len(text))
+                quit_sent = send_key(master, b"q", time.monotonic() + 2.0)
+                quit_blocked = not quit_sent
+                if quit_sent:
+                    quit_at = time.monotonic()
+            if not quit_sent and now > frame_deadline:
+                note("12 秒内没等到首帧，放弃")
+                break
+            if quit_sent and now > quit_at + EXIT_WAIT:
+                note("发送 q 之后 %s 秒进程仍不退出，强杀收尾" % EXIT_WAIT)
+                break
+        # 已经等到超时的这一种，不必再等第二遍 EXIT_WAIT：wait_code 会直接强杀
+        code = wait_code(proc, time.monotonic() + (2.0 if quit_at else EXIT_WAIT))
+        note("拿到退出码 %s（捕获 %d 字节）" % (code, len(captured)))
+    finally:
+        kill_group(proc)
+        try:
+            os.close(master)
+        except OSError:
+            pass
+        shutil.rmtree(home, ignore_errors=True)
 
     out = bytes(captured)
     if b"\x1b[6n" in out:
@@ -137,12 +222,14 @@ def main():
         return fail("主机列表第一帧没画出来（别名 smoke 没出现在终端字节流里）", out)
     if b"\x1b[2J" not in out:
         return fail("第一帧之前没有整屏重画（字节流里找不到 \\x1b[2J）：更新重启后的旧字残影会回来", out)
+    if quit_blocked:
+        return fail("界面画出来后 pty 的输入队列排不空，`q` 发不进去：事件流没在收 tty", out)
     if code != 0:
-        return fail("按 q 退出后进程退出码不是 0，而是 %s" % code, out)
+        return fail("按 q 退出后进程退出码不是 0，而是 %s（%s）" % (code, "已尽力收尾" if code is None else "非零"), out)
     if not re.search(rb"\x1b\[\?1049l", out):
         return fail("退出时没有离开备用屏（终端没被完整交还给 shell）", out)
 
-    print("ok: ells 在 pty 里出帧、退出干净（捕获 %d 字节）" % len(out))
+    print("ok: ells 在 pty 里出帧、退出干净（捕获 %d 字节、%.1f 秒）" % (len(out), time.monotonic() - started))
     return 0
 
 

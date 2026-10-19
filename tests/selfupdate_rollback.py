@@ -37,6 +37,18 @@ def fail(msg, stage):
     return 1
 
 
+def run_checked(argv, seconds, check=True):
+    """带墙钟上限地跑一条命令；超时就把已读到的部分吐出来再退出脚本。"""
+    try:
+        return subprocess.run(argv, capture_output=True, text=True, timeout=seconds, check=check)
+    except subprocess.TimeoutExpired as e:
+        print("FAIL: %s 超过 %s 秒没结束" % (" ".join(argv), seconds))
+        for label, raw in (("stdout", e.stdout), ("stderr", e.stderr)):
+            if raw:
+                print("--- %s ---\n%s" % (label, raw if isinstance(raw, str) else raw.decode("utf-8", "replace")))
+        sys.exit(1)
+
+
 def main():
     binary = sys.argv[1] if len(sys.argv) > 1 else "target/debug/ells"
     if not os.path.exists(binary):
@@ -53,8 +65,7 @@ def main():
     shutil.copy2(binary, backup)
 
     # 版本形状照抄生产：记录里是发布 tag（带 v），二进制自己报的是 crate 版本（不带 v）
-    reported = subprocess.run([exe, "--version"], capture_output=True, text=True,
-                              check=True).stdout.split()[-1].strip()
+    reported = run_checked([exe, "--version"], 10.0).stdout.split()[-1].strip()
     tag = "v" + reported
     with open(os.path.join(bindir, "ells.update.pending"), "w", encoding="utf-8") as fh:
         fh.write("tag=%s\nbackup=%s\ntries=1\n" % (tag, backup))
@@ -62,8 +73,10 @@ def main():
     link = os.path.join(bindir, "s")
     os.symlink("ells.gone", link)
 
-    # 守卫里 ells 会 exec 替换自身并接管这块 pty，退回后的那份照样要出帧、干净退出
-    run = subprocess.run([sys.executable, GUARD, exe], capture_output=True, text=True)
+    # 守卫里 ells 会 exec 替换自身并接管这块 pty，退回后的那份照样要出帧、干净退出。
+    # 守卫自己每一步都有墙钟（最坏三十几秒必然返回），这里再套一层 90 秒，
+    # 保证这一支脚本永远不会把 CI 挂住。
+    run = run_checked([sys.executable, GUARD, exe], 90.0, check=False)
     print(run.stdout.strip())
     if run.stderr.strip():
         print("--- 守卫 stderr ---\n" + run.stderr.strip())
