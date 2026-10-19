@@ -1371,6 +1371,7 @@ impl App {
         &mut self,
         terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     ) -> Result<()> {
+        let mut confirmed = false;
         while !self.done {
             // 界面（键盘/鼠标/绘制）永远作用于当前标签：先把手工作区切回来
             self.work = self.active;
@@ -1391,15 +1392,26 @@ impl App {
                 // 和弹窗各自盖住一片格子，而 ratatui 只补它以为变了的那几个格子；Windows 10 的
                 // 控制台在这些位置会把上一画面的残片（尤其被切断的全角字半个格子）一直留在那儿，
                 // 差分永远等不到有人重写它 —— 这就是"弹窗关掉后还有残留"。
-                // terminal.clear() 会清屏并作废差分基线，于是这一帧是真正的全量第一帧。
+                // 整屏重画 = 清屏 + 作废差分基线，于是这一帧是真正的全量第一帧。
                 if self.repaint || self.passthrough_last
                     || self.dialog_last && !dialog
                     || self.overlay_last && !overlays
                 {
-                    terminal.clear()?;
+                    // 这里不能用 `Terminal::clear()`：它的第一行是问终端"光标现在在哪"，
+                    // unix 上那是一发 `\x1b[6n` 等终端回话，而此刻事件流正在读同一个 tty，
+                    // 回话被它吃掉 → 超时报错 → 首帧就把程序打死（Windows 走控制台 API
+                    // 才幸免）。resize 到当前尺寸会走同一套"清屏 + 重置差分基线"，但不问光标。
+                    let size = terminal.size()?;
+                    terminal.resize(size.into())?;
                     self.repaint = false;
                 }
                 terminal.draw(|f| ui::draw(f, self))?;
+                if !confirmed {
+                    // 这一帧真的落到了屏幕上 = 这个版本可用：
+                    // 自更新留下的备份与待验证记录到此才有资格被扔掉
+                    confirmed = true;
+                    update::confirm_first_frame();
+                }
                 self.passthrough_last = false;
                 self.overlay_last = overlays;
                 self.dialog_last = dialog;

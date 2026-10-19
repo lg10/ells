@@ -250,6 +250,11 @@ fn net_msg(e: &ureq::Error) -> String {
 pub fn check() -> Result<Option<String>, String> {
     let tag = probe_tag()?;
     write_cache(&tag);
+    // 自动回退过的版本不再推给用户：不然就是"回退 → 又提示更新 → 又起不来 → 又回退"
+    if is_rejected(&tag) {
+        tracing::info!(%tag, "这个版本自动回退过，本次不再提示更新");
+        return Ok(None);
+    }
     Ok(is_newer(&tag).then_some(tag))
 }
 
@@ -309,14 +314,359 @@ fn old_path(exe: &Path) -> PathBuf {
 /// 下载并替换自身。`cancel` 置位即中止并清掉临时件。
 ///
 /// 成功不代表用户已经在跑新版本——正在跑的还是旧镜像，只是盘上的文件已经换好，
-/// 调用方要提示重启。
+/// 调用方要提示重启。换好之后立刻登记"待验证"（见 `recover_at_startup`）：
+/// 新二进制万一起不来，下次启动才有东西可退。
 pub fn apply(
     tag: &str,
     cancel: &AtomicBool,
     progress: impl FnMut(u64, Option<u64>),
 ) -> Result<(), String> {
-    apply_to(&exe_path()?, tag, cancel, progress)
+    let exe = exe_path()?;
+    let result = apply_to(&exe, tag, cancel, progress);
+    if result.is_ok() {
+        heal_launchers_in_dir(&exe);
+    }
+    result
 }
+
+/// 更新后留下的"这份新版本还没画出一帧"记录，和 `.old` 备份放在同一个目录里。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pending {
+    pub tag: String,
+    pub backup: PathBuf,
+    pub tries: u32,
+}
+
+/// 一次启动该做什么：`RolledBack` 表示盘上的二进制已被退回上一版（`tag` 是被退回
+/// 的那个版本），调用方要把退回后的那份重新拉起来。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Startup {
+    Ready,
+    RolledBack { tag: String },
+}
+
+fn pending_path(exe: &Path) -> PathBuf {
+    exe.parent().map(|d| d.join("ells.update.pending")).unwrap_or_else(|| PathBuf::from("ells.update.pending"))
+}
+
+/// 已经自动退回过的版本：别再把它当成"有更新"推给用户，否则就是
+/// 回退 → 提示更新 → 再崩 → 再回退的死循环。
+fn rejected_path(exe: &Path) -> PathBuf {
+    exe.parent().map(|d| d.join("ells.update.rejected")).unwrap_or_else(|| PathBuf::from("ells.update.rejected"))
+}
+
+fn read_pending(exe: &Path) -> Option<Pending> {
+    let text = std::fs::read_to_string(pending_path(exe)).ok()?;
+    let mut tag = String::new();
+    let mut backup = PathBuf::new();
+    let mut tries = 0u32;
+    for line in text.lines() {
+        let Some((k, v)) = line.split_once('=') else { continue };
+        match k.trim() {
+            "tag" => tag = v.trim().to_string(),
+            "backup" => backup = PathBuf::from(v.trim()),
+            "tries" => tries = v.trim().parse().unwrap_or(0),
+            _ => {}
+        }
+    }
+    (!tag.is_empty() && backup.is_file()).then_some(Pending { tag, backup, tries })
+}
+
+fn write_pending(exe: &Path, pending: &Pending) {
+    let text = format!(
+        "tag={}\nbackup={}\ntries={}\n",
+        pending.tag,
+        pending.backup.display(),
+        pending.tries
+    );
+    if let Err(e) = std::fs::write(pending_path(exe), text) {
+        tracing::warn!("写更新待验证记录失败：{e}");
+    }
+}
+
+fn clear_pending(exe: &Path) {
+    let _ = std::fs::remove_file(pending_path(exe));
+}
+
+/// 这次启动要不要把二进制退回上一版。
+///
+/// 只在界面启动路径上调用：无头子命令跑得动不代表界面版没坏，反过来也不该让
+/// `ells list` 去动盘上的二进制。
+pub fn recover_at_startup() -> Startup {
+    match exe_path() {
+        Ok(exe) => {
+            let startup = recover_from(&exe, current_version());
+            if let Startup::RolledBack { .. } = startup {
+                // 改名会让 Windows 的 current_exe() 跟着跑到 .broken 上，
+                // 所以先把"该拉起哪份文件"记死，restart 才不会把坏的那份再 exec 一遍
+                let _ = INSTALL_TARGET.set(exe);
+            }
+            startup
+        }
+        Err(_) => Startup::Ready,
+    }
+}
+
+/// `recover_at_startup` 的内核，`current` 传这份二进制自己的版本号，好在临时目录里测。
+fn recover_from(exe: &Path, current: &str) -> Startup {
+    let Some(pending) = read_pending(exe) else {
+        return Startup::Ready;
+    };
+    if !is_same_version(&pending.tag, current) {
+        // 版本号对不上 = 这条是陈账（重装过、或后来又更新过一轮）。拿它去退体只会把
+        // 一份好端端的二进制换成更早的，所以当场作废，本次照常启动。
+        clear_pending(exe);
+        return Startup::Ready;
+    }
+    if pending.tries == 0 {
+        // 这是换上新版本后的第一次启动，先给它一次机会，只把次数记下来
+        write_pending(exe, &Pending { tries: 1, ..pending.clone() });
+        return Startup::Ready;
+    }
+    let tag = pending.tag.clone();
+    match rollback_to_backup(exe, &pending) {
+        Ok(()) => Startup::RolledBack { tag },
+        Err(e) => {
+            tracing::warn!("自动回退失败：{e}");
+            clear_pending(exe);
+            Startup::Ready
+        }
+    }
+}
+
+/// 把备份挪回原位，顶掉这份起不来的新版本。
+///
+/// Windows 不许覆盖正在运行的镜像，所以先把坏的那份改名挪走（改名是允许的），
+/// 再把备份放回来；备份挪不回来必须原样挪回，否则启动名直接消失。
+fn rollback_to_backup(exe: &Path, pending: &Pending) -> Result<(), String> {
+    let broken = {
+        let mut name = exe
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "ells".to_string());
+        name.push_str(".broken");
+        exe.with_file_name(name)
+    };
+    if cfg!(windows) {
+        let _ = std::fs::remove_file(&broken);
+        std::fs::rename(exe, &broken)
+            .map_err(|e| format!("挪不开正在运行的 {}：{e}", exe.display()))?;
+    }
+    if let Err(e) = std::fs::rename(&pending.backup, exe) {
+        if cfg!(windows) {
+            let _ = std::fs::rename(&broken, exe);
+        }
+        return Err(format!("把上一版挪回 {} 失败：{e}", exe.display()));
+    }
+    write_rejected(exe, &pending.tag);
+    clear_pending(exe);
+    tracing::info!(tag = %pending.tag, backup = %pending.backup.display(), "已自动退回上一版");
+    Ok(())
+}
+
+fn write_rejected(exe: &Path, tag: &str) {
+    let _ = std::fs::write(rejected_path(exe), format!("{tag}\n"));
+}
+
+/// 属于"当前这份二进制"的待验证记录。
+///
+/// 只读不改：确认与回滚都在自己那份记录上做决定，作废陈账是启动自愈（`recover_from`）
+/// 一个人的活，别让一个查询顺手删掉别人的退路。
+fn pending_for(exe: &Path, current: &str) -> Option<Pending> {
+    let pending = read_pending(exe)?;
+    (is_same_version(&pending.tag, current)).then_some(pending)
+}
+
+/// 第一帧真的画到屏幕上之后调用：新版本被认定可用，待验证记录与备份都可以扔掉。
+pub fn confirm_first_frame() {
+    if let Ok(exe) = exe_path() {
+        confirm_for(&exe, current_version());
+    }
+}
+
+fn confirm_for(exe: &Path, current: &str) {
+    let Some(pending) = pending_for(exe, current) else {
+        return;
+    };
+    let _ = std::fs::remove_file(&pending.backup);
+    clear_pending(exe);
+}
+
+/// 主循环带着错误退出时调用：这是"新版本起来了但第一帧都没画出来"的直接证据，
+/// 当场退回上一版，不要等用户再试一次。返回被退回的版本号表示盘上已退回，调用方要重启。
+pub fn roll_back_after_failed_start() -> Option<String> {
+    let exe = exe_path().ok()?;
+    let tag = roll_back_for(&exe, current_version())?;
+    let _ = INSTALL_TARGET.set(exe);
+    Some(tag)
+}
+
+fn roll_back_for(exe: &Path, current: &str) -> Option<String> {
+    let pending = pending_for(exe, current)?;
+    let tag = pending.tag.clone();
+    match rollback_to_backup(exe, &pending) {
+        Ok(()) => Some(tag),
+        Err(e) => {
+            tracing::warn!("自动回退失败：{e}");
+            clear_pending(exe);
+            None
+        }
+    }
+}
+
+/// 记录里的 tag 是发布形状（`v0.2.4`），`current_version()` 是 crate 形状（`0.2.4`），
+/// 只能按解析出来的三段号比，直接比字符串会永远对不上 —— 对不上就等于永不回滚。
+fn is_same_version(a: &str, b: &str) -> bool {
+    Version::parse(a).is_some_and(|x| Version::parse(b) == Some(x))
+}
+
+/// 这个 tag 是不是已经被自动回退过一次：是的话不再提示更新。
+pub fn is_rejected(tag: &str) -> bool {
+    let Ok(exe) = exe_path() else {
+        return false;
+    };
+    std::fs::read_to_string(rejected_path(&exe))
+        .map(|text| text.trim() == tag)
+        .unwrap_or(false)
+}
+
+/// 启动时把同目录里另一个启动名对齐到正在跑的这份。
+///
+/// 安装脚本在同一个目录里放下了不止一个启动名（Windows 上 `ells.exe` 和 `s.exe`
+/// 是两份真拷贝，unix 上 `s` 是指向 `ells` 的软链），而自更新只换得动"正在跑的
+/// 那一个"。不补这一步，用户下次敲另一个名字拿到的还是旧版本，它还会再提示一次
+/// "有更新"；更糟的是软链可能在替换中变成一个独立副本，两份各跑各的版本。
+///
+/// 三种坏法都在这里修：软链断了（重新指回来）、只剩一个启动名（补上另一个）、
+/// 两份内容不同（用正在跑的这份覆盖）。跳过正在跑的本身，以及被另一个 ells
+/// 占用的启动名（Windows 不许覆盖运行中的镜像）—— 占用只是跳过，不算失败。
+pub fn heal_launchers() {
+    let Ok(exe) = exe_path() else { return };
+    // 开发构建里不补：`cargo run` 跑的是 target/debug/ells，那本来就不是安装目录，
+    // 照同一套规则会在开发机上凭空多拷出一个几百 MB 的 target/debug/s.exe。
+    // cargo 的输出目录里一定有 deps/，真实安装目录不会有。
+    if exe.parent().is_some_and(|dir| dir.join("deps").is_dir()) {
+        return;
+    }
+    heal_launchers_in_dir(&exe);
+}
+
+fn heal_launchers_in_dir(exe: &Path) {
+    let Some(dir) = exe.parent() else {
+        return;
+    };
+    for name in LAUNCHER_NAMES {
+        let path = dir.join(name);
+        if path == exe {
+            continue;
+        }
+        // 是不是同一个文件：先按解析后的真实路径比（软链因此也判成同一个），
+        // 解析不了再退回比名字——宁可跳过，也不能把刚装好的二进制拷回它自己
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) => {
+                if same_file(exe, &path) {
+                    continue;
+                }
+                if meta.file_type().is_symlink() && !path.is_file() {
+                    // 断链：安装脚本留下的名字还在 PATH 里，但执行只会报"没有那个文件"
+                    let _ = std::fs::remove_file(&path);
+                    link_launcher(exe, &path);
+                    continue;
+                }
+                if !path.is_file() {
+                    continue;
+                }
+                match refresh_copy(exe, &path) {
+                    Refresh::Same => {}
+                    Refresh::Done => {
+                        tracing::info!(path = %path.display(), "另一个启动名已跟着更新")
+                    }
+                    Refresh::Blocked(e) => tracing::warn!(
+                        path = %path.display(),
+                        "另一个启动名覆盖不了（多半是别处的 ells 正在运行），本次跳过：{e}"
+                    ),
+                    Refresh::Failed(e) => {
+                        tracing::warn!(path = %path.display(), "另一个启动名修不好：{e}")
+                    }
+                }
+            }
+            // 名字压根不在：这个目录里有正在跑的二进制，说明它是安装目录，补齐安装脚本的形状
+            Err(_) => link_launcher(exe, &path),
+        }
+    }
+}
+
+fn same_file(exe: &Path, other: &Path) -> bool {
+    match (std::fs::canonicalize(exe), std::fs::canonicalize(other)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => other.file_name() == exe.file_name(),
+    }
+}
+
+enum Refresh {
+    Same,
+    Done,
+    Blocked(String),
+    Failed(String),
+}
+
+/// 内容一致就不写盘：省一次几十 MB 的覆盖，也不会去碰别人正在跑的镜像。
+fn refresh_copy(exe: &Path, path: &Path) -> Refresh {
+    let (Some(want), Some(got)) = (digest_of(exe), digest_of(path)) else {
+        return Refresh::Failed("读不出内容".to_string());
+    };
+    if want == got {
+        return Refresh::Same;
+    }
+    match std::fs::copy(exe, path) {
+        Ok(_) => Refresh::Done,
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            Refresh::Blocked(e.to_string())
+        }
+        Err(e) => Refresh::Failed(e.to_string()),
+    }
+}
+
+/// 整份文件的 SHA256；读不出来给 None。只用来判断"两份是不是同一份东西"。
+fn digest_of(path: &Path) -> Option<String> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf).ok()?;
+        if n == 0 {
+            break;
+        }
+        ctx.update(&buf[..n]);
+    }
+    Some(ctx.finish().as_ref().iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// 按安装脚本的形状补上启动名：unix 是指向同目录主二进制的软链，Windows 只能再拷一份。
+fn link_launcher(exe: &Path, path: &Path) {
+    #[cfg(unix)]
+    {
+        let Some(target) = exe.file_name() else { return };
+        match std::os::unix::fs::symlink(target, path) {
+            Ok(_) => tracing::info!(path = %path.display(), "缺失的启动名已补上软链"),
+            Err(e) => tracing::warn!(path = %path.display(), "启动名补不出来：{e}"),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        match std::fs::copy(exe, path) {
+            Ok(_) => tracing::info!(path = %path.display(), "缺失的启动名已补上副本"),
+            Err(e) => tracing::warn!(path = %path.display(), "启动名补不出来：{e}"),
+        }
+    }
+}
+
+/// 安装脚本会创建的启动名。
+#[cfg(windows)]
+const LAUNCHER_NAMES: [&str; 2] = ["ells.exe", "s.exe"];
+/// unix 上 `s` 是指向 `ells` 的软链（同一个文件，自愈时按"是不是同一个文件"跳过）。
+#[cfg(not(windows))]
+const LAUNCHER_NAMES: [&str; 2] = ["ells", "s"];
 
 /// 把 `exe` 换成 `tag` 版本的官方资产。目标路径单独传进来，是为了能在临时目录里
 /// 跑完整链路做验证，而不是拿正在运行的自己试。
@@ -349,6 +699,12 @@ fn apply_to(
         let _ = std::fs::remove_file(&tmp);
     } else {
         let _ = INSTALL_TARGET.set(exe.to_path_buf());
+        // 盘上换好了，但"能不能跑起来"只有下一帧才知道。先登记待验证，
+        // 万一这份新二进制开局就崩，下次启动还有 `.old` 可以退回去。
+        write_pending(
+            exe,
+            &Pending { tag: tag.clone(), backup: old_path(exe), tries: 0 },
+        );
         tracing::info!(%tag, path = %exe.display(), "ells 已更新");
     }
     result
@@ -437,24 +793,19 @@ fn mark_executable(_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// 用新二进制顶掉正在运行的自己。
+/// 用新二进制顶掉正在运行的自己，并把旧的留成 `.old`。
 ///
-/// Windows 不许删除运行中的 exe，但允许改名，所以先把它挪成 `ells.exe.old`
-/// （下次启动由 `cleanup_leftovers` 清掉）；替换失败必须原样挪回，
-/// 否则用户的 `s` / `ells` 命令会直接消失。
+/// Windows 不许删除运行中的 exe，只许改名，所以必须先挪开；unix 上同样挪这一挪，
+/// 是因为那是"新版换上了却根本起不来"时唯一能退回的东西（见 `recover_at_startup`）。
+/// 替换失败必须原样挪回，否则用户的 `s` / `ells` 命令会直接消失。
 fn install_in_place(exe: &Path, tmp: &Path) -> Result<(), String> {
-    let moved_aside = cfg!(windows);
-    if moved_aside {
-        let old = old_path(exe);
-        let _ = std::fs::remove_file(&old);
-        std::fs::rename(exe, &old).map_err(|e| {
-            format!("无法挪开正在运行的 {}：{e}（Windows 偶发占用，稍后重试即可）", exe.display())
-        })?;
-    }
+    let old = old_path(exe);
+    let _ = std::fs::remove_file(&old);
+    std::fs::rename(exe, &old).map_err(|e| {
+        format!("无法挪开正在运行的 {}：{e}（Windows 偶发占用，稍后重试即可）", exe.display())
+    })?;
     if let Err(e) = std::fs::rename(tmp, exe) {
-        if moved_aside {
-            let _ = std::fs::rename(old_path(exe), exe);
-        }
+        let _ = std::fs::rename(old_path(exe), exe);
         return Err(replace_err(exe, &e));
     }
     Ok(())
@@ -471,13 +822,17 @@ fn replace_err(exe: &Path, e: &std::io::Error) -> String {
     }
 }
 
-/// 清掉上一次更新留下的备份件与崩溃残留的临时件（临时件只删一天前的，
-/// 免得误杀另一个正在下载的 ells 实例）。
+/// 清掉上一次更新留下的崩溃残留（临时件与回退坏件只删一天前的，
+/// 免得误杀另一个正在下载的 ells 实例、或删掉别人正要退回的备份）。
 pub fn cleanup_leftovers() {
     let Ok(exe) = std::env::current_exe() else {
         return;
     };
-    let _ = std::fs::remove_file(old_path(&exe));
+    // 备份的归宿是 `confirm_first_frame`：新版还没被证明能画出一帧时，
+    // `.old` 是唯一的退路，这里不能碰。
+    if read_pending(&exe).is_none() {
+        let _ = std::fs::remove_file(old_path(&exe));
+    }
     let Some(dir) = exe.parent() else { return };
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -486,7 +841,9 @@ pub fn cleanup_leftovers() {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if !(name.starts_with("ells.update.") && name.ends_with(".tmp")) {
+        let leftover = (name.starts_with("ells.update.") && name.ends_with(".tmp"))
+            || name.ends_with(".broken");
+        if !leftover {
             continue;
         }
         let stale = entry
@@ -507,7 +864,13 @@ pub fn cleanup_leftovers() {
 /// unix 走 exec：原地替换当前进程映像，pid、进程组、控制终端全部保留。
 /// 之前用 spawn 拉新进程，旧进程一退出，新进程就成了"死进程组"里的孤儿——
 /// tty 不再是它的前台，macOS 上任何 termios 初始化直接 EIO，新版本还没开局就报
-/// "Input/output error (os error 5)"。Windows 控制台没有这套进程组语义，维持 spawn。
+/// "Input/output error (os error 5)"。
+///
+/// Windows 反过来：新进程必须**自己带一块控制台**。同控制台拉起来时新进程确实活着
+/// （实测事件流、备用屏都正常），但父进程一退出，外层 shell 立刻把提示符打回同一块
+/// 屏幕 —— 两个进程往同一个控制台写，用户只看见提示符压着一片残片，像闪退，实际是
+/// 版本已经在后台跑着却没了屏幕。`CREATE_NEW_CONSOLE` 在 Windows Terminal 下就是
+/// 新开一个标签，新版本从第一帧起就独占它那块屏幕。
 pub fn restart() -> Result<(), String> {
     let exe = exe_path()?;
     let mut cmd = std::process::Command::new(&exe);
@@ -521,11 +884,26 @@ pub fn restart() -> Result<(), String> {
     }
     #[cfg(not(unix))]
     {
-        cmd.spawn()
-            .map(|_| ())
-            .map_err(|e| format!("新版本启动失败：{e}（请手动运行 {}）", exe.display()))
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(CREATE_NEW_CONSOLE);
+        }
+        match cmd.spawn() {
+            Ok(_) => {
+                // 旧标签得说一句人话：它回到 shell 是交接完成，不是崩了。
+                // unix 上不用——exec 原地换映像，新画面紧跟着就盖过来了。
+                println!("新版本已在新标签/新窗口里打开，本标签交还给 shell。");
+                Ok(())
+            }
+            Err(e) => Err(format!("新版本启动失败：{e}（请手动运行 {}）", exe.display())),
+        }
     }
 }
+
+/// Windows 控制台创建标志：给子进程另开一块控制台，不继承父进程那块。
+#[cfg(windows)]
+const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
 
 #[cfg(test)]
 mod tests {
@@ -537,6 +915,17 @@ mod tests {
         assert!(Version::parse("v0.1.10").unwrap() > Version::parse("0.1.9").unwrap());
         assert!(Version::parse("0.2.0").unwrap() > Version::parse("0.1.99").unwrap());
         assert!(!is_newer("v0.0.1"));
+    }
+
+    #[test]
+    fn release_and_crate_version_shapes_are_the_same_version() {
+        // 待验证记录里存的是发布 tag（带 v），比的是 CARGO_PKG_VERSION（不带 v）
+        assert!(is_same_version("v0.2.4", "0.2.4"));
+        assert!(is_same_version("0.2.4", "0.2.4"));
+        assert!(!is_same_version("v0.2.4", "0.2.5"));
+        // 认不出来的版本不能判成同一条记录，否则陈账会被当成新账误退
+        assert!(!is_same_version("latest", "0.2.4"));
+        assert!(!is_same_version("v0.2.4", ""));
     }
 
     #[test]
@@ -649,11 +1038,201 @@ mod tests {
         assert!(old.to_string_lossy().ends_with(".old"));
     }
 
-    #[test]
-    fn replace_moves_the_new_file_in_and_backs_the_old_one_up() {
-        let dir = std::env::temp_dir().join(format!("ells-update-test-{}", std::process::id()));
+    /// 每个自愈/回退测试各自的临时目录；名字带 pid，跑完即删。
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("ells-update-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let exe = dir.join(if cfg!(windows) { "ells.exe" } else { "ells" });
+        dir
+    }
+
+    #[test]
+    fn a_stale_launcher_copy_is_refreshed_from_the_running_one() {
+        let dir = temp_dir("sibling");
+        let [first, second] = LAUNCHER_NAMES;
+        let exe = dir.join(second);
+        let other = dir.join(first);
+        std::fs::write(&exe, b"new binary").unwrap();
+        std::fs::write(&other, b"stale binary").unwrap();
+
+        heal_launchers_in_dir(&exe);
+
+        assert_eq!(std::fs::read_to_string(&other).unwrap(), "new binary");
+        assert_eq!(std::fs::read_to_string(&exe).unwrap(), "new binary");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_missing_launcher_name_is_created_beside_the_binary() {
+        // 用户报的正是这个形状：`ells` 打得开、`s` 再也打不开。安装目录里两个启动名
+        // 是安装脚本放下的，自愈不能只留一个。
+        let dir = temp_dir("missing-launcher");
+        let exe = dir.join(LAUNCHER_NAMES[0]);
+        let other = dir.join(LAUNCHER_NAMES[1]);
+        std::fs::write(&exe, b"new binary").unwrap();
+        assert!(!other.exists());
+
+        heal_launchers_in_dir(&exe);
+
+        assert!(other.is_file(), "缺失的启动名要补回来");
+        assert_eq!(std::fs::read_to_string(&other).unwrap(), "new binary");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_running_binary_is_never_copied_onto_itself() {
+        // 自己也在启动名清单里；拷回自己 = 边截断边读同一个 inode，会把刚装好的二进制写坏
+        let dir = temp_dir("self");
+        let exe = dir.join(LAUNCHER_NAMES[0]);
+        std::fs::write(&exe, b"new binary").unwrap();
+
+        heal_launchers_in_dir(&exe);
+
+        assert_eq!(std::fs::read_to_string(&exe).unwrap(), "new binary", "自己不能被拷成零字节");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn healing_from_a_symlink_alias_does_not_split_the_launcher_in_two() {
+        // 用户敲 `s` 起的其实是软链。把它当"另一个启动名"拷一份，两份就各跑各的版本了。
+        let dir = temp_dir("alias");
+        let main = dir.join("ells");
+        let alias = dir.join("s");
+        std::fs::write(&main, b"new binary").unwrap();
+        std::os::unix::fs::symlink("ells", &alias).unwrap();
+
+        heal_launchers_in_dir(&alias);
+
+        assert!(
+            std::fs::symlink_metadata(&alias).unwrap().file_type().is_symlink(),
+            "软链不该被换成一份独立拷贝"
+        );
+        assert_eq!(std::fs::read_to_string(&main).unwrap(), "new binary");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_launcher_symlink_is_relinked() {
+        // 替换中途被截断时，`s` 会指着一个已经不存在的名字：命令还在 PATH 里，
+        // 执行只会报"没有那个文件"，看起来就像"s 打不开、ells 能打开"。
+        let dir = temp_dir("dangling");
+        let exe = dir.join("ells");
+        let link = dir.join("s");
+        std::fs::write(&exe, b"new binary").unwrap();
+        std::os::unix::fs::symlink("ells.gone", &link).unwrap();
+
+        heal_launchers_in_dir(&exe);
+
+        assert!(link.is_file(), "断链修好后应该能读到主二进制");
+        assert_eq!(std::fs::read_to_string(&link).unwrap(), "new binary");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_pending_record_rolls_back_on_the_second_start() {
+        // tag 一律用发布形状 `v0.2.4`、current 用 crate 形状 `0.2.4`：这就是盘上真实的
+        // 两种写法，比字符串的话这条记录永远不会生效。
+        let dir = temp_dir("recover");
+        let exe = dir.join(LAUNCHER_NAMES[0]);
+        let backup = old_path(&exe);
+        std::fs::write(&exe, b"broken new").unwrap();
+        std::fs::write(&backup, b"good old").unwrap();
+        write_pending(&exe, &Pending { tag: "v0.2.4".into(), backup: backup.clone(), tries: 0 });
+
+        // 换上新版本的第一次启动：先给它一次机会，只记次数
+        assert_eq!(recover_from(&exe, "0.2.4"), Startup::Ready);
+        assert_eq!(std::fs::read_to_string(&exe).unwrap(), "broken new");
+        assert_eq!(read_pending(&exe).unwrap().tries, 1);
+
+        // 第二次还是起不来：退回上一版，并把这一版记成"别再推给用户"
+        assert_eq!(
+            recover_from(&exe, "0.2.4"),
+            Startup::RolledBack { tag: "v0.2.4".into() }
+        );
+        assert_eq!(std::fs::read_to_string(&exe).unwrap(), "good old");
+        assert!(read_pending(&exe).is_none(), "退完不该留记录");
+        assert_eq!(
+            std::fs::read_to_string(rejected_path(&exe)).unwrap().trim(),
+            "v0.2.4",
+            "退回过的版本要记下来，否则会陷入 提示更新→再崩→再退回"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_pending_record_from_another_version_is_dropped_not_acted_on() {
+        // 记录里写着 v0.2.4、盘上跑的却是 v0.3.0（重装过、或又更新过一轮）。
+        // 拿这条陈账去退体会把好端端的二进制换成更早的一份，所以当场作废。
+        let dir = temp_dir("stale-pending");
+        let exe = dir.join(LAUNCHER_NAMES[0]);
+        let backup = old_path(&exe);
+        std::fs::write(&exe, b"current").unwrap();
+        std::fs::write(&backup, b"much older").unwrap();
+        write_pending(&exe, &Pending { tag: "v0.2.4".into(), backup: backup.clone(), tries: 3 });
+
+        assert_eq!(recover_from(&exe, "0.3.0"), Startup::Ready);
+        assert_eq!(std::fs::read_to_string(&exe).unwrap(), "current");
+        assert!(!pending_path(&exe).exists(), "陈账要当场清掉，不能留着下次误退");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_confirmed_frame_throws_the_backup_away_and_keeps_an_unrelated_one() {
+        let dir = temp_dir("confirm");
+        let exe = dir.join(LAUNCHER_NAMES[0]);
+        let backup = old_path(&exe);
+        std::fs::write(&exe, b"new").unwrap();
+        std::fs::write(&backup, b"old").unwrap();
+        write_pending(&exe, &Pending { tag: "v0.2.4".into(), backup: backup.clone(), tries: 1 });
+
+        // 版本号对不上 = 这条不是给这份二进制画的帧，备份得留着
+        confirm_for(&exe, "0.9.9");
+        assert!(backup.is_file(), "对不上版本的确认不能删备份");
+
+        confirm_for(&exe, "0.2.4");
+        assert!(!backup.exists(), "新版被证明能出帧，退路就没用了");
+        assert!(!pending_path(&exe).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_start_rolls_back_on_the_spot() {
+        let dir = temp_dir("roll-back-now");
+        let exe = dir.join(LAUNCHER_NAMES[0]);
+        let backup = old_path(&exe);
+        std::fs::write(&exe, b"broken new").unwrap();
+        std::fs::write(&backup, b"good old").unwrap();
+        write_pending(&exe, &Pending { tag: "v0.2.4".into(), backup: backup.clone(), tries: 1 });
+
+        assert_eq!(roll_back_for(&exe, "0.2.4").as_deref(), Some("v0.2.4"));
+        assert_eq!(std::fs::read_to_string(&exe).unwrap(), "good old");
+        // 退过一次之后没有第二条记录可退，不能无限重启自己
+        assert_eq!(roll_back_for(&exe, "0.2.4"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn nothing_rolls_back_when_the_backup_is_gone() {
+        // 没有备份就没有退路：这时必须让当前这份跑下去，而不是把二进制挪没了
+        let dir = temp_dir("no-backup");
+        let exe = dir.join(LAUNCHER_NAMES[0]);
+        std::fs::write(&exe, b"the only copy").unwrap();
+        write_pending(
+            &exe,
+            &Pending { tag: "v0.2.4".into(), backup: old_path(&exe), tries: 5 },
+        );
+
+        assert_eq!(recover_from(&exe, "0.2.4"), Startup::Ready);
+        assert_eq!(std::fs::read_to_string(&exe).unwrap(), "the only copy");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn replace_moves_the_new_file_in_and_keeps_the_old_one_as_backup() {
+        let dir = temp_dir("replace");
+        let exe = dir.join(LAUNCHER_NAMES[0]);
         let tmp = dir.join("ells.update.1.tmp");
         std::fs::write(&exe, b"old binary").unwrap();
         std::fs::write(&tmp, b"new binary").unwrap();
@@ -661,10 +1240,22 @@ mod tests {
         install_in_place(&exe, &tmp).expect("替换应成功");
         assert_eq!(std::fs::read_to_string(&exe).unwrap(), "new binary");
         assert!(!tmp.exists(), "临时件应被改名走，不该留下");
-        if cfg!(windows) {
-            // Windows 上旧镜像被挪成 .old，不能凭空消失
-            assert!(old_path(&exe).exists());
-        }
+        // unix 上也要留这一挪：那是"新版换上却起不来"时唯一能退回的东西
+        assert_eq!(std::fs::read_to_string(old_path(&exe)).unwrap(), "old binary");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_replace_moves_the_original_back() {
+        // 新二进制挪不上去（这里用"临时件压根不在盘上"造出来），旧的必须原样挪回，
+        // 否则 ells / s 两个启动名会一起消失，用户连报错都看不到。
+        let dir = temp_dir("restore");
+        let exe = dir.join(LAUNCHER_NAMES[0]);
+        std::fs::write(&exe, b"old binary").unwrap();
+        let tmp = dir.join("no-such-dir").join("ells.update.1.tmp");
+
+        assert!(install_in_place(&exe, &tmp).is_err());
+        assert_eq!(std::fs::read_to_string(&exe).unwrap(), "old binary");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -695,31 +1286,11 @@ mod tests {
         apply_to(&exe, "v0.1.5", &cancel, &mut |_, _| ticks += 1).expect("更新应完成");
 
         let want = fetch_sum("v0.1.5", asset).expect("发布资产应有校验条目");
-        assert_eq!(digest_of(&exe), want, "换上去的不是发布的那份文件");
+        assert_eq!(digest_of(&exe).as_deref(), Some(want.as_str()), "换上去的不是发布的那份文件");
         assert!(std::fs::metadata(&exe).unwrap().len() > 1 << 20, "不像一个真二进制");
         assert!(ticks > 1, "进度回调至少要有几拍：{ticks}");
-        if cfg!(windows) {
-            assert!(old_path(&exe).exists(), "旧镜像应被挪成 .old 而不是丢掉");
-        }
+        assert!(old_path(&exe).exists(), "旧镜像应被挪成 .old 而不是丢掉");
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    fn digest_of(path: &Path) -> String {
-        let mut file = std::fs::File::open(path).unwrap();
-        let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
-        let mut buf = [0u8; 64 * 1024];
-        loop {
-            let n = file.read(&mut buf).unwrap();
-            if n == 0 {
-                break;
-            }
-            ctx.update(&buf[..n]);
-        }
-        ctx.finish()
-            .as_ref()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect()
     }
 
     /// 真网络冒烟：跑 `cargo test -- --ignored`。校验和是发布时算好的，写死在这里

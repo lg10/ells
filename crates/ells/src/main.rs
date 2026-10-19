@@ -84,6 +84,23 @@ fn main() -> Result<()> {
         std::process::exit(code);
     }
 
+    // 下面两步只在界面启动路径上做：无头子命令跑得动不代表界面版没坏，
+    // 反过来也不该让 `ells list` 去动盘上的二进制。
+    match update::recover_at_startup() {
+        update::Startup::Ready => {}
+        update::Startup::RolledBack { tag } => {
+            // 上次换上这一版之后一帧都没画出来、这次已经退回上一版：
+            // 直接拉起退回后的那份，用户不用重敲命令（unix 走 exec，永不返回）
+            eprintln!(
+                "\x1b[31mells {tag} 起不来，已自动退回上一版，正在用退回后的版本打开。\x1b[0m"
+            );
+            update::restart().map_err(anyhow::Error::msg)?;
+            return Ok(());
+        }
+    }
+    // 同目录里另一个启动名（`s`）可能停在旧版本、或者在替换中变成了断链
+    update::heal_launchers();
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -104,14 +121,27 @@ fn main() -> Result<()> {
     dialog::run_service(rx);
 
     let restart = match app_thread.join() {
-        Ok(result) => result?,
-        Err(_) => anyhow::bail!(
+        Ok(result) => result,
+        Err(_) => Err(anyhow::anyhow!(
             "ells 主循环异常退出，屏幕已恢复；详情见上方错误信息"
-        ),
+        )),
+    };
+    let restart = match restart {
+        Ok(restart) => restart,
+        Err(err) => {
+            // 刚换上、还没画出过一帧的版本把程序打死了：当场退回上一版再拉起来，
+            // 不能让用户此后每次启动都只看到一行 Error
+            if let Some(tag) = update::roll_back_after_failed_start() {
+                eprintln!("\x1b[31mells {tag} 启动失败，已自动退回上一版。\x1b[0m");
+                update::restart().map_err(anyhow::Error::msg)?;
+            }
+            return Err(err);
+        }
     };
     if restart {
         // 必须在主线程执行：unix 的 exec 原地替换进程映像，pid/进程组/控制终端
-        // 全部保留，新版本才能直接接管屏幕；Windows 是 spawn 后正常退出
+        // 全部保留，新版本才能直接接管屏幕；Windows 用 CREATE_NEW_CONSOLE 拉起新版本
+        // （它必须自己带一块控制台，否则和外层 shell 抢同一块屏幕）后正常退出
         update::restart().map_err(anyhow::Error::msg)?;
     }
     Ok(())

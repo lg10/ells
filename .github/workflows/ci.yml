@@ -46,6 +46,18 @@ jobs:
       - name: Test
         run: cargo test --locked --target ${{ matrix.target }}
 
+      # 首帧必须真的画到屏幕上。v0.2.3 就是在第一帧之前问了一次光标位置（`\x1b[6n`），
+      # 而 tty 的读字节正被 crossterm 的异步事件流占着 —— 回话收不到只会超时，
+      # macOS / Linux 上程序在出帧之前就退出。Windows 控制台不发转义序列，
+      # 所以这两个守卫只在 unix 的两台原生跑（x86_64 mac 是交叉产物，跑不了 pty）。
+      - name: pty 启动守卫（首帧不许问光标）
+        if: matrix.os == 'ubuntu-22.04' || matrix.target == 'aarch64-apple-darwin'
+        run: python3 tests/tty_startup.py target/${{ matrix.target }}/debug/ells
+
+      - name: 自更新回滚 + 启动名自愈（真二进制、真 pty）
+        if: matrix.os == 'ubuntu-22.04' || matrix.target == 'aarch64-apple-darwin'
+        run: python3 tests/selfupdate_rollback.py target/${{ matrix.target }}/debug/ells
+
       - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
