@@ -33,6 +33,9 @@ pub struct SessionState {
     intercepting: bool,
     /// Extra Ctrl-C re-sends already emitted during the current swallow window.
     abort_retries: u8,
+    /// 脚本里的 rz（命令行没有回显）：先不中止远端 rz，等本地选完并上传落盘后
+    /// 再放行。否则远端 rz 立刻退出，脚本紧接着的 `[ -f ]` 检查必然失败。
+    hold_receive: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -71,6 +74,7 @@ impl SessionState {
             zmodem: Watcher::new(),
             intercepting: false,
             abort_retries: 0,
+            hold_receive: false,
         }
     }
 
@@ -133,7 +137,8 @@ impl SessionState {
         if self.intercepting {
             // lrzsz rz/sz re-sends its handshake every ~3s; make sure it dies
             // by re-aborting a few times while we keep swallowing output.
-            if !bytes.is_empty() && self.abort_retries < 3 {
+            // 脚本里的 rz 正被有意留着等上传，不能补刀。
+            if !self.hold_receive && !bytes.is_empty() && self.abort_retries < 3 {
                 self.abort_retries += 1;
                 self.send_abort();
             }
@@ -144,7 +149,13 @@ impl SessionState {
             if !matches!(e, ZmodemEvent::Missing { .. }) {
                 self.intercepting = true;
                 self.abort_retries = 0;
-                self.send_abort();
+                // 用户手敲的 rz 立刻中止（提示符马上回来）；脚本里的 rz 不回显，
+                // 留到上传完成再放行，让脚本后续动作看到已落盘的文件。
+                self.hold_receive =
+                    matches!(e, ZmodemEvent::Receive) && !self.zmodem.transfer_echoed();
+                if !self.hold_receive {
+                    self.send_abort();
+                }
                 return ev;
             }
         }
@@ -163,6 +174,20 @@ impl SessionState {
         self.intercepting
     }
 
+    /// 正在等本地把文件传完，之后再中止远端脚本里的 rz。
+    pub fn is_holding_receive(&self) -> bool {
+        self.hold_receive
+    }
+
+    /// 本地这一轮上传已结束（成功、失败或取消）：中止远端 rz，让脚本继续走。
+    pub fn release_receive(&mut self) {
+        if !self.hold_receive {
+            return;
+        }
+        self.send_abort();
+        self.end_intercept();
+    }
+
     /// lrzsz aborts a handshake when it sees ≥5 consecutive CAN octets;
     /// send a full CAN×10 burst plus Ctrl-C as insurance.
     fn send_abort(&mut self) {
@@ -172,10 +197,14 @@ impl SessionState {
 
     pub fn end_intercept(&mut self) {
         let was_intercepting = self.intercepting;
+        let held = self.hold_receive;
         self.intercepting = false;
+        self.hold_receive = false;
         self.abort_retries = 0;
         self.zmodem.reset();
-        if was_intercepting {
+        // 脚本还要接着往下跑，它自己会打印后续输出并回到提示符；额外敲回车只会在
+        // 脚本结束后的交互提示符上多留一个空行。
+        if was_intercepting && !held {
             // The shell reprinted its prompt while we were swallowing; nudge it
             // so the user lands back on a visible prompt instead of a blank page.
             self.session.write_input(vec![b'\r']);

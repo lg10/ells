@@ -81,22 +81,30 @@ pub fn shutdown() {
     }
 }
 
-/// 主线程前台守卫：只在对话框弹出期间存在。
+/// 主线程前台守卫 + 空闲时的事件泵（仅 macOS 有意义）。
 #[cfg(target_os = "macos")]
 mod foreground {
-    use objc2::rc::Retained;
     use objc2::MainThreadMarker;
+    use objc2::rc::Retained;
     use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
+    use objc2_foundation::{NSDate, NSRunLoop};
     use std::sync::OnceLock;
+    use std::sync::mpsc::{Receiver, RecvTimeoutError};
+
+    use super::Job;
 
     /// macOS 上从终端启动的纯命令行进程：NSApp 处于 Prohibited 且从未 finishLaunching。
     /// rfd 在这个状态直接 runModal，会把系统共享的 openAndSavePanelService 一起锁死
     /// ——不只 ells，连访达都卡住，直到 ells 退出才恢复。
-    /// 正确姿势是弹框前以 Regular 正式拉起 AppKit 并激活，收尾后调回 Prohibited，
-    /// Dock 与焦点都还给终端。
+    /// 首次弹框时以 Accessory 正式拉起：不进 Dock、不占菜单栏，但能正常激活并弹面板。
+    /// 之后一直留在 Accessory，不再每次弹框都切回 Prohibited：策略切换是异步的，
+    /// 下一次面板可能在旧策略还没生效时开出来，又走回锁死面板服务的老路。
     pub struct Foreground {
         app: Option<Retained<NSApplication>>,
     }
+
+    /// AppKit 是否已经正式拉起（第一次弹框之后）。
+    static LAUNCHED: OnceLock<()> = OnceLock::new();
 
     impl Foreground {
         pub fn acquire() -> Self {
@@ -104,9 +112,8 @@ mod foreground {
                 return Self { app: None };
             };
             let app = NSApplication::sharedApplication(mtm);
-            app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
-            static LAUNCHED: OnceLock<()> = OnceLock::new();
             if LAUNCHED.set(()).is_ok() {
+                app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
                 app.finishLaunching();
             }
             #[allow(deprecated)]
@@ -119,7 +126,27 @@ mod foreground {
         fn drop(&mut self) {
             if let Some(app) = &self.app {
                 app.deactivate();
-                app.setActivationPolicy(NSApplicationActivationPolicy::Prohibited);
+            }
+        }
+    }
+
+    /// 取下一个对话框任务。没有任务时不能一直停在 `recv()`：面板关闭后
+    /// AppKit 还有收尾事件（XPC 回执、视图服务拆除）要走主线程 run loop，
+    /// 主线程不转，共享的 openAndSavePanelService 就会等这个客户端到天荒地老，
+    /// 访达的打开/保存面板跟着一起转圈。空闲时让 run loop 跑一小步再回来等。
+    pub fn next_job(rx: &Receiver<Job>) -> Option<Job> {
+        // 还没弹过面板：AppKit 尚未启动，没有收尾事件要跑，直接阻塞等。
+        if LAUNCHED.get().is_none() {
+            return rx.recv().ok();
+        }
+        loop {
+            match rx.recv_timeout(std::time::Duration::from_millis(20)) {
+                Ok(job) => return Some(job),
+                Err(RecvTimeoutError::Timeout) => {
+                    NSRunLoop::currentRunLoop()
+                        .runUntilDate(&NSDate::dateWithTimeIntervalSinceNow(0.01));
+                }
+                Err(RecvTimeoutError::Disconnected) => return None,
             }
         }
     }
@@ -128,6 +155,10 @@ mod foreground {
 /// 非 macOS 平台 rfd 自行处理线程与事件循环，守卫是空的。
 #[cfg(not(target_os = "macos"))]
 mod foreground {
+    use std::sync::mpsc::Receiver;
+
+    use super::Job;
+
     pub struct Foreground;
 
     impl Foreground {
@@ -135,11 +166,15 @@ mod foreground {
             Foreground
         }
     }
+
+    pub fn next_job(rx: &Receiver<Job>) -> Option<Job> {
+        rx.recv().ok()
+    }
 }
 
 /// 在主线程上运行；收到 `Shutdown` 后返回。
 pub fn run_service(rx: Receiver<Job>) {
-    while let Ok(job) = rx.recv() {
+    while let Some(job) = foreground::next_job(&rx) {
         if let Job::Shutdown = job {
             break;
         }

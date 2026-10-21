@@ -1224,7 +1224,7 @@ dependencies = [
 
 [[package]]
 name = "ells"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1238,6 +1238,7 @@ dependencies = [
  "futures",
  "objc2",
  "objc2-app-kit",
+ "objc2-foundation",
  "ratatui",
  "rfd",
  "ring",
@@ -1247,13 +1248,14 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "unicode-width",
  "ureq",
  "zeroize",
 ]
 
 [[package]]
 name = "ells-core"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "argon2 0.5.3",
@@ -1280,7 +1282,7 @@ dependencies = [
 
 [[package]]
 name = "ells-term"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "crossterm",
  "vt100",
@@ -1288,7 +1290,7 @@ dependencies = [
 
 [[package]]
 name = "ells-transfer"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "futures",

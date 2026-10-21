@@ -3,6 +3,8 @@
 
 use std::collections::VecDeque;
 
+use unicode_width::UnicodeWidthChar;
+
 const CAN: u8 = 0x18;
 /// lrzsz 在横幅/头部前先发送 8 个 CAN 填充（zspuck），二进制头另有 2 个 CAN
 /// 框定；正常终端输出几乎不会出现连续 8 个 CAN。
@@ -44,6 +46,13 @@ pub struct Watcher {
     /// CAN 串后紧跟 `**`（lrzsz 十六进制头文本的框定标志）
     hex_head: bool,
     missing: Option<bool>,
+    /// 当前输入行的屏幕模型：Tab 补全会用 \b/ESC[K/BEL 局部重绘，
+    /// 按控制字节断行会把补全中途的片段当成完整命令。
+    echo: EchoLine,
+    /// CSI 参数缓冲（ESC[ ... 最终字节）。
+    csi: Vec<u8>,
+    /// 最近一条带提示符、已回车提交的命令是不是 sz/rz 本身。
+    transfer_echo: bool,
     fired: bool,
 }
 
@@ -65,18 +74,28 @@ impl Watcher {
         for &b in bytes {
             // 整段吸收 ANSI 转义序列（彩色提示符、括号粘贴 ESC[200~/201~ 等），
             // 否则回显行会被 ESC 截断，命令行参数（文件名）就丢了。
+            // CSI 的收尾字节还要作用到回显行模型：readline 的 Tab 补全正是靠
+            // \b 和 ESC[K 做局部重绘，不重放就把补全中途的片段当成了整行。
             if self.esc != 0 {
                 self.esc = match self.esc {
                     1 => match b {
-                        b'[' => 2,
+                        b'[' => {
+                            self.csi.clear();
+                            2
+                        }
                         b']' => 3,
-                        0x40..=0x5f => 0,
-                        _ => 1,
+                        0x20..=0x2f => 1,
+                        0x30..=0x7e => 0,
+                        _ => 0,
                     },
                     2 => {
                         if (0x20..=0x3f).contains(&b) {
+                            self.csi.push(b);
                             2
                         } else {
+                            if (0x40..=0x7e).contains(&b) {
+                                self.echo.csi(&self.csi, b);
+                            }
                             0
                         }
                     }
@@ -95,7 +114,14 @@ impl Watcher {
             }
             if b == 0x1b {
                 self.esc = 1;
+                self.csi.clear();
                 continue;
+            }
+            self.echo.feed_byte(b);
+            if b == b'\n' {
+                if let Some(text) = self.echo.take_line() {
+                    self.on_echo_line(&text);
+                }
             }
             if b == CAN {
                 self.can_run += 1;
@@ -121,16 +147,14 @@ impl Watcher {
                 self.can_run = 0;
             }
             match b {
-                b'\r' | b'\n' => self.end_line(true),
+                b'\r' | b'\n' => self.end_raw_line(),
                 // readline 退格编辑输出 "\b \b"：逐字节回删即可正确还原行内容
                 0x08 | 0x7f => {
                     self.line.pop();
                 }
                 b'\t' => self.line.push(b),
                 0x00..=0x1f => {
-                    if !self.line.is_empty() {
-                        self.end_line(false);
-                    }
+                    self.end_raw_line();
                 }
                 _ => self.line.push(b),
             }
@@ -169,7 +193,8 @@ impl Watcher {
         std::mem::take(&mut self.out_cmds)
     }
 
-    fn end_line(&mut self, final_line: bool) {
+    /// 原始字节行只用于 lrzsz 横幅/报错等文本标记；命令解析走 `on_echo_line`。
+    fn end_raw_line(&mut self) {
         if self.line.is_empty() {
             return;
         }
@@ -182,30 +207,50 @@ impl Watcher {
         if self.lines.len() >= 64 {
             self.lines.pop_front();
         }
-        // 只有带提示符前缀的行才是用户命令回显。真实 lrzsz 的 sz 启动时会先
-        // 打印兼容横幅 "rz\r"（提示对端运行 rz），裸 "rz" 行绝不能当回显命令，
-        // 否则会把 sz 误判成 rz。
-        let has_prompt =
-            trimmed.contains("# ") || trimmed.contains("$ ") || trimmed.contains("> ");
-        if let Some(cmd) = parse_command(&trimmed) {
-            if !cmd.is_empty() {
-                if has_prompt && cmd.first().is_some_and(|w| is_transfer_cmd(w)) {
-                    if self.cmds.len() >= 16 {
-                        self.cmds.pop_front();
-                    }
-                    zlog(&format_args!("echo {:?}", cmd));
-                    if final_line && is_bare_sz(&cmd) {
-                        self.bare_sz = true;
-                    }
-                    self.cmds.push_back(cmd.clone());
-                }
-                self.out_cmds.push(cmd);
-            }
-        }
         if self.missing.is_none() {
             self.missing = extract_missing(&trimmed);
         }
         self.lines.push_back(trimmed);
+    }
+
+    /// 一条真正回车提交的终端行（已在 EchoLine 里按光标重绘还原）。
+    ///
+    /// 只有带提示符的行才算 shell 命令：补全重绘的中间片段、lrzsz 横幅、
+    /// 程序输出都不是用户提交的内容。上一行是不是 sz/rz 本身决定远端脚本里的
+    /// rz 要不要等本地传完再中止（脚本里的命令不会回显）。
+    fn on_echo_line(&mut self, text: &str) {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let has_prompt =
+            trimmed.contains("# ") || trimmed.contains("$ ") || trimmed.contains("> ");
+        if !has_prompt {
+            return;
+        }
+        let Some(cmd) = parse_command(trimmed).filter(|c| !c.is_empty()) else {
+            self.transfer_echo = false;
+            return;
+        };
+        let is_transfer = cmd.first().is_some_and(|w| is_transfer_cmd(w));
+        self.transfer_echo = is_transfer;
+        if is_transfer {
+            if self.cmds.len() >= 16 {
+                self.cmds.pop_front();
+            }
+            zlog(&format_args!("echo {:?}", cmd));
+            if is_bare_sz(&cmd) {
+                self.bare_sz = true;
+            }
+            self.cmds.push_back(cmd.clone());
+        }
+        self.out_cmds.push(cmd);
+    }
+
+    /// 最近一次回车提交的是不是用户手敲的 sz/rz。脚本里的 rz 不会回显，
+    /// 检测到握手时这里为 false。
+    pub fn transfer_echoed(&self) -> bool {
+        self.transfer_echo
     }
 
     fn marker_seen(&self) -> bool {
@@ -277,6 +322,196 @@ impl Watcher {
             })
             .unwrap_or_default()
     }
+}
+
+/// 单行终端回显的单元格模型。
+///
+/// readline 在 Tab 补全/编辑时不会重发整行，而是用 `\b` 移光标、`ESC[K`
+/// 擦到行尾、BEL 响铃；按“控制字节即行尾”解析会把补全中途的片段（真机上
+/// 是 `cd /data/wwwr`）当成用户提交的命令。这里按终端语义重放整行，
+/// 只在换行时交出最终文本。
+#[derive(Default)]
+struct EchoLine {
+    /// 一列一个元素；宽字符占两列（头部 `Some(c)` + 尾部 `None`）。
+    cells: Vec<Option<char>>,
+    cursor: usize,
+    /// 跨 feed 的不完整 UTF-8 序列。
+    utf8: Vec<u8>,
+}
+
+impl EchoLine {
+    fn feed_byte(&mut self, b: u8) {
+        if b < 0x80 {
+            if !self.utf8.is_empty() {
+                self.flush_utf8();
+            }
+            self.handle_char(b as char);
+            return;
+        }
+        self.utf8.push(b);
+        match std::str::from_utf8(&self.utf8) {
+            Ok(_) => self.flush_utf8(),
+            Err(e) if e.error_len().is_none() => {}
+            Err(_) => self.flush_utf8(),
+        }
+    }
+
+    fn flush_utf8(&mut self) {
+        if self.utf8.is_empty() {
+            return;
+        }
+        let text = String::from_utf8_lossy(&self.utf8).into_owned();
+        self.utf8.clear();
+        for c in text.chars() {
+            self.handle_char(c);
+        }
+    }
+
+    fn handle_char(&mut self, c: char) {
+        match c {
+            '\r' => self.cursor = 0,
+            '\n' => {}
+            '\u{8}' | '\u{7f}' => self.backspace(),
+            '\t' => self.tab(),
+            // BEL：Tab 补全/歧义提示的响铃，读到它时用户还没提交这一行
+            '\u{7}' => {}
+            c if (c as u32) < 0x20 => {}
+            c => self.put(c),
+        }
+    }
+
+    fn put(&mut self, c: char) {
+        let width = c.width().unwrap_or(0);
+        if width == 0 {
+            return;
+        }
+        self.cut_at_cursor();
+        self.cells.push(Some(c));
+        if width == 2 {
+            self.cells.push(None);
+        }
+        self.cursor = self.cells.len();
+    }
+
+    /// 把光标之后的旧内容截掉；光标停在宽字符后半格时连整个字一起截。
+    fn cut_at_cursor(&mut self) {
+        if self.cursor >= self.cells.len() {
+            return;
+        }
+        let mut cut = self.cursor;
+        if cut > 0
+            && self.cells[cut].is_none()
+            && self.cells[cut - 1].is_some_and(|c| c.width() == Some(2))
+        {
+            cut -= 1;
+        }
+        self.cells.truncate(cut);
+        self.cursor = cut;
+    }
+
+    /// 仅移动光标（终端语义）；真正的删除来自 `ESC[K`。
+    /// readline 的 `\b \b` 会先退格、写空格、再退格，这样才不会多删。
+    fn backspace(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    fn tab(&mut self) {
+        let next = (self.cursor / 8 + 1) * 8;
+        while self.cursor < next {
+            self.put(' ');
+        }
+    }
+
+    fn csi(&mut self, params: &[u8], final_byte: u8) {
+        let n = numeric_param(params);
+        match final_byte {
+            b'K' => self.erase_line(n.unwrap_or(0)),
+            b'C' => self.move_right(n.filter(|&n| n > 0).unwrap_or(1)),
+            b'D' => self.move_left(n.filter(|&n| n > 0).unwrap_or(1)),
+            b'G' => self.set_col(n.filter(|&n| n > 0).unwrap_or(1) - 1),
+            _ => {}
+        }
+    }
+
+    fn erase_line(&mut self, mode: usize) {
+        match mode {
+            0 => self.cut_at_cursor(),
+            1 => {
+                let end = self.cursor.min(self.cells.len());
+                for cell in &mut self.cells[..end] {
+                    *cell = None;
+                }
+            }
+            2 => {
+                for cell in &mut self.cells {
+                    *cell = None;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn move_right(&mut self, n: usize) {
+        self.cursor = self.cursor.saturating_add(n);
+        while self.cells.len() < self.cursor {
+            self.cells.push(None);
+        }
+    }
+
+    fn move_left(&mut self, n: usize) {
+        self.cursor = self.cursor.saturating_sub(n);
+    }
+
+    fn set_col(&mut self, col: usize) {
+        self.cursor = col;
+        while self.cells.len() < self.cursor {
+            self.cells.push(None);
+        }
+    }
+
+    fn take_line(&mut self) -> Option<String> {
+        self.flush_utf8();
+        let text = self.render();
+        self.cells.clear();
+        self.cursor = 0;
+        if text.trim().is_empty() {
+            None
+        } else {
+            Some(text)
+        }
+    }
+
+    fn render(&self) -> String {
+        let mut out = String::with_capacity(self.cells.len());
+        let mut i = 0;
+        while i < self.cells.len() {
+            match self.cells[i] {
+                Some(c) => {
+                    out.push(c);
+                    i += if c.width() == Some(2) { 2 } else { 1 };
+                }
+                None => {
+                    out.push(' ');
+                    i += 1;
+                }
+            }
+        }
+        out.trim_end().to_string()
+    }
+}
+
+fn numeric_param(params: &[u8]) -> Option<usize> {
+    let mut n = 0usize;
+    let mut any = false;
+    for &b in params {
+        if b.is_ascii_digit() {
+            any = true;
+            n = n.saturating_mul(10).saturating_add((b - b'0') as usize);
+        } else {
+            return None;
+        }
+    }
+    any.then_some(n)
 }
 
 /// CAN 串后紧跟的头类型字节（含 ZDLE 转义与扩展头形式）→ 0=ZRQINIT 1=ZRINIT 2=ZFILE。
@@ -704,5 +939,50 @@ mod tests {
         let bytes = include_bytes!("../tests/zmodem_rz_capture.bin");
         let mut w = Watcher::new();
         assert_eq!(w.feed(bytes), Some(ZmodemEvent::Receive));
+    }
+
+    /// 真机字节（x1，2026-10-21 10:32）：用户输入 `cd /data/wwwroot/ktpms/2.0/`
+    /// 时按 Tab 补全，readline 用 `成都\b\bESC[K...\a` 局部重绘。BEL 不是行尾，
+    /// 修复前会把中途片段 `cd /data/wwwr` 当成提交的命令，SFTP 于是上传到
+    /// 不存在的 /data/wwwr。
+    #[test]
+    fn tab_completion_redraw_keeps_the_submitted_cd() {
+        let mut w = Watcher::new();
+        let bytes = "\x1b[37;40m[\x1b[32;40mroot\x1b[37;40m@xianhukentian \x1b[35;40m~\x1b[0m]# 成都\x08\x08\x1b[K\x08\x08\x1b[K\x07成都\x08\x08\x1b[K\x08\x08\x1b[K\x07cd /data/wwwr\x07oot/ktop\x08\x1b[K\x08\x1b[Kpms/v\x07\x07\x08\x1b[K2.0/\r\n";
+        assert_eq!(w.feed(bytes.as_bytes()), None);
+        assert_eq!(
+            w.take_commands(),
+            vec![vec![
+                "cd".to_string(),
+                "/data/wwwroot/ktpms/2.0/".to_string()
+            ]]
+        );
+    }
+
+    /// 补全响铃（BEL）夹在行中间时，片段要拼成整行而不是提前断行
+    #[test]
+    fn bell_mid_line_does_not_submit_a_fragment() {
+        let mut w = Watcher::new();
+        w.feed(b"[root@x ~]# cd /data/wwwr\x07oot/ktop\x08\x1b[K\r\n");
+        assert_eq!(
+            w.take_commands(),
+            vec![vec!["cd".to_string(), "/data/wwwroot/kto".to_string()]]
+        );
+    }
+
+    /// 区分手敲的 rz（有命令回显）和脚本里的 rz（只有 lrzsz 横幅）
+    #[test]
+    fn transfer_echo_marks_only_a_submitted_rz() {
+        let mut typed = Watcher::new();
+        typed.feed(b"[root@x ~]# rz -be\r\n");
+        assert!(typed.transfer_echoed());
+
+        typed.feed(b"[root@x ~]# ./updateDist.sh\r\n");
+        assert!(!typed.transfer_echoed());
+
+        let mut scripted = Watcher::new();
+        scripted.feed(b"[root@x ~]# ./updateDist.sh\r\n");
+        scripted.feed(b"./updateDist.sh: line 1: o: command not found\r\n");
+        assert!(!scripted.transfer_echoed());
     }
 }

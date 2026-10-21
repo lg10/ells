@@ -125,8 +125,10 @@ pub enum AppEvent {
     /// Progress tick of an in-flight transfer.
     SftpProgress { slot: u32, pr: Progress },
     /// A transfer finished (Err carries the failure message).
+    /// `rz`：这一笔就是被挂起的脚本 `rz` 在等的那次上传（无论成败都要放行远端）。
     SftpDone {
         slot: u32,
+        rz: bool,
         res: std::result::Result<String, (String, String)>,
     },
     /// 自更新：后台检查完成。Ok(Some(tag)) = 有更新，Ok(None) = 已是最新。

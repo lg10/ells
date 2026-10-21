@@ -544,6 +544,8 @@ pub struct Slot {
     pub sz_pending: Vec<String>,
     /// rz waiting for remote_cwd before opening the native picker.
     pub rz_pending: bool,
+    /// 这次上传来自脚本里的 rz：传完（或取消）后要中止远端 rz，让脚本继续。
+    pub rz_hold: bool,
     /// Destination directory for the next upload (browser path or remote cwd).
     pub upload_dest: Option<String>,
     /// Browser was opened by an argument-less `sz` to pick a download target.
@@ -1462,7 +1464,12 @@ impl App {
                     }
                     // Sliding swallow window: rz/sz retries ZRINIT every ~3s;
                     // keep hiding output (and re-aborting) while bytes keep coming.
-                    if self.slots[self.work].session.as_ref().is_some_and(|s| s.is_intercepting()) {
+                    // 脚本 rz 例外：要一直等着，直到本地传完才由 release_rz_hold 收尾。
+                    if self.slots[self.work]
+                        .session
+                        .as_ref()
+                        .is_some_and(|s| s.is_intercepting() && !s.is_holding_receive())
+                    {
                         self.clear_zmodem_soon();
                     }
                 }
@@ -1503,6 +1510,7 @@ impl App {
                     slot.remote_cwd.clear();
                     slot.sz_pending.clear();
                     slot.rz_pending = false;
+                    slot.rz_hold = false;
                     slot.sz_pick_mode = false;
                     slot.sz_saveas_pending = false;
                     slot.pending_zmodem = None;
@@ -1645,12 +1653,14 @@ impl App {
                 }
                 AppEvent::PickedUpload { path, .. } => {
                     self.dialog_open = false;
+                    let from_rz = self.slots[self.work].rz_hold;
                     match path {
-                        Some(p) => self.start_upload(PathBuf::from(p)),
+                        Some(p) => self.start_upload(PathBuf::from(p), from_rz),
                         None => {
                             self.slots[self.work].status =
                                 Some("已取消上传（未选择文件）".to_string());
                             self.slots[self.work].upload_dest = None;
+                            self.release_rz_hold();
                         }
                     }
                     self.replay_pending_zmodem();
@@ -1675,7 +1685,7 @@ impl App {
                 AppEvent::PickedUploadDir { path, .. } => {
                     self.dialog_open = false;
                     match path {
-                        Some(p) => self.start_upload(PathBuf::from(p)),
+                        Some(p) => self.start_upload(PathBuf::from(p), false),
                         None => {
                             self.slots[self.work].status =
                                 Some("已取消上传（未选择目录）".to_string());
@@ -1751,6 +1761,8 @@ impl App {
                         self.slots[self.work].rz_pending = false;
                         self.slots[self.work].sz_pending.clear();
                         self.slots[self.work].sz_saveas_pending = false;
+                        // 脚本 rz 还卡在远端等上传：目录没了也要放行，不能让脚本干等
+                        self.release_rz_hold();
                     }
                 },
                 AppEvent::ZmodemClear { seq, .. } => {
@@ -1758,8 +1770,13 @@ impl App {
                         // 无条件复位：裸 sz 只触发检测不进入吞流，但 watcher 的
                         // fired 状态同样需要清掉，否则下次 sz/rz 不会被检测。
                         if let Some(s) = &mut self.slots[self.work].session {
-                            s.end_intercept();
+                            if s.is_holding_receive() {
+                                s.release_receive();
+                            } else {
+                                s.end_intercept();
+                            }
                         }
+                        self.slots[self.work].rz_hold = false;
                     }
                 }
                 AppEvent::SftpHome { res, .. } => match res {
@@ -1805,7 +1822,7 @@ impl App {
                         });
                     }
                 }
-                AppEvent::SftpDone { res, .. } => {
+                AppEvent::SftpDone { res, rz, .. } => {
                     let slot = &mut self.slots[self.work];
                     match res {
                         Ok(label) => {
@@ -1844,6 +1861,10 @@ impl App {
                     {
                         let path = self.slots[self.work].browser.path.clone();
                         self.start_listing(path);
+                    }
+                    // 成败都要放行：脚本还得往下跑，自己会检查文件在不在
+                    if rz {
+                        self.release_rz_hold();
                     }
                 }
             }
@@ -3295,6 +3316,7 @@ impl App {
         slot.remote_cwd.clear();
         slot.sz_pending.clear();
         slot.rz_pending = false;
+        slot.rz_hold = false;
         slot.sz_pick_mode = false;
         slot.sz_saveas_pending = false;
         slot.pending_zmodem = None;
@@ -3387,18 +3409,29 @@ impl App {
     }
 
     /// 上传本地文件或目录（目录自动走递归上传）。目标目录取 upload_dest，其次当前浏览目录。
-    fn start_upload(&mut self, local: PathBuf) {
+    /// `from_rz`：这笔上传来自脚本 `rz`，结束时要放行远端那个还在等的 rz。
+    fn start_upload(&mut self, local: PathBuf, from_rz: bool) {
+        let rz = from_rz && self.slots[self.work].rz_hold;
         let Some(sftp) = self.slots[self.work].sftp.clone() else {
             self.slots[self.work].status = Some("上传失败：该连接没有 SFTP 通道".to_string());
+            if rz {
+                self.release_rz_hold();
+            }
             return;
         };
         let Some(name) = local.file_name().map(|s| s.to_string_lossy().into_owned()) else {
             self.slots[self.work].status = Some("无法解析所选文件名".to_string());
+            if rz {
+                self.release_rz_hold();
+            }
             return;
         };
         let dest = self.slots[self.work].upload_dest.take().unwrap_or_default();
         if dest.is_empty() {
             self.slots[self.work].status = Some("上传失败：还不知道要传到哪个远端目录".to_string());
+            if rz {
+                self.release_rz_hold();
+            }
             return;
         }
         let tx = self.event_tx.clone();
@@ -3416,7 +3449,7 @@ impl App {
             // 先收干进度转发、再发 Done：顺序反了的话，尾随的进度事件会因为
             // 条目已 done 匹配不上，被登记成一条永不完结的"?"传输（100% 卡住、1/2）
             let _ = pump.await;
-            let _ = tx.send(AppEvent::SftpDone { slot, res });
+            let _ = tx.send(AppEvent::SftpDone { slot, rz, res });
         });
     }
 
@@ -3471,7 +3504,7 @@ impl App {
                 .await;
             // 同 start_upload：尾随进度必须先于 Done 入队，否则会在传输列表里留下永不完结的残项
             let _ = pump.await;
-            let _ = tx.send(AppEvent::SftpDone { slot, res });
+            let _ = tx.send(AppEvent::SftpDone { slot, rz: false, res });
         });
     }
 
@@ -3828,9 +3861,21 @@ impl App {
                 }
             }
             Z::Receive => {
-                self.clear_zmodem_soon();
+                // 脚本里的 rz 不回显：远端那个 rz 先留着，等本地传完再中止。
+                let hold = self.slots[self.work]
+                    .session
+                    .as_ref()
+                    .is_some_and(|s| s.is_holding_receive());
+                self.slots[self.work].rz_hold = hold;
+                if hold {
+                    // 作废可能还挂着的自动收尾定时器；放行时机改由上传结束决定
+                    self.slots[self.work].zclear_seq += 1;
+                } else {
+                    self.clear_zmodem_soon();
+                }
                 if self.slots[self.work].sftp.is_none() {
                     self.slots[self.work].status = Some("已拦截 rz，但该连接没有 SFTP 通道".to_string());
+                    self.release_rz_hold();
                     return;
                 }
                 self.slots[self.work].sz_pending.clear();
@@ -3889,6 +3934,18 @@ impl App {
             tokio::time::sleep(std::time::Duration::from_millis(4000)).await;
             let _ = tx.send(AppEvent::ZmodemClear { slot, seq });
         });
+    }
+
+    /// 脚本 rz 挂起中，本地这一段（选文件 + 上传）已经结束：中止远端 rz，
+    /// 让脚本继续往下执行（此时文件已经落盘，脚本自己的检查能看到它）。
+    fn release_rz_hold(&mut self) {
+        if !self.slots[self.work].rz_hold {
+            return;
+        }
+        self.slots[self.work].rz_hold = false;
+        if let Some(s) = &mut self.slots[self.work].session {
+            s.release_receive();
+        }
     }
 
     /// Best-effort remote cwd tracking from echoed shell commands.
@@ -5439,6 +5496,7 @@ impl App {
                 slot.remote_cwd.clear();
                 slot.sz_pending.clear();
                 slot.rz_pending = false;
+                slot.rz_hold = false;
                 slot.search = None;
                 // 新连接从零开始：清掉上一个会话的传输记录
                 slot.browser.transfers.clear();
@@ -6396,6 +6454,14 @@ async fn run_upload(
             return Err((name, format!("无法读取本地路径 {}：{err}", local.display())));
         }
     };
+    // 目标目录不存在时 SFTP 只会回一个 "No such file"，看不出是哪一层目录记错了。
+    // 先查一次，把实际用于上传的远端目录写进错误里。
+    match ells_transfer::remote_meta(&sftp, &dest).await {
+        Ok(Some(meta)) if meta.is_dir => {}
+        Ok(Some(_)) => return Err((name, format!("上传失败：远端路径不是目录：{dest}"))),
+        Ok(None) => return Err((name, format!("上传失败：远端目录不存在：{dest}"))),
+        Err(err) => return Err((name, format!("上传失败：无法检查远端目录 {dest}：{err:#}"))),
+    }
     let target = ells_transfer::remote_join(&dest, &name);
     let mut final_name = name.clone();
     match ells_transfer::remote_meta(&sftp, &target).await {
