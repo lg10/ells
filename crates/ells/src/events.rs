@@ -131,6 +131,13 @@ pub enum AppEvent {
         rz: bool,
         res: std::result::Result<String, (String, String)>,
     },
+    /// 容器视图的一轮查询（Socket 直连或 docker ps 兜底）回来了。
+    /// `seq` 同其它定时回包：关掉视图、切 all、再刷新都会顶掉旧的一包。
+    DockerContainers {
+        slot: u32,
+        seq: u64,
+        res: std::result::Result<Vec<ells_core::docker::DockerContainer>, String>,
+    },
     /// 自更新：后台检查完成。Ok(Some(tag)) = 有更新，Ok(None) = 已是最新。
     UpdateChecked(std::result::Result<Option<String>, String>),
     /// 用户在确认弹窗里点了【更 新】（回调够不着 App，只能再发一个事件回来）。

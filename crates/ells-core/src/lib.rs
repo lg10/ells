@@ -1,4 +1,5 @@
 pub mod audit;
+pub mod docker;
 pub mod exec;
 pub mod filter;
 pub mod host;

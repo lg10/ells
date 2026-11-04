@@ -1,5 +1,6 @@
 mod app;
 mod cli;
+mod containers;
 mod dialog;
 mod events;
 mod highlight;

@@ -38,6 +38,8 @@ pub struct SessionState {
     /// 脚本里的 rz（命令行没有回显）：先不中止远端 rz，等本地选完并上传落盘后
     /// 再放行。否则远端 rz 立刻退出，脚本紧接着的 `[ -f ]` 检查必然失败。
     hold_receive: bool,
+    /// 远端输出里刚出现过 `docker ps` 的表头：底栏借这个提一句"F4 看容器"。
+    docker_hint: crate::containers::DockerHintClock,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -78,6 +80,7 @@ impl SessionState {
             intercepting: false,
             abort_retries: 0,
             hold_receive: false,
+            docker_hint: Default::default(),
         }
     }
 
@@ -103,6 +106,8 @@ impl SessionState {
         // 任何按键都回到实时底部并取消选择高亮（与常见终端一致）
         self.scroll = 0;
         self.clear_selection();
+        // 用户已经开始干别的了，底栏那句"F4 看容器"就不必再挂着
+        self.docker_hint.clear();
         if binds.matches(Action::Passthrough, key) {
             self.toggle_mode();
             return SessionAction::Keep;
@@ -177,7 +182,13 @@ impl SessionState {
                 let _ = stdout.flush();
             }
         }
+        self.docker_hint.feed(bytes);
         ev
+    }
+
+    /// 最近这一段输出像 `docker ps` 的表（12 秒内有效）。
+    pub fn docker_hint(&self) -> bool {
+        self.docker_hint.active()
     }
 
     pub fn is_intercepting(&self) -> bool {
@@ -480,6 +491,12 @@ impl SessionState {
         self.emu.set_scrollback(target);
         self.scroll = self.emu.scrollback_offset();
         self.scroll != before
+    }
+
+    /// 这个方向还滚得动吗（负数向上、正数向下）。拖选定时器据此停表：
+    /// 到顶/到底就不要每 50ms 空转，也不能因此丢掉拖选状态。
+    pub fn can_scroll(&mut self, lines: i32) -> bool {
+        self.emu.can_scroll(lines)
     }
 }
 

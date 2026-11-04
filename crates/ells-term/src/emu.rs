@@ -106,6 +106,16 @@ impl Emulator {
         max
     }
 
+    /// 往这个方向（负数向上、正数向下）还滚得动吗？自滚定时器据此停表：
+    /// 到顶/到底时不该每 50ms 空转，更不该因此丢掉拖选状态。
+    pub fn can_scroll(&mut self, lines: i32) -> bool {
+        if lines < 0 {
+            self.scrollback_len() > self.parser.screen().scrollback()
+        } else {
+            self.parser.screen().scrollback() > 0
+        }
+    }
+
     /// 取内容行 `[start, end]`（0 = 最早的历史行，含两端）的纯文本。
     /// 越界自动钳制；取完恢复调用前的回看偏移。
     pub fn content_lines(&mut self, start: usize, end: usize, cols: u16) -> Vec<String> {
@@ -194,6 +204,27 @@ impl Emulator {
 #[cfg(test)]
 mod tests {
     use super::Emulator;
+
+    /// 自滚定时器只该在真的滚得动时开：到顶/到底必须能问出来，
+    /// 否则拖到边界后每一跳都空转（以前还会因此把拖选状态清掉）。
+    #[test]
+    fn scroll_limits_report_when_there_is_nowhere_left_to_go() {
+        let mut emu = Emulator::new(3, 20);
+        assert!(!emu.can_scroll(-1), "没有历史时向上滚不动");
+        assert!(!emu.can_scroll(1), "实时底部向下也滚不动");
+        for i in 0..12 {
+            emu.process(format!("row-{i:02}\r\n").as_bytes());
+        }
+        assert!(emu.can_scroll(-1), "有了历史就能上翻");
+        assert!(!emu.can_scroll(1), "仍在实时底部");
+        let max = emu.scrollback_len();
+        emu.set_scrollback(max);
+        assert_eq!(emu.scrollback_offset(), max);
+        assert!(!emu.can_scroll(-1), "到顶后不能再往上");
+        assert!(emu.can_scroll(1), "到顶后还能往下回");
+        emu.set_scrollback(max / 2);
+        assert!(emu.can_scroll(-1) && emu.can_scroll(1), "半中间两边都通");
+    }
 
     /// 内容行 `start..=end`（0 = 最早的历史行）的纯文本。取完会恢复当前回看偏移。
     #[test]

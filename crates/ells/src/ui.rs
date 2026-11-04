@@ -12,6 +12,7 @@ use crate::app::{
     App, Choice, FieldKind, FieldRole, ListRow, Prompt, RULE_COLS, ScreenKind, Slot, UnlockState,
     UnlockStage,
 };
+use crate::containers::{exposure, ports_summary, DockerTab};
 use crate::session::TermMode;
 use crate::theme;
 
@@ -1594,11 +1595,12 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App) {
         binds.display(Action::HostList),
     );
     let term_body = format!(
-        "直接打字即发往远端 · {} 文件浏览器 · {} 内嵌/直通 · {} 关闭标签 · {} 整屏重绘 · 滚轮回看 · 拖选复制（OSC 52）· {} 搜索历史输出（回看时按 / 同样可用，n/N 上下条）· {} 回主机列表 · F1 帮助",
+        "直接打字即发往远端 · {} 文件浏览器 · {} 内嵌/直通 · {} 关闭标签 · {} 整屏重绘 · {} 容器视图（Docker socket 直连，读不到就回落 docker ps；端口中心 / 展开 / TSV 复制）· 滚轮回看 · 拖选复制（OSC 52）· {} 搜索历史输出（回看时按 / 同样可用，n/N 上下条）· {} 回主机列表 · F1 帮助",
         binds.display(Action::Browser),
         binds.display(Action::Passthrough),
         binds.display(Action::CloseTab),
         binds.display(Action::Redraw),
+        binds.display(Action::Containers),
         binds.display(Action::Search),
         binds.display(Action::HostList),
     );
@@ -2294,6 +2296,15 @@ fn draw_session(f: &mut Frame, app: &mut App) {
             Style::default().fg(theme::alt()).bg(theme::bg()),
         ));
         f.render_widget(Paragraph::new(line), note_row);
+    } else if s.docker_hint() {
+        let line = Line::from(Span::styled(
+            format!(
+                " 检测到 docker ps 输出 · {} 打开容器视图（端口 / 状态 / 已复制 TSV）",
+                binds.display(Action::Containers)
+            ),
+            Style::default().fg(theme::ok()).bg(theme::bg()),
+        ));
+        f.render_widget(Paragraph::new(line), note_row);
     } else if let Some(note) = app.slots[idx].status.as_ref().or(app.status.as_ref()) {
         let line = Line::from(Span::styled(
             format!(" {note}"),
@@ -2419,6 +2430,9 @@ fn draw_session(f: &mut Frame, app: &mut App) {
     }
     if app.disk_popup {
         draw_disk_popup(f, app);
+    }
+    if app.slots[idx].docker.open {
+        draw_docker_popup(f, app);
     }
     // 弹窗最后渲染：内嵌终端的逐格写入会覆盖先画的浮层
     if app.settings_open {
@@ -2933,6 +2947,292 @@ fn draw_disk_popup(f: &mut Frame, app: &App) {
             width: area.width,
             height: 1,
         },
+    );
+}
+
+/// 容器视图面板的几何。命中测试与绘制同源，改布局只改这一个地方。
+pub fn docker_popup_rect(area: Rect, total: usize, detail: usize) -> Rect {
+    let w = area.width.saturating_sub(6).min(118).max(48).min(area.width);
+    let body = (total as u16)
+        .saturating_add(detail as u16)
+        .saturating_add(6);
+    let h = body
+        .min(area.height.saturating_sub(2))
+        .max(9)
+        .min(area.height);
+    centered(w, h, area)
+}
+
+/// 表格主体（不含标题行与底栏）。
+pub fn docker_list_rect(area: Rect, total: usize, detail: usize) -> Rect {
+    let p = docker_popup_rect(area, total, detail);
+    let inner_h = p.height.saturating_sub(2);
+    let y = p.y.saturating_add(2).min(p.y.saturating_add(p.height));
+    let bottom = p.y.saturating_add(p.height);
+    Rect {
+        x: p.x + 1,
+        y,
+        width: p.width.saturating_sub(2),
+        height: inner_h
+            .saturating_sub(2 + detail as u16)
+            .min(bottom.saturating_sub(y)),
+    }
+}
+
+/// 长列表的滚动窗口：尽量让选中行停在中间。
+pub fn docker_scroll_offset(total: usize, visible: usize, selected: usize) -> usize {
+    if visible == 0 || total <= visible {
+        return 0;
+    }
+    selected
+        .saturating_sub(visible / 2)
+        .min(total.saturating_sub(visible))
+}
+
+/// 容器视图（F4）：容器列表 / 端口中心两页，选中行可展开端口明细。
+fn draw_docker_popup(f: &mut Frame, app: &App) {
+    let v = &app.slots[app.active].docker;
+    let total = v.rows_len();
+    let detail = v.detail_rows();
+    let panel = docker_popup_rect(f.area(), total, detail);
+    f.buffer_mut().set_style(panel, Style::default().bg(theme::bg()));
+    f.render_widget(Clear, panel);
+
+    let title = match v.tab {
+        DockerTab::Containers => format!(
+            " 容器 · {} 个（运行 {}） · {}{} ",
+            v.items.len(),
+            v.running_count(),
+            if v.all { "含已停止" } else { "仅运行中" },
+            if v.loading { " · 读取中" } else { "" }
+        ),
+        DockerTab::Ports => format!(
+            " 端口映射 · {} 条 · 按宿主端口排序{} ",
+            total,
+            if v.loading { " · 读取中" } else { "" }
+        ),
+    };
+    let block = Block::bordered()
+        .title(title)
+        .title_style(Style::default().fg(theme::accent()).add_modifier(Modifier::BOLD));
+    let inner = block.inner(panel);
+    f.render_widget(block, panel);
+    if inner.height < 3 || inner.width < 12 {
+        return;
+    }
+
+    let header_row = Rect { x: inner.x, y: inner.y, width: inner.width, height: 1 };
+    let footer_row = Rect {
+        x: inner.x,
+        y: inner.y + inner.height - 1,
+        width: inner.width,
+        height: 1,
+    };
+    let list = docker_list_rect(f.area(), total, detail);
+    let label = Style::default().fg(theme::dim()).add_modifier(Modifier::BOLD);
+
+    if v.loading && v.items.is_empty() {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                " 正在读取容器列表…（直连 Docker socket，不通就回落 docker ps）",
+                Style::default().fg(theme::accent()),
+            ))),
+            Rect { x: inner.x, y: inner.y + inner.height / 2, width: inner.width, height: 1 },
+        );
+    } else if let Some(err) = &v.error {
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled(
+                    " 拿不到容器列表",
+                    Style::default().fg(theme::err()).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(Span::styled(
+                    format!(" {}", clip_display(err, inner.width.saturating_sub(2) as usize)),
+                    Style::default().fg(theme::muted()),
+                )),
+            ]),
+            Rect { x: inner.x, y: inner.y + 1, width: inner.width, height: inner.height.saturating_sub(2) },
+        );
+    } else if total == 0 {
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled(
+                    if v.all { " 没有容器" } else { " 没有运行中的容器" },
+                    Style::default().fg(theme::dim()),
+                )),
+                Line::from(Span::styled(
+                    " a 切到含已停止 · r 重试 · 这台可能没装 Docker 或当前用户没有 socket 权限",
+                    Style::default().fg(theme::muted()),
+                )),
+            ]),
+            Rect { x: inner.x, y: inner.y + 1, width: inner.width, height: inner.height.saturating_sub(2) },
+        );
+    } else {
+        match v.tab {
+            DockerTab::Containers => draw_docker_containers(f, v, header_row, list, label),
+            DockerTab::Ports => draw_docker_ports(f, v, header_row, list, label),
+        }
+    }
+
+    if detail > 0 && !v.items.is_empty() {
+        draw_docker_detail(f, v, detail, inner, footer_row);
+    }
+
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            " ↑↓ 选择 · Enter 展开端口 · Tab/p 切容器/端口 · a 含已停止 · r 刷新 · c 复制 · Esc 关闭 ",
+            Style::default().fg(theme::dim()),
+        ))),
+        footer_row,
+    );
+}
+
+fn draw_docker_containers(
+    f: &mut Frame,
+    v: &crate::containers::DockerView,
+    header: Rect,
+    list: Rect,
+    label: Style,
+) {
+    let w = list.width as usize;
+    let id_w = 12;
+    let name_w = 20.min(w.saturating_sub(id_w + 24));
+    let state_w = 9;
+    let image_w = 24.min(w.saturating_sub(id_w + name_w + state_w + 6));
+    let ports_w = w.saturating_sub(id_w + name_w + image_w + state_w);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!(
+                "{}{}{}{}{}",
+                pad_display("ID", id_w),
+                pad_display("名称", name_w),
+                pad_display("镜像", image_w),
+                pad_display("状态", state_w),
+                "端口"
+            ),
+            label,
+        ))),
+        header,
+    );
+
+    let visible = list.height as usize;
+    let start = docker_scroll_offset(v.items.len(), visible, v.selected);
+    let mut lines: Vec<Line> = Vec::with_capacity(visible);
+    for (i, c) in v.items.iter().enumerate().skip(start).take(visible) {
+        let tone = if c.is_running() { theme::ok() } else { theme::dim() };
+        let line = Line::from(vec![
+            Span::styled(pad_display(c.short_id(), id_w), Style::default().fg(theme::muted())),
+            Span::styled(pad_display(&clip_display(&c.name, name_w.saturating_sub(1)), name_w), Style::default().fg(theme::text())),
+            Span::styled(pad_display(&clip_display(&c.image, image_w.saturating_sub(1)), image_w), Style::default().fg(theme::alt())),
+            Span::styled(pad_display(&clip_display(&c.state, state_w.saturating_sub(1)), state_w), Style::default().fg(tone)),
+            Span::styled(
+                clip_display(&ports_summary(&c.ports), ports_w.saturating_sub(1)),
+                Style::default().fg(theme::muted()),
+            ),
+        ]);
+        lines.push(if i == v.selected { line.style(select_style()) } else { line });
+    }
+    f.render_widget(Paragraph::new(lines), list);
+}
+
+fn draw_docker_ports(
+    f: &mut Frame,
+    v: &crate::containers::DockerView,
+    header: Rect,
+    list: Rect,
+    label: Style,
+) {
+    let w = list.width as usize;
+    let name_w = 20.min(w.saturating_sub(34));
+    let host_w = 10;
+    let container_w = 12;
+    let proto_w = 6;
+    let expose_w = w.saturating_sub(name_w + host_w + container_w + proto_w);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!(
+                "{}{}{}{}{}",
+                pad_display("名称", name_w),
+                pad_display("宿主口", host_w),
+                pad_display("容器口", container_w),
+                pad_display("协议", proto_w),
+                "绑定地址"
+            ),
+            label,
+        ))),
+        header,
+    );
+
+    let rows = v.ports();
+    let visible = list.height as usize;
+    let start = docker_scroll_offset(rows.len(), visible, v.selected);
+    let mut lines: Vec<Line> = Vec::with_capacity(visible);
+    for (i, r) in rows.iter().enumerate().skip(start).take(visible) {
+        let exposed = matches!(r.ip.as_str(), "0.0.0.0" | "::");
+        let line = Line::from(vec![
+            Span::styled(pad_display(&clip_display(&r.name, name_w.saturating_sub(1)), name_w), Style::default().fg(theme::text())),
+            Span::styled(
+                pad_display(&r.public_port.to_string(), host_w),
+                Style::default().fg(theme::warn()).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(pad_display(&r.private_port.to_string(), container_w), Style::default().fg(theme::alt())),
+            Span::styled(pad_display(&r.proto, proto_w), Style::default().fg(theme::muted())),
+            Span::styled(
+                clip_display(exposure(&r.ip), expose_w.saturating_sub(1)),
+                Style::default().fg(if exposed { theme::err() } else { theme::dim() }),
+            ),
+        ]);
+        lines.push(if i == v.selected { line.style(select_style()) } else { line });
+    }
+    f.render_widget(Paragraph::new(lines), list);
+}
+
+fn draw_docker_detail(
+    f: &mut Frame,
+    v: &crate::containers::DockerView,
+    detail: usize,
+    inner: Rect,
+    footer: Rect,
+) {
+    let ports = v.selected_ports();
+    let y = footer.y.saturating_sub(detail as u16);
+    let lines: Vec<Line> = ports
+        .iter()
+        .take(detail)
+        .enumerate()
+        .map(|(i, p)| {
+            let last = i + 1 == ports.len().min(detail);
+            let text = match p.public_port {
+                Some(public) => format!(
+                    " {} {} → {}/{} · {}",
+                    if last { "└" } else { "├" },
+                    public,
+                    p.private_port,
+                    p.proto,
+                    exposure(&p.ip)
+                ),
+                None => format!(
+                    " {} {}/{} · {}",
+                    if last { "└" } else { "├" },
+                    p.private_port,
+                    p.proto,
+                    exposure(&p.ip)
+                ),
+            };
+            let more = ports.len() > detail && i + 1 == detail;
+            Line::from(Span::styled(
+                if more {
+                    format!("{}（还有 {} 条，c 复制全部）", text, ports.len() - detail)
+                } else {
+                    text
+                },
+                Style::default().fg(theme::muted()),
+            ))
+        })
+        .collect();
+    f.render_widget(
+        Paragraph::new(lines),
+        Rect { x: inner.x, y, width: inner.width, height: detail as u16 },
     );
 }
 
@@ -4522,5 +4822,31 @@ mod tests {
         assert!(filled(&early) < filled(&late), "走得越久该越长：{early} / {late}");
         assert!(overrun.contains('░'), "跑过估计值也还剩轨道没填满");
         assert!(overrun.contains("已用 5.0s"), "超时就照实说超了多久");
+    }
+
+    /// 容器面板在窄屏上也不能画到框外，列表区必须完整落在面板里面。
+    #[test]
+    fn docker_panel_stays_inside_even_on_tiny_terminals() {
+        for (cols, rows) in [(120, 40), (80, 24), (50, 16), (30, 8), (12, 3)] {
+            let area = Rect::new(0, 0, cols, rows);
+            for (total, detail) in [(0, 0), (3, 0), (100, 4)] {
+                let p = docker_popup_rect(area, total, detail);
+                assert!(p.x + p.width <= area.x + area.width, "{cols}x{rows} 面板超右");
+                assert!(p.y + p.height <= area.y + area.height, "{cols}x{rows} 面板超下");
+                let l = docker_list_rect(area, total, detail);
+                assert!(l.x + l.width <= p.x + p.width, "{cols}x{rows} 列表超右");
+                assert!(l.y + l.height <= p.y + p.height, "{cols}x{rows} 列表超下");
+            }
+        }
+    }
+
+    /// 选中行永远落在滚动窗口里：顶部不藏、底部不越。
+    #[test]
+    fn docker_scroll_keeps_selection_in_view() {
+        assert_eq!(docker_scroll_offset(5, 10, 3), 0);
+        assert_eq!(docker_scroll_offset(100, 10, 0), 0);
+        assert_eq!(docker_scroll_offset(100, 10, 50), 45);
+        assert_eq!(docker_scroll_offset(100, 10, 99), 90);
+        assert_eq!(docker_scroll_offset(100, 0, 99), 0);
     }
 }

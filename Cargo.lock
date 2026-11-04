@@ -1224,7 +1224,7 @@ dependencies = [
 
 [[package]]
 name = "ells"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1255,7 +1255,7 @@ dependencies = [
 
 [[package]]
 name = "ells-core"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "anyhow",
  "argon2 0.5.3",
@@ -1272,6 +1272,7 @@ dependencies = [
  "russh",
  "russh-sftp",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -1282,7 +1283,7 @@ dependencies = [
 
 [[package]]
 name = "ells-term"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "crossterm",
  "vt100",
@@ -1290,7 +1291,7 @@ dependencies = [
 
 [[package]]
 name = "ells-transfer"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "anyhow",
  "futures",

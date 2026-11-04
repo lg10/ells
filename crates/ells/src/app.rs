@@ -23,6 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{mpsc, oneshot};
 use zeroize::Zeroizing;
 
+use crate::containers::DockerView;
 use crate::events::{self, AppEvent};
 use crate::keybinds::{Action, Chord};
 use crate::session::{SessionAction, SessionState, TermMode};
@@ -578,6 +579,8 @@ pub struct Slot {
     pub connected_at: Option<std::time::Instant>,
     /// 会话页底部那排 CPU / 内存 / 磁盘条的数据与采集状态（每标签一份）
     pub metrics: Metrics,
+    /// 容器视图（F4）：每标签一份，断开时连数据一起清掉。
+    pub docker: DockerView,
 }
 
 /// 采集周期。5 秒是"CPU 这根条看着像活的"和"把服务器打穿"之间的位置：CPU 那一格
@@ -616,6 +619,12 @@ pub const METRICS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// 一轮回包的字节上限：几百个挂载点的 `df` 也就几十 KB，留足量的同时挡住
 /// 那种把登录横幅写成几 MB 的机器。
 pub const METRICS_MAX_BYTES: usize = 256 * 1024;
+
+/// 容器列表的预算：socket 直连 + CLI 兜底共用一个截止时间，别让一次 F4 等太久。
+const DOCKER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// 几百个容器的 Engine JSON 也不过几百 KB，留足空间同时挡住失控输出。
+const DOCKER_MAX_BYTES: usize = 2 * 1024 * 1024;
 
 /// 连续这么多轮回包是空的（这台机器什么都不给），就认定它采不到：停止轮询，把那一行
 /// 还给终端。
@@ -1430,6 +1439,7 @@ impl App {
             || self.rules_open
             || self.ports_open
             || self.disk_popup
+            || self.slots[self.work].docker.open
             || self.known_open
             || self.audit_open
             || self.sessions_open
@@ -1605,6 +1615,7 @@ impl App {
                     slot.sz_saveas_pending = false;
                     slot.pending_zmodem = None;
                     slot.search = None;
+                    slot.docker.reset();
                     if let Some(label) = label {
                         slot.status = Some(format!("[{label}] 会话已结束"));
                     }
@@ -1647,6 +1658,9 @@ impl App {
                 AppEvent::MetricsTick { seq, .. } => self.on_metrics_tick(self.work, seq),
                 AppEvent::MetricsProbe { seq, res, .. } => {
                     self.on_metrics_probe(self.work, seq, res)
+                }
+                AppEvent::DockerContainers { seq, res, .. } => {
+                    self.on_docker_containers(self.work, seq, res)
                 }
                 AppEvent::Conflict { prompt, .. } => self.ask_conflict(prompt),
                 AppEvent::ImportHosts(hosts) => self.import_hosts(hosts),
@@ -2037,6 +2051,10 @@ impl App {
         // 保证"正在等二级确认"时不会被面板抢走按键。
         // 叠着开的按层从最上面那个开始吃键：端口映射弹窗是从隧道面板里按 m 开出来的，
         // 两个标记同时为真时先判弹窗，否则 Esc 关掉的是背后那个面板、弹窗留在屏幕上。
+        if self.slots[self.work].docker.open {
+            self.handle_docker_key(&key);
+            return;
+        }
         if self.disk_popup {
             self.handle_disk_popup_key(&key);
             return;
@@ -2095,6 +2113,14 @@ impl App {
             if self.screen == ScreenKind::List && self.slots[self.active].session.is_some() {
                 self.detach_or_close_tab();
             }
+        }
+        if binds.matches(Action::Containers, &key) && self.screen == ScreenKind::Session {
+            if self.remote_holds_screen() {
+                self.refuse_to_take_screen();
+            } else {
+                self.open_docker();
+            }
+            return;
         }
         match self.screen {
             ScreenKind::Session => self.handle_session_key(&key).await,
@@ -2255,6 +2281,7 @@ impl App {
             | AppEvent::AutoReconnect { slot, .. }
             | AppEvent::MetricsTick { slot, .. }
             | AppEvent::MetricsProbe { slot, .. }
+            | AppEvent::DockerContainers { slot, .. }
             | AppEvent::Conflict { slot, .. }
             | AppEvent::SftpCwd { slot, .. }
             | AppEvent::ZmodemClear { slot, .. }
@@ -2700,6 +2727,24 @@ impl App {
             }
             return;
         }
+        // 容器视图：点外面关；点中某一行就选它。
+        if self.slots[self.work].docker.open {
+            let detail = self.slots[self.work].docker.detail_rows();
+            let rows = self.slots[self.work].docker.rows_len();
+            if !hit(ui::docker_popup_rect(self.last_area, rows, detail), column, row) {
+                self.slots[self.work].docker.close();
+            } else {
+                let list = ui::docker_list_rect(self.last_area, rows, detail);
+                if hit(list, column, row) {
+                    let start = ui::docker_scroll_offset(rows, list.height as usize, self.slots[self.work].docker.selected);
+                    let idx = start + (row - list.y) as usize;
+                    if idx < rows {
+                        self.slots[self.work].docker.selected = idx;
+                    }
+                }
+            }
+            return;
+        }
         // 磁盘挂载点小面板：点外面就关，表本身只读不必选。
         if self.disk_popup {
             let rows = self.slots[self.work].metrics.disks.len();
@@ -2877,18 +2922,24 @@ impl App {
     }
 
     /// 拖选越界时该滚多少：返回 `(列, 端点行, 步数)`，负数向上进历史、正数向下回实时。
-    /// 指针在终端区内、没在拖、或标签/模式不对时返回 `None`。
-    fn select_autoscroll(&self) -> Option<(u16, u16, i32)> {
+    /// 指针在终端区内、没在拖、方向已经到头、或标签/模式不对时返回 `None`。
+    fn select_autoscroll(&mut self) -> Option<(u16, u16, i32)> {
         let (id, col, row) = self.select_drag?;
         if self.screen != ScreenKind::Session || self.slots.get(self.work)?.id != id {
             return None;
         }
-        let session = self.slots.get(self.work)?.session.as_ref()?;
+        let area = ui::session_emu_rect(self.last_area, self.footer_rows(self.work));
+        let plan = autoscroll_plan(area, col, row)?;
+        let session = self.slots.get_mut(self.work)?.session.as_mut()?;
         if session.word_grab() || session.mode != TermMode::Embedded {
             return None;
         }
-        let area = ui::session_emu_rect(self.last_area, self.footer_rows(self.work));
-        autoscroll_plan(area, col, row)
+        // 到头就别再开定时器：以前这里靠"滚不动就清掉拖选状态"来停表，
+        // 结果拖到边界后往回走既不缩也不长，松手还不复制。
+        if !session.can_scroll(plan.2) {
+            return None;
+        }
+        Some(plan)
     }
 
     fn autoscroll_selection(&mut self) {
@@ -2896,16 +2947,10 @@ impl App {
             return;
         };
         let area = ui::session_emu_rect(self.last_area, self.footer_rows(self.work));
-        let mut stuck = false;
         if let Some(s) = &mut self.slots[self.work].session {
-            stuck = !s.scroll_by(step);
+            s.scroll_by(step);
             // 端点钉在最近的边上：视图滚一格，选区就多长一行。
             s.update_selection(area, col, edge_row);
-        }
-        if stuck {
-            // 到头了还停在区外：松手事件可能丢在窗口外，这里主动停表，
-            // 免得视图到顶后还每 50ms 空转重画。
-            self.select_drag = None;
         }
     }
 
@@ -2944,6 +2989,10 @@ impl App {
 
     /// 滚轮：会话=回看历史；浏览器=移动选择（列表窗口跟随滚动）。
     fn handle_scroll(&mut self, delta: i8) {
+        if self.slots[self.work].docker.open {
+            self.slots[self.work].docker.move_by(if delta > 0 { 1 } else { -1 });
+            return;
+        }
         match self.screen {
             ScreenKind::Session => {
                 if let Some(s) = &mut self.slots[self.work].session {
@@ -4956,6 +5005,81 @@ impl App {
         if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
             self.disk_popup = false;
         }
+    }
+
+    /// F4：打开容器视图，并在后台问一次这台机器（Socket 直连优先，docker ps 兜底）。
+    fn open_docker(&mut self) {
+        if self.screen != ScreenKind::Session {
+            return;
+        }
+        let Some(target) = self.slots[self.work]
+            .session
+            .as_ref()
+            .and_then(|s| s.session.probe_target())
+        else {
+            self.slots[self.work].status = Some("容器视图需要一条活着的连接".to_string());
+            return;
+        };
+        let all = self.slots[self.work].docker.all;
+        let seq = self.slots[self.work].docker.begin_fetch(all);
+        let id = self.slots[self.work].id;
+        let tx = self.event_tx.clone();
+        tokio::spawn(async move {
+            let res = target
+                .docker_containers(all, DOCKER_TIMEOUT, DOCKER_MAX_BYTES)
+                .await
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(AppEvent::DockerContainers { slot: id, seq, res });
+        });
+    }
+
+    fn handle_docker_key(&mut self, key: &KeyEvent) {
+        let mut reload = false;
+        let mut copied = false;
+        {
+            let v = &mut self.slots[self.work].docker;
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    v.close();
+                    return;
+                }
+                KeyCode::Up | KeyCode::Char('k') => v.move_by(-1),
+                KeyCode::Down | KeyCode::Char('j') => v.move_by(1),
+                KeyCode::Home | KeyCode::Char('g') => v.selected = 0,
+                KeyCode::End | KeyCode::Char('G') => {
+                    v.selected = v.rows_len().saturating_sub(1)
+                }
+                KeyCode::Enter | KeyCode::Char(' ') => v.expanded = !v.expanded,
+                KeyCode::Tab | KeyCode::Char('p') => v.toggle_tab(),
+                KeyCode::Char('a') => {
+                    v.all = !v.all;
+                    reload = true;
+                }
+                KeyCode::Char('r') => reload = true,
+                KeyCode::Char('c') | KeyCode::Char('y') => {
+                    if let Some(text) = v.copy_text() {
+                        crate::term::copy_osc52(&text);
+                        copied = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if copied {
+            self.slots[self.work].status = Some("已复制选中行（TSV，可直接粘进表格）".to_string());
+        }
+        if reload {
+            self.open_docker();
+        }
+    }
+
+    fn on_docker_containers(
+        &mut self,
+        idx: usize,
+        seq: u64,
+        res: std::result::Result<Vec<ells_core::docker::DockerContainer>, String>,
+    ) {
+        self.slots[idx].docker.adopt(seq, res);
     }
 
     /// 面板上的行：有转发规则的主机（没规则的不显示，否则整台机器列表都在）。

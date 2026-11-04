@@ -179,10 +179,11 @@ pub enum Action {
     Passthrough,
     Redraw,
     Search,
+    Containers,
 }
 
 impl Action {
-    pub const ALL: [Action; 9] = [
+    pub const ALL: [Action; 10] = [
         Action::NewTab,
         Action::NextTab,
         Action::PrevTab,
@@ -192,6 +193,7 @@ impl Action {
         Action::Passthrough,
         Action::Redraw,
         Action::Search,
+        Action::Containers,
     ];
 
     pub fn label(self) -> &'static str {
@@ -205,6 +207,7 @@ impl Action {
             Action::Passthrough => "内嵌 / 直通切换",
             Action::Redraw => "整屏重绘",
             Action::Search => "搜索历史输出",
+            Action::Containers => "容器视图",
         }
     }
 
@@ -220,6 +223,7 @@ impl Action {
             Action::Passthrough => "key_passthrough",
             Action::Redraw => "key_redraw",
             Action::Search => "key_search",
+            Action::Containers => "key_containers",
         }
     }
 
@@ -242,6 +246,7 @@ impl Action {
             Action::Passthrough => Chord::ctrl('q'),
             Action::Redraw => Chord::ctrl('l'),
             Action::Search => Chord::function(3),
+            Action::Containers => Chord::function(4),
         }
     }
 }
@@ -332,6 +337,7 @@ mod tests {
         assert_eq!(b.display(Action::Passthrough), "Ctrl-Q");
         assert_eq!(b.display(Action::Redraw), "Ctrl-L");
         assert_eq!(b.display(Action::Search), "F3");
+        assert_eq!(b.display(Action::Containers), "F4");
     }
 
     #[test]

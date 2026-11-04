@@ -1,6 +1,6 @@
 use anyhow::{anyhow, bail, Context, Result};
 use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 use crate::host::{Auth, Host};
@@ -402,6 +402,54 @@ impl ProbeTarget {
     ) -> Result<String> {
         handle_probe(&self.handle, command, timeout, max_bytes).await
     }
+
+    /// 拿一份容器列表。先试 SSH 的 `direct-streamlocal` 直连
+    /// `/var/run/docker.sock`（不需要远端有 docker CLI，也不 fork 进程），
+    /// 服务器不支持 streamlocal 或 socket 路径不同时，退回 `docker ps` 的
+    /// 行式 JSON。两条路都失败才算失败。
+    pub async fn docker_containers(
+        &self,
+        all: bool,
+        timeout: std::time::Duration,
+        max_bytes: usize,
+    ) -> Result<Vec<crate::docker::DockerContainer>> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut socket_err = None;
+        let mut cli_err: Option<String> = None;
+        if let Some(rest) = budget(deadline) {
+            // socket 那一路只花一半预算：服务器接了通道却没人应答时，
+            // 还要留时间给 docker ps 兜底。
+            let socket_budget = rest.min(std::time::Duration::from_secs(4));
+            match handle_docker_socket(&self.handle, all, socket_budget, max_bytes).await {
+                Ok(list) => return Ok(list),
+                Err(e) => socket_err = Some(e),
+            }
+        }
+        if let Some(rest) = budget(deadline) {
+            let cmd = if all {
+                "docker ps -a --format '{{json .}}' 2>/dev/null || echo ELLS_DOCKER_FAILED"
+            } else {
+                "docker ps --format '{{json .}}' 2>/dev/null || echo ELLS_DOCKER_FAILED"
+            };
+            if let Ok(text) = self.probe(cmd, rest, max_bytes).await {
+                if text.contains("ELLS_DOCKER_FAILED") {
+                    cli_err = Some("远端没有 docker 命令，或当前用户无权访问".to_string());
+                } else {
+                    match crate::docker::parse_cli_json_lines(&text) {
+                        Ok(list) => return Ok(list),
+                        Err(e) => cli_err = Some(e),
+                    }
+                }
+            }
+        }
+        let why = match (socket_err.map(|e| e.to_string()), cli_err) {
+            (Some(s), Some(c)) => format!("socket: {s}；docker ps: {c}"),
+            (Some(s), None) => format!("socket: {s}"),
+            (None, Some(c)) => format!("docker ps: {c}"),
+            (None, None) => "超时".to_string(),
+        };
+        Err(anyhow!("这台机器拿不到容器列表（{why}）"))
+    }
 }
 
 /// 凑到数据才算成功：一个数都没有就报错，让界面那句状态话说明"这台采不到"。
@@ -617,8 +665,52 @@ async fn handle_probe(
     Ok(text)
 }
 
-/// Establish an authenticated handle to `host`, tunneling through the
-/// configured jump host (recursively, ProxyJump style) when present.
+/// 通过 SSH 的 streamlocal 转发直连 Docker 的 unix socket，在上面说一回合 HTTP。
+/// Docker Engine 的 `/containers/json` 就够了，用不着远端装 CLI。
+async fn handle_docker_socket(
+    handle: &russh::client::Handle<Handler>,
+    all: bool,
+    timeout: std::time::Duration,
+    max_bytes: usize,
+) -> Result<Vec<crate::docker::DockerContainer>> {
+    let channel = handle
+        .channel_open_direct_streamlocal("/var/run/docker.sock")
+        .await
+        .context("服务器不允许直连 Docker socket")?;
+    let mut stream = channel.into_stream();
+    let path = if all {
+        "/containers/json?all=1"
+    } else {
+        "/containers/json"
+    };
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: docker\r\nAccept: application/json\r\nConnection: close\r\n\r\n"
+    );
+    let raw = tokio::time::timeout(timeout, async move {
+        stream.write_all(request.as_bytes()).await?;
+        stream.flush().await?;
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            let n = stream.read(&mut chunk).await?;
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if buf.len() >= max_bytes {
+                break;
+            }
+        }
+        Ok::<_, std::io::Error>(buf)
+    })
+    .await
+    .context("Docker socket 读超时")??;
+    let body = crate::docker::parse_http_response(&raw).map_err(|e| anyhow!(e))?;
+    let text = String::from_utf8_lossy(&body);
+    crate::docker::parse_engine_json(&text).map_err(|e| anyhow!(e))
+}
+
+/// Establish an authenticated handle to `host`, tunneling through the/// configured jump host (recursively, ProxyJump style) when present.
 pub(crate) fn connect_handle<'a>(
     host: &'a Host,
     vault: &'a crate::Vault,
