@@ -97,6 +97,44 @@ impl Emulator {
         self.parser.screen().scrollback()
     }
 
+    /// 当前实际可回看的历史行数（不含当前屏）。
+    pub fn scrollback_len(&mut self) -> usize {
+        let saved = self.parser.screen().scrollback();
+        self.parser.screen_mut().set_scrollback(usize::MAX / 4);
+        let max = self.parser.screen().scrollback();
+        self.parser.screen_mut().set_scrollback(saved);
+        max
+    }
+
+    /// 取内容行 `[start, end]`（0 = 最早的历史行，含两端）的纯文本。
+    /// 越界自动钳制；取完恢复调用前的回看偏移。
+    pub fn content_lines(&mut self, start: usize, end: usize, cols: u16) -> Vec<String> {
+        let saved = self.parser.screen().scrollback();
+        self.parser.screen_mut().set_scrollback(usize::MAX / 4);
+        let max = self.parser.screen().scrollback();
+        let total = max + self.rows as usize;
+        let mut out = Vec::new();
+        if start < total {
+            for line in start..=end.min(total - 1) {
+                let (offset, row) = if line < max {
+                    (max - line, 0)
+                } else {
+                    (0, line - max)
+                };
+                self.parser.screen_mut().set_scrollback(offset);
+                out.push(
+                    self.parser
+                        .screen()
+                        .rows(0, cols)
+                        .nth(row)
+                        .unwrap_or_default(),
+                );
+            }
+        }
+        self.parser.screen_mut().set_scrollback(saved);
+        out
+    }
+
     /// 采集"全部历史 + 实时屏"的纯文本，返回 `(最大回看偏移, 由旧到新的行)`。
     ///
     /// vt100 只暴露滚动后的可视区，所以这里逐偏移取视图首行来覆盖 scrollback，
@@ -156,6 +194,29 @@ impl Emulator {
 #[cfg(test)]
 mod tests {
     use super::Emulator;
+
+    /// 内容行 `start..=end`（0 = 最早的历史行）的纯文本。取完会恢复当前回看偏移。
+    #[test]
+    fn content_lines_reads_across_scrollback_without_moving_the_view() {
+        let mut emu = Emulator::new(3, 20);
+        for i in 0..12 {
+            emu.process(format!("row-{i:02}\r\n").as_bytes());
+        }
+        let (max, expected) = emu.history_lines();
+        assert_eq!(emu.scrollback_len(), max);
+        emu.set_scrollback(2);
+        let got = emu.content_lines(2, 9, 20);
+        let want: Vec<String> = expected[2..=9]
+            .iter()
+            .map(|l| l.trim_end().to_string())
+            .collect();
+        assert_eq!(got.iter().map(|l| l.trim_end().to_string()).collect::<Vec<_>>(), want);
+        assert_eq!(emu.scrollback_offset(), 2, "取文本不该把视图挪走");
+        // 越界由调用方无感钳制；整段超出就返回空。
+        let total = max + 3;
+        assert_eq!(emu.content_lines(total, total + 5, 20).len(), 0);
+        assert_eq!(emu.content_lines(total - 1, total + 5, 20).len(), 1);
+    }
 
     /// 搜索要靠 `history_lines` 的下标跳回视图，所以"下标 → (回看偏移, 视图行)"
     /// 的换算必须逐行成立；这里把每一行都定位一遍。

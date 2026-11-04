@@ -2182,7 +2182,7 @@ fn display_width(s: &str) -> usize {
     s.chars().map(|c| if is_wide(c) { 2 } else { 1 }).sum()
 }
 
-fn is_wide(c: char) -> bool {
+pub(crate) fn is_wide(c: char) -> bool {
     let u = c as u32;
     (0x1100..=0x115F).contains(&u)
         || (0x2E80..=0xA4CF).contains(&u)
@@ -2197,10 +2197,14 @@ fn is_wide(c: char) -> bool {
 
 fn draw_session(f: &mut Frame, app: &mut App) {
     let idx = app.active;
-    if let Some(sg) = app.slots[idx].session.as_mut() {
+    // 回看偏移应用后顺手取历史行数：选区用内容行号，本帧的高亮判断要用同一个数。
+    let sb_len = if let Some(sg) = app.slots[idx].session.as_mut() {
         let off = sg.scroll;
         sg.emu.set_scrollback(off);
-    }
+        sg.emu.scrollback_len()
+    } else {
+        0
+    };
     let Some(s) = &app.slots[idx].session else { return };
     // 底部指标行占不占这一行，由 App 一处决定（会话页绘制与鼠标命中都用它），
     // 和 SessionState 里算视口高度时用的那个数必须同源，否则正好裁掉远端最后一行
@@ -2317,7 +2321,6 @@ fn draw_session(f: &mut Frame, app: &mut App) {
     let rows = emu_rows.min(area.height);
     let cols = emu_cols.min(area.width);
     let highlight_on = app.settings.highlight;
-    let sel = s.selection_rect();
     let buf = f.buffer_mut();
     for r in 0..rows {
         // 逐行构建与单元格对齐的文本（宽字符续格用 '\0' 占位）用于高亮匹配
@@ -2381,10 +2384,8 @@ fn draw_session(f: &mut Frame, app: &mut App) {
                 mods |= Modifier::REVERSED;
             }
             style = style.add_modifier(mods);
-            if let Some(((x0, y0), (x1, y1))) = sel {
-                if x >= x0 && x <= x1 && y >= y0 && y <= y1 {
-                    style = style.add_modifier(Modifier::REVERSED);
-                }
+            if s.selection_contains(x, y, area, sb_len) {
+                style = style.add_modifier(Modifier::REVERSED);
             }
             buf[(x, y)].set_symbol(symbol).set_style(style);
         }
@@ -2415,6 +2416,9 @@ fn draw_session(f: &mut Frame, app: &mut App) {
     // 底部不再叠加状态浮层：状态统一显示在顶部第二行，避免三处重复。
     if footer > 0 {
         draw_metrics_bar(f, app, chunks[2]);
+    }
+    if app.disk_popup {
+        draw_disk_popup(f, app);
     }
     // 弹窗最后渲染：内嵌终端的逐格写入会覆盖先画的浮层
     if app.settings_open {
@@ -2477,6 +2481,49 @@ fn inline(raw: &str) -> String {
     raw.chars().map(|c| if c.is_control() { ' ' } else { c }).collect()
 }
 
+/// 多盘平铺时的挂载点名：放得下就用完整路径，放不下退到末级目录名再截断。
+fn short_mount(mount: &str, width: usize) -> String {
+    if display_width(mount) <= width {
+        return mount.to_string();
+    }
+    let base = mount.trim_end_matches('/');
+    let name = base.rsplit('/').next().filter(|s| !s.is_empty()).unwrap_or("/");
+    clip_display(name, width)
+}
+
+/// 底栏磁盘格的鼠标命中矩形：与绘制共用同一套布局算法。
+pub fn disk_cell_rect(m: &crate::app::Metrics, area: Rect) -> Option<Rect> {
+    if m.disk.is_none() {
+        return None;
+    }
+    let (x, w) = metric_render(m, area.width).disk_span?;
+    if w == 0 {
+        return None;
+    }
+    Some(Rect {
+        x: area.x.saturating_add(x as u16),
+        y: area.y,
+        width: w as u16,
+        height: 1,
+    })
+}
+
+/// 会话页底部指标行所在的一格（绘制与命中测试同源）。
+pub fn session_footer_rect(area: Rect, footer_rows: u16) -> Rect {
+    Rect {
+        x: area.x,
+        y: area.y + area.height.saturating_sub(footer_rows),
+        width: area.width,
+        height: footer_rows,
+    }
+}
+
+/// 磁盘挂载点小面板的矩形；高度跟着盘数走。
+pub fn disk_popup_rect(area: Rect, rows: usize) -> Rect {
+    let h = (rows as u16).saturating_add(4).clamp(6, 16);
+    centered(64, h, area)
+}
+
 /// 一根条的填充格数：向上取整，1% 也要看得见一格。
 fn bar_filled(percent: Option<u8>, width: usize) -> usize {
     match percent {
@@ -2494,10 +2541,166 @@ fn bar_filled(percent: Option<u8>, width: usize) -> usize {
 /// 宽度不够时按顺序降级：先把条缩短、缩到 0 就只剩"标签 百分比"，再把行尾的说明
 /// 整句丢掉（先丢负载，再丢磁盘那句）。被挤掉的永远是装饰，不是数字。
 pub fn metric_parts(m: &crate::app::Metrics, width: u16) -> Vec<(String, MetricTone)> {
-    // 连上到第一轮回来之间一个数都没有：明说"在采"，别摆三条空槽看着像坏了
+    metric_render(m, width).parts
+}
+
+/// 底栏最多平铺几块盘：再多就靠点击后的小面板。
+const DISK_INLINE_MAX: usize = 3;
+
+/// 一行渲染结果：分段文本 + 磁盘格在行内的列偏移（供鼠标命中测试）。
+struct MetricRender {
+    parts: Vec<(String, MetricTone)>,
+    disk_span: Option<(usize, usize)>,
+}
+
+fn metric_render(m: &crate::app::Metrics, width: u16) -> MetricRender {
     if !m.has_data() {
-        return vec![(" 远端主机指标：正在采集第一轮…".to_string(), MetricTone::Dim)];
+        return MetricRender {
+            // 连上到第一轮回来之间一个数都没有：明说"在采"，别摆三条空槽看着像坏了
+            parts: vec![(" 远端主机指标：正在采集第一轮…".to_string(), MetricTone::Dim)],
+            disk_span: None,
+        };
     }
+    if m.disks.len() > 1 && let Some(render) = multi_disk_render(m, width) {
+        return render;
+    }
+    single_disk_render(m, width)
+}
+
+/// 多盘紧凑布局：`磁盘 ███░ 88% /data · ██░ 75% / · █░ 40% /home`。
+///
+/// 每块盘一根小条，三块时条宽合计 12 格 —— 和单盘现状一样长，整段面积不超过
+/// 单盘现状（标签+条+百分比+用量说明）的 120%。放不下就依次缩短挂载点名、
+/// 减到两块，最后退回单盘布局；百分比和报警配色永不丢。
+fn multi_disk_render(m: &crate::app::Metrics, width: u16) -> Option<MetricRender> {
+    let avail = width as usize;
+    let cells = metric_cells(m);
+    let pct_len = |p: Option<u8>| p.map(|p| p.to_string().len() + 1).unwrap_or(1);
+    let cpu_fixed = display_width(cells[0].label) + 2 + pct_len(cells[0].percent);
+    let mem_fixed = display_width(cells[1].label) + 2 + pct_len(cells[1].percent);
+    // 紧凑布局里磁盘标签前面已经有 ` · `，所以按原样算；只有和单盘比 120% 时才
+    // 像单盘那样给两侧各算一个空格。
+    let disk_label_w = display_width(cells[2].label);
+    let single_section = disk_label_w + 2 + 12 + 1 + pct_len(cells[2].percent) + 2
+        + display_width(&cells[2].detail);
+    // 120% 封顶：多盘那一段（含挂载点名）不能比单盘现状胖出两成。
+    let cap = single_section * 12 / 10 + 1;
+    let sep = " · ";
+    let sep_w = display_width(sep);
+
+    let max_n = m.disks.len().min(DISK_INLINE_MAX);
+    // 从最丰富（三块、完整挂载点）往最省（两块、短名）试，第一套装得下的就用它。
+    for clip in [12usize, 6, 4, 2] {
+        for n in (2..=max_n).rev() {
+            let bar = (12 / n).max(2);
+            let groups: Vec<(String, String)> = m.disks[..n]
+                .iter()
+                .map(|d| {
+                    let mount = inline(&short_mount(&d.mount, clip));
+                    (format!("{pct}%", pct = d.percent), mount)
+                })
+                .collect();
+            let extra = m.disks.len().saturating_sub(n);
+            let mut groups_w = 0usize;
+            for (i, (pct, mount)) in groups.iter().enumerate() {
+                if i > 0 {
+                    groups_w += sep_w;
+                }
+                groups_w += bar + 1 + display_width(pct) + 1 + display_width(mount);
+            }
+            // `+N` 是"还有几块没摊开"的角标，不算进 120% 的盘面预算：为了它把
+            // 第三块盘挤掉不值得，但摆不下整行时它照样会让位。
+            let extra_w = if extra > 0 { display_width(&format!(" +{extra}")) } else { 0 };
+            // 盘面不许比单盘现状胖出两成；这一行固定的那些字必须先摆得下。
+            if disk_label_w + 2 + groups_w > cap {
+                continue;
+            }
+            let base =
+                cpu_fixed + mem_fixed + disk_label_w + groups_w + extra_w + 2 * sep_w;
+            if base > avail {
+                continue;
+            }
+            // CPU/内存各一根等长的条，条后还得留一格才不贴住百分比。剩下多少
+            // 就给多少，封顶 12；算完再核一遍整行，免得两种条宽差一格。
+            let bar_cpu = ((avail - base) / 2).saturating_sub(1).min(12);
+            let bars_w = if bar_cpu > 0 { 2 * (bar_cpu + 1) } else { 0 };
+            if base + bars_w > avail {
+                continue;
+            }
+            let mut parts: Vec<(String, MetricTone)> = Vec::new();
+            let mut col = 0usize;
+            let mut push = |text: String, tone: MetricTone, col: &mut usize| {
+                *col += display_width(&text);
+                parts.push((text, tone));
+            };
+            for (i, cell) in cells.iter().take(2).enumerate() {
+                if i > 0 {
+                    push(sep.to_string(), MetricTone::Dim, &mut col);
+                }
+                push(format!(" {} ", cell.label), MetricTone::Label, &mut col);
+                let tone = MetricTone::of(cell.percent);
+                if bar_cpu > 0 {
+                    let filled = bar_filled(cell.percent, bar_cpu);
+                    push(
+                        format!("{}{}", "█".repeat(filled), "░".repeat(bar_cpu - filled)),
+                        tone.as_bar(),
+                        &mut col,
+                    );
+                    push(" ".to_string(), MetricTone::Dim, &mut col);
+                }
+                push(
+                    cell.percent.map(|p| format!("{p}%")).unwrap_or_else(|| "—".to_string()),
+                    tone,
+                    &mut col,
+                );
+            }
+            push(sep.to_string(), MetricTone::Dim, &mut col);
+            let disk_start = col;
+            push(cells[2].label.to_string(), MetricTone::Label, &mut col);
+            for (i, d) in m.disks[..n].iter().enumerate() {
+                if i > 0 {
+                    push(sep.to_string(), MetricTone::Dim, &mut col);
+                }
+                let tone = MetricTone::of(Some(d.percent));
+                let filled = bar_filled(Some(d.percent), bar);
+                push(
+                    format!("{}{}", "█".repeat(filled), "░".repeat(bar - filled)),
+                    tone.as_bar(),
+                    &mut col,
+                );
+                push(" ".to_string(), MetricTone::Dim, &mut col);
+                push(format!("{}%", d.percent), tone, &mut col);
+                push(
+                    format!(" {}", inline(&short_mount(&d.mount, clip))),
+                    MetricTone::Dim,
+                    &mut col,
+                );
+            }
+            let mut disk_w = col - disk_start;
+            if extra > 0 {
+                let text = format!(" +{extra}");
+                disk_w += display_width(&text);
+                push(text, MetricTone::Dim, &mut col);
+            }
+            // 行尾只剩负载这一句：挂载点已经平铺在前面了，不再重复用量说明。
+            let load = &cells[0].detail;
+            let w = display_width(load);
+            if w > 0 && w + 2 <= avail.saturating_sub(col) {
+                push(format!("  {load}"), MetricTone::Dim, &mut col);
+            }
+            drop(push);
+            // 兜底：真的画出来比算出来宽一格时别交出去，退回更省的那套。
+            if col > avail {
+                continue;
+            }
+            return Some(MetricRender { parts, disk_span: Some((disk_start, disk_w)) });
+        }
+    }
+    None
+}
+
+/// 单盘布局：保持原有"三格等长条 + 行尾说明"的样子。
+fn single_disk_render(m: &crate::app::Metrics, width: u16) -> MetricRender {
     let cells = metric_cells(m);
     let avail = width as usize;
     // 每格的固定开销：` 标签 `（两侧各一个空格）+ 百分比文本；分隔符 ` · ` 占 3 列。
@@ -2563,7 +2766,20 @@ pub fn metric_parts(m: &crate::app::Metrics, width: u16) -> Vec<(String, MetricT
         let gap = if n == 0 { "  " } else { " · " };
         parts.push((format!("{gap}{}", cell.detail), MetricTone::Dim));
     }
-    parts
+    // 磁盘格的命中范围只到百分比为止：行尾说明不属于那一格。
+    let disk_span = parts
+        .iter()
+        .position(|(text, _)| text == " 磁盘 ")
+        .map(|start| {
+            let x = parts[..start].iter().map(|(t, _)| display_width(t)).sum::<usize>();
+            let w = parts[start..]
+                .iter()
+                .take_while(|(t, _)| !t.starts_with("  ") && t != " · ")
+                .map(|(t, _)| display_width(t))
+                .sum::<usize>();
+            (x, w)
+        });
+    MetricRender { parts, disk_span }
 }
 
 /// 一格的配色：<70 正常、70~89 提醒、≥90 危险；没有数就是灰。
@@ -2646,6 +2862,77 @@ fn draw_metrics_bar(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(
         Paragraph::new(line).style(Style::default().bg(theme::band())),
         area,
+    );
+}
+
+/// 点底栏磁盘格弹出的全部挂载点小面板（只读）。
+fn draw_disk_popup(f: &mut Frame, app: &App) {
+    let disks = &app.slots[app.active].metrics.disks;
+    let area = disk_popup_rect(app.last_area, disks.len());
+    f.buffer_mut().set_style(area, Style::default().bg(theme::bg()));
+    f.render_widget(Clear, area);
+    let block = Block::bordered()
+        .title(format!(" 磁盘挂载点（{} 块） ", disks.len()))
+        .title_style(Style::default().fg(theme::accent()).add_modifier(Modifier::BOLD));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let lines: Vec<Line> = if disks.is_empty() {
+        vec![
+            Line::from(Span::styled(
+                " 这台机器还没有磁盘数据",
+                Style::default().fg(theme::dim()),
+            )),
+            Line::from(Span::styled(
+                " 服务器没有 statvfs 扩展、df 也给不出挂载点时会是这样",
+                Style::default().fg(theme::muted()),
+            )),
+        ]
+    } else {
+        let mut out = vec![Line::from(vec![
+            Span::styled(
+                pad_display("挂载点", 30),
+                Style::default().fg(theme::dim()).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                pad_display("使用率", 8),
+                Style::default().fg(theme::dim()).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("已用/总量", Style::default().fg(theme::dim()).add_modifier(Modifier::BOLD)),
+        ])];
+        for d in disks {
+            let tone = MetricTone::of(Some(d.percent)).color();
+            out.push(Line::from(vec![
+                Span::styled(
+                    pad_display(&clip_display(&inline(&d.mount), 28), 30),
+                    Style::default().fg(theme::text()),
+                ),
+                Span::styled(
+                    pad_display(&format!("{}%", d.percent), 8),
+                    Style::default().fg(tone).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(
+                        "{}/{}",
+                        human_size(d.used_kb * 1024),
+                        human_size(d.total_kb * 1024)
+                    ),
+                    Style::default().fg(theme::muted()),
+                ),
+            ]));
+        }
+        out
+    };
+    f.render_widget(Paragraph::new(lines), inner);
+    f.render_widget(
+        Paragraph::new(" Esc/点击外部 关闭 · 按使用率从高到低 · 数值来自 statvfs/df ")
+            .style(Style::default().fg(theme::dim())),
+        Rect {
+            x: area.x,
+            y: area.y.saturating_add(area.height),
+            width: area.width,
+            height: 1,
+        },
     );
 }
 
@@ -3742,6 +4029,88 @@ mod tests {
         metric_parts(m, width).into_iter().map(|(t, _)| t).collect()
     }
 
+    /// 按显示列切一段文本：命中范围是列号，CJK 一个字占两列，不能拿 `chars()` 直接切。
+    fn columns(line: &str, start: usize, width: usize) -> String {
+        let mut out = String::new();
+        let mut col = 0usize;
+        for c in line.chars() {
+            let cw = if is_wide(c) { 2 } else { 1 };
+            if col >= start && col + cw <= start + width {
+                out.push(c);
+            }
+            col += cw;
+        }
+        out
+    }
+
+    /// 四块真实挂载点（使用率降序：/backup 90、/data 88、/ 75、/home 40）：
+    /// 底栏只该平铺前三块，剩下的用 `+1` 交代。
+    const M_MULTI: &str = concat!(
+        "ellsm1\n",
+        "cpu  140 0 52 850 58 0 0 0\n",
+        "MemTotal: 1000 kB\n",
+        "MemAvailable: 390 kB\n",
+        "0.42 0.31 0.19 1/234 5678\n",
+        "/dev/sda1 2000 1500 500 75% /\n",
+        "/dev/sdb1 4000 3520 480 88% /data\n",
+        "/dev/sdc1 1000 400 600 40% /home\n",
+        "/dev/sdd1 1000 900 100 90% /backup\n",
+    );
+
+    fn multi_metrics() -> crate::app::Metrics {
+        let mut m = crate::app::Metrics::default();
+        m.adopt(&ells_core::Probe::parse(M_MULTI));
+        m
+    }
+
+    /// 多块盘：底栏平铺前三块（含各自压缩后的小条），其余用 `+N` 交代，
+    /// 三根小条合起来和原来一根条一样长。
+    #[test]
+    fn multiple_mounts_are_listed_with_compressed_bars() {
+        let m = multi_metrics();
+        assert_eq!(m.disks.len(), 4, "普查要把整张挂载点表留下");
+        let line = metric_line(&m, 120);
+        for mount in ["/backup", "/data", "/"] {
+            assert!(line.contains(mount), "「{line}」缺 {mount}");
+        }
+        assert!(line.contains("+1"), "「{line}」没交代还有一块");
+        assert!(!line.contains("/home"), "「{line}」只该平铺三块");
+
+        let render = metric_render(&m, 120);
+        let (x, w) = render.disk_span.expect("磁盘格该有命中范围");
+        let span = columns(&line, x, w);
+        let bars = span.chars().filter(|c| matches!(c, '█' | '░')).count();
+        assert_eq!(bars, 12, "三根小条合计 12 格，和单盘条一样长：「{span}」");
+        assert!(display_width(&line) <= 120, "「{line}」");
+    }
+
+    /// 窄屏放不下三块盘就退回单盘老样子：百分比一个都不能少。
+    #[test]
+    fn multi_disk_layout_falls_back_on_a_narrow_row() {
+        let m = multi_metrics();
+        let line = metric_line(&m, 40);
+        assert!(line.contains("90%"), "「{line}」");
+        assert!(!line.contains("/backup"), "「{line}」窄屏不该硬塞挂载点");
+        assert!(display_width(&line) <= 40, "「{line}」");
+    }
+
+    /// 磁盘格命中矩形必须真的盖在「磁盘」那一段上，否则点击会落到终端里变成拖选。
+    #[test]
+    fn the_disk_cell_rect_covers_the_disk_label() {
+        for m in [filled_metrics(), multi_metrics()] {
+            let area = Rect::new(3, 7, 120, 1);
+            let rect = disk_cell_rect(&m, area).expect("有磁盘就该有命中格");
+            let line = metric_line(&m, 120);
+            let start = (rect.x - area.x) as usize;
+            let span = columns(&line, start, rect.width as usize);
+            assert!(
+                span.starts_with("磁盘") || span.starts_with(" 磁盘"),
+                "命中范围落在「{span}」"
+            );
+            assert_eq!(rect.y, area.y);
+        }
+    }
+
     /// 把整行切成"三格 + 行尾装饰"。用来钉死一件事：格子里只允许有标签、条和百分比，
     /// 说明一律在行尾 —— 说明一塞回某一格后面，那一格就比旁边的格宽出一截，用户第一眼
     /// 看到的是"这根条怎么长一点"，而不是数变了没有。
@@ -3778,6 +4147,12 @@ mod tests {
         for width in 31u16..=200 {
             let drawn = display_width(&metric_line(&m, width));
             assert!(drawn <= width as usize, "{width} 列下画出 {drawn} 列");
+        }
+        // 多盘平铺也不能把整行撑出去（窄屏会自动退回单盘）。
+        let multi = multi_metrics();
+        for width in 31u16..=200 {
+            let drawn = display_width(&metric_line(&multi, width));
+            assert!(drawn <= width as usize, "多盘 {width} 列下画出 {drawn} 列");
         }
     }
 

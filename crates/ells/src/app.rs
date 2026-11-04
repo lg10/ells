@@ -683,6 +683,17 @@ pub struct DiskGauge {
     pub total_kb: u64,
 }
 
+impl DiskGauge {
+    fn from_sample(d: &ells_core::DiskSample) -> Self {
+        Self {
+            mount: d.mount.clone(),
+            percent: d.used_percent,
+            used_kb: d.used_kb,
+            total_kb: d.total_kb,
+        }
+    }
+}
+
 /// 一个标签的底部指标行：既有面向绘制的"最近一次结果"，也有面向调度的"代号 + 连续失败"。
 ///
 /// 节奏沿用自动重连那套（**没有全局 tick**）：一次性定时器睡到点发一个带 `seq` 的
@@ -696,8 +707,12 @@ pub struct Metrics {
     pub mem: Option<u8>,
     /// 1/5/15 分钟平均负载；没有 `/proc/loadavg` 的机器是 `None`
     pub load: Option<ells_core::LoadSample>,
-    /// 磁盘容量使用率（每一轮都跟着换数，但中间那些轮只跟单最满那块；见 `disk_rounds`）
+    /// 磁盘容量使用率（每一轮都跟着换数，但中间那些轮只跟单最满那块；见 `disk_rounds`）。
+    /// 始终是 `disks` 里最满的那一块，底部那一格和旧调用方都读它。
     pub disk: Option<DiskGauge>,
+    /// 全部真实挂载点，按使用率降序：普查整表刷新，跟单轮只更新对应的那一块。
+    /// 底栏最多平铺三块，完整列表在点击后的小面板里。
+    pub disks: Vec<DiskGauge>,
     /// 上一轮 `/proc/stat` 快照：CPU 利用率是两次快照做差出来的
     prev_cpu: Option<ells_core::CpuSample>,
     /// 只拿到基线、还没差出 CPU 数：为 true 时下一轮用 `METRICS_CPU_WINDOW` 接力。
@@ -784,16 +799,28 @@ impl Metrics {
             probe.mem.as_ref().and_then(ells_core::metrics::mem_percent),
         );
         self.load = probe.load;
-        // 磁盘那一格：这一轮问到数就换上（跟单轮每 5 秒都问得到同一块盘的新数），
+        // 磁盘：这一轮问到数就换上（跟单轮每 5 秒都问得到同一块盘的新数），
         // 没问到就沿用上次的数 —— 那一格本来就该以"变化时才动"为主。
-        if let Some(d) = probe.worst_disk() {
-            self.disk = Some(DiskGauge {
-                mount: d.mount.clone(),
-                percent: d.used_percent,
-                used_kb: d.used_kb,
-                total_kb: d.total_kb,
-            });
+        //
+        // 普查轮带回的是**整张挂载点表**，整表替换；跟单轮只带回最满那一块，
+        // 按挂载点原地更新，别的盘必须留着 —— 否则底栏刚平铺出来的三块盘
+        // 会在下一次 5 秒跟单后缩回一块。
+        let survey = self.disk_survey_due();
+        if survey {
+            let fresh: Vec<DiskGauge> =
+                probe.disks.iter().map(DiskGauge::from_sample).collect();
+            if !fresh.is_empty() {
+                self.disks = fresh;
+            }
+        } else if let Some(d) = probe.worst_disk() {
+            let fresh = DiskGauge::from_sample(d);
+            match self.disks.iter_mut().find(|x| x.mount == fresh.mount) {
+                Some(slot) => *slot = fresh,
+                // 缓存里没有这块（刚切过来、或者上一轮漏了）：补进去，下一轮继续跟。
+                None => self.disks.push(fresh),
+            }
         }
+        self.disk = self.disks.first().cloned();
         // 普查点：到点的这一轮**不管问到没问到**都往后数 11 轮。没问到也要数，是因为
         // "没问到"里就有这台没有 statvfs、df 又给不出盘的一类机器 —— 不数的话下一轮
         // 又是一次普查加一条 df，60 秒的节奏当场退化成 5 秒。
@@ -1064,6 +1091,8 @@ pub struct App {
     /// 端口映射总表（m 打开）。数据只能来自隧道事件：自动分配的口只有它自己知道。
     pub ports_open: bool,
     pub tunnel_ports: HashMap<String, Vec<PortMap>>,
+    /// 点底栏磁盘格弹出的挂载点小面板（会话页，只读）。
+    pub disk_popup: bool,
     /// known_hosts 管理页（列表页按 h 打开）。
     pub known_open: bool,
     pub known_entries: Vec<hostkey::KnownEntry>,
@@ -1094,6 +1123,10 @@ pub struct App {
     pub restart_after_exit: bool,
     /// 最近一次绘制的终端区域，用于把鼠标坐标映射到顶部按钮。
     pub last_area: Rect,
+    /// 上一次按下的时刻和格子，用来认双击（同一格、500ms 内）。
+    last_press: Option<(std::time::Instant, u16, u16)>,
+    /// 拖选进行中的标签 id 与指针位置（越界时据此开自滚定时器）。
+    select_drag: Option<(u32, u16, u16)>,
     pub vault: Vault,
     pub vault_key: Option<VaultKey>,
     /// 待连接的主机 + 落到哪个标签下标（选标签的规则在 `start_connect` 里定）。
@@ -1200,6 +1233,40 @@ fn group_rank(group: Option<&str>) -> (u8, String) {
     }
 }
 
+/// 拖选越界自滚每跳最多这么行：再快会一帧跳过整屏，用户根本看不清选到哪。
+const AUTOSCROLL_MAX_STEP: i32 = 12;
+
+/// 指针在终端区外时这一跳滚多少：`(列, 端点行, 步数)`，负数向上进历史、
+/// 正数向下回实时。端点钉在最近的边上，视图滚一格选区就长一行。
+fn autoscroll_plan(area: Rect, col: u16, row: u16) -> Option<(u16, u16, i32)> {
+    if area.height == 0 {
+        return None;
+    }
+    let last = area.y.saturating_add(area.height).saturating_sub(1);
+    if row >= area.y && row <= last {
+        return None;
+    }
+    let (edge, outside, dir) = if row < area.y {
+        (area.y, area.y - row, -1)
+    } else {
+        (last, row - last, 1)
+    };
+    Some((col, edge, dir * (1 + i32::from(outside)).min(AUTOSCROLL_MAX_STEP)))
+}
+
+/// 双击 = 上一次按下在同一格、且不超过 500ms（Windows 默认值）。
+fn is_double_click(
+    prev: Option<(std::time::Instant, u16, u16)>,
+    now: std::time::Instant,
+    column: u16,
+    row: u16,
+) -> bool {
+    prev.is_some_and(|(t, c, r)| {
+        (c, r) == (column, row)
+            && now.duration_since(t) <= std::time::Duration::from_millis(500)
+    })
+}
+
 impl App {
     fn startup(
         tx: mpsc::UnboundedSender<AppEvent>,
@@ -1272,6 +1339,7 @@ impl App {
             rules_error: None,
             ports_open: false,
             tunnel_ports: HashMap::new(),
+            disk_popup: false,
             known_open: false,
             known_entries: Vec::new(),
             known_selected: 0,
@@ -1290,6 +1358,8 @@ impl App {
             update: UpdateState::default(),
             restart_after_exit: false,
             last_area: Rect::ZERO,
+            last_press: None,
+            select_drag: None,
             vault: Vault::default(),
             vault_key: None,
             pending_connect: None,
@@ -1359,6 +1429,7 @@ impl App {
             || self.tunnels_open
             || self.rules_open
             || self.ports_open
+            || self.disk_popup
             || self.known_open
             || self.audit_open
             || self.sessions_open
@@ -1384,6 +1455,9 @@ impl App {
             }
             let passthrough = self.screen == ScreenKind::Session
                 && self.slots[self.active].session.as_ref().map(|s| s.mode) == Some(TermMode::Passthrough);
+            if passthrough || self.screen != ScreenKind::Session {
+                self.select_drag = None;
+            }
             if passthrough {
                 // 直通期间整块屏幕归远端，ells 一个字节都不画：重绘请求攒着，等屏幕交回来再用
                 self.passthrough_last = true;
@@ -1422,8 +1496,24 @@ impl App {
             if let Some((host, idx)) = self.pending_connect.take() {
                 self.spawn_connect(host, idx);
             }
-            let Some(ev) = self.event_rx.recv().await else {
-                break;
+            // 拖动越界期间没有新事件也要动：50ms 一跳把视图滚出去，
+            // 滚完直接回循环顶部重画一帧。
+            let ev = if self.select_autoscroll().is_some() {
+                match tokio::time::timeout(std::time::Duration::from_millis(50), self.event_rx.recv())
+                    .await
+                {
+                    Ok(Some(ev)) => ev,
+                    Ok(None) => break,
+                    Err(_) => {
+                        self.autoscroll_selection();
+                        continue;
+                    }
+                }
+            } else {
+                let Some(ev) = self.event_rx.recv().await else {
+                    break;
+                };
+                ev
             };
             // 后台标签的事件绝不落到当前标签上：找不到对应标签就直接丢弃
             let Some(idx) = self.event_slot(&ev) else {
@@ -1876,6 +1966,9 @@ impl App {
         if key.kind == KeyEventKind::Release {
             return;
         }
+        // 按键（会话页会清掉选区）也顺手结束拖选：松手事件丢在窗口外时
+        // 不能留下一个还在按距离自滚的状态。
+        self.select_drag = None;
         // Some terminals deliver Ctrl+<letter> as a bare ASCII control char
         // (\x03 for Ctrl-C) without the CONTROL modifier; a bare control
         // char must never reach text inputs. 0x1C–0x1F 同理，它们是 Ctrl-
@@ -1944,6 +2037,10 @@ impl App {
         // 保证"正在等二级确认"时不会被面板抢走按键。
         // 叠着开的按层从最上面那个开始吃键：端口映射弹窗是从隧道面板里按 m 开出来的，
         // 两个标记同时为真时先判弹窗，否则 Esc 关掉的是背后那个面板、弹窗留在屏幕上。
+        if self.disk_popup {
+            self.handle_disk_popup_key(&key);
+            return;
+        }
         if self.ports_open {
             self.handle_ports_key(&key);
             return;
@@ -2256,6 +2353,7 @@ impl App {
         self.active = idx;
         self.work = idx;
         self.screen = view;
+        self.select_drag = None;
         self.settings_open = false;
         self.transfer_popup = false;
         self.status = None;
@@ -2464,6 +2562,12 @@ impl App {
         if self.remote_holds_screen() {
             return;
         }
+        // 新的按下 = 上一次拖选已经结束。松手事件可能丢在窗口外，
+        // 不能让它一直挂着按距离自滚；下面若按在终端区会重新置位。
+        self.select_drag = None;
+        let now = std::time::Instant::now();
+        let double_click = is_double_click(self.last_press, now, column, row);
+        self.last_press = Some((now, column, row));
         if self.choice.is_some() {
             let (lines, options) = match &self.choice {
                 Some(c) => (c.lines.len(), c.options.len()),
@@ -2596,6 +2700,14 @@ impl App {
             }
             return;
         }
+        // 磁盘挂载点小面板：点外面就关，表本身只读不必选。
+        if self.disk_popup {
+            let rows = self.slots[self.work].metrics.disks.len();
+            if !hit(ui::disk_popup_rect(self.last_area, rows), column, row) {
+                self.disk_popup = false;
+            }
+            return;
+        }
         // 端口映射弹窗：点外面就关，表本身只读不必选。
         if self.ports_open {
             if !hit(ui::ports_rect(self.last_area), column, row) {
@@ -2661,14 +2773,31 @@ impl App {
                     self.toggle_host_list();
                 } else if hit(progress_r, column, row) && !self.slots[self.work].browser.transfers.is_empty() {
                     self.transfer_popup = true;
+                } else if {
+                    // 底栏磁盘格：点开完整挂载点列表。命中矩形与绘制同一套算法。
+                    let footer = self.footer_rows(self.work);
+                    footer > 0
+                        && ui::disk_cell_rect(
+                            &self.slots[self.work].metrics,
+                            ui::session_footer_rect(self.last_area, footer),
+                        )
+                        .is_some_and(|r| hit(r, column, row))
+                } {
+                    self.disk_popup = true;
                 } else if hit(
                     ui::session_emu_rect(self.last_area, self.footer_rows(self.work)),
                     column,
                     row,
                 ) {
-                    // 终端区按下 = 开始拖选（鼠标捕获后原生选择失效，由 ells 自绘）
+                    // 终端区按下 = 开始拖选（鼠标捕获后原生选择失效，由 ells 自绘）。
+                    // 双击落在词内就整词选中；落在空格/标点上仍按普通按下处理。
+                    let area = ui::session_emu_rect(self.last_area, self.footer_rows(self.work));
+                    let id = self.slots[self.work].id;
                     if let Some(s) = &mut self.slots[self.work].session {
-                        s.begin_selection(column, row);
+                        if !(double_click && s.select_word(area, column, row)) {
+                            s.begin_selection(area, column, row);
+                        }
+                        self.select_drag = Some((id, column, row));
                     }
                 }
             }
@@ -2731,28 +2860,86 @@ impl App {
         if self.screen != ScreenKind::Session {
             return;
         }
+        // 只有从终端区按下的拖动才动选区：从标题栏/底栏起手的拖动
+        // 不该把上一次的选区拖变形。
+        let Some((id, _, _)) = self.select_drag else {
+            return;
+        };
+        self.select_drag = Some((id, column, row));
+        let area = ui::session_emu_rect(self.last_area, self.footer_rows(self.work));
         if let Some(s) = &mut self.slots[self.work].session {
-            s.update_selection(column, row);
+            // 双击按住期间鼠标抖一下不该把整词缩成一个点：等松手再复制。
+            if s.word_grab() {
+                return;
+            }
+            s.update_selection(area, column, row);
+        }
+    }
+
+    /// 拖选越界时该滚多少：返回 `(列, 端点行, 步数)`，负数向上进历史、正数向下回实时。
+    /// 指针在终端区内、没在拖、或标签/模式不对时返回 `None`。
+    fn select_autoscroll(&self) -> Option<(u16, u16, i32)> {
+        let (id, col, row) = self.select_drag?;
+        if self.screen != ScreenKind::Session || self.slots.get(self.work)?.id != id {
+            return None;
+        }
+        let session = self.slots.get(self.work)?.session.as_ref()?;
+        if session.word_grab() || session.mode != TermMode::Embedded {
+            return None;
+        }
+        let area = ui::session_emu_rect(self.last_area, self.footer_rows(self.work));
+        autoscroll_plan(area, col, row)
+    }
+
+    fn autoscroll_selection(&mut self) {
+        let Some((col, edge_row, step)) = self.select_autoscroll() else {
+            return;
+        };
+        let area = ui::session_emu_rect(self.last_area, self.footer_rows(self.work));
+        let mut stuck = false;
+        if let Some(s) = &mut self.slots[self.work].session {
+            stuck = !s.scroll_by(step);
+            // 端点钉在最近的边上：视图滚一格，选区就多长一行。
+            s.update_selection(area, col, edge_row);
+        }
+        if stuck {
+            // 到头了还停在区外：松手事件可能丢在窗口外，这里主动停表，
+            // 免得视图到顶后还每 50ms 空转重画。
+            self.select_drag = None;
         }
     }
 
     fn handle_mouse_release(&mut self, column: u16, row: u16) {
+        // 不是从终端区按下的松手（点在标题栏、弹窗上等）：不动既有选区。
+        if self.select_drag.take().is_none() {
+            return;
+        }
         if self.screen != ScreenKind::Session {
             return;
         }
         let area = ui::session_emu_rect(self.last_area, self.footer_rows(self.work));
-        let text = match &mut self.slots[self.work].session {
+        let (copyable, text) = match &mut self.slots[self.work].session {
             Some(s) => {
-                s.update_selection(column, row);
-                s.selected_text(area)
+                if !s.word_grab() {
+                    s.update_selection(area, column, row);
+                }
+                let copyable = s.selection_is_copyable();
+                let text = s.selected_text(area);
+                s.end_word_grab();
+                (copyable, text)
             }
             None => return,
         };
-        if !text.is_empty() {
-            term::copy_osc52(&text);
-            let n = text.chars().count();
-            self.slots[self.work].status = Some(format!("已复制 {n} 个字符（OSC 52 剪贴板）"));
+        // 原地单击只清空选区：不把光标下的一个字符悄悄塞进剪贴板。
+        if !copyable || text.is_empty() {
+            if let Some(s) = &mut self.slots[self.work].session {
+                s.clear_selection();
+            }
+            return;
         }
+        term::copy_osc52(&text);
+        let n = text.chars().count();
+        self.slots[self.work].status = Some(format!("已复制 {n} 个字符（OSC 52 剪贴板）"));
     }
 
     /// 滚轮：会话=回看历史；浏览器=移动选择（列表窗口跟随滚动）。
@@ -4761,6 +4948,13 @@ impl App {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('m') => self.ports_open = false,
             _ => {}
+        }
+    }
+
+    /// 磁盘挂载点小面板：只读，Esc/q 关闭；任意其它键也放它走（避免挡住终端输入）。
+    fn handle_disk_popup_key(&mut self, key: &KeyEvent) {
+        if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+            self.disk_popup = false;
         }
     }
 
@@ -7375,6 +7569,34 @@ mod metrics_tests {
         );
     }
 
+    /// 跟单轮只带回最满那一块，但底栏平铺的另外几块必须留着；
+    /// 下一轮普查再整表换新（挂载点增删只有普查看得见）。
+    #[test]
+    fn a_follow_round_updates_one_mount_without_dropping_the_others() {
+        let mut m = Metrics::default();
+        m.adopt(&probe(concat!(
+            "ellsm1\n",
+            "/dev/sda1 2000 1500 500 75% /\n",
+            "/dev/sdb1 4000 3520 480 88% /data\n",
+            "/dev/sdc1 1000 400 600 40% /home\n",
+        )));
+        assert_eq!(m.disks.len(), 3, "普查要把整张挂载点表留下");
+        assert_eq!(m.disk.as_ref().map(|d| d.mount.as_str()), Some("/data"));
+
+        m.adopt(&probe("ellsm1\n/dev/sdb1 4000 3760 240 94% /data\n"));
+        assert_eq!(m.disks.len(), 3, "跟单轮不能把别的盘冲掉");
+        assert_eq!(m.disk.as_ref().map(|d| d.percent), Some(94));
+        assert_eq!(
+            m.disks.iter().find(|d| d.mount == "/data").map(|d| d.percent),
+            Some(94)
+        );
+
+        // 到普查点：整表替换，挂载点删掉一块就真的少一块。
+        m.disk_rounds = 0;
+        m.adopt(&probe("ellsm1\n/dev/sdb1 4000 3760 240 94% /data\n"));
+        assert_eq!(m.disks.len(), 1, "普查结果就是新的全部挂载点");
+    }
+
     /// 没数的那一轮要**留着上次的数**：那一格空掉比旧一秒看起来都像坏了。
     #[test]
     fn the_disk_cell_keeps_its_number_between_queries() {
@@ -7455,5 +7677,41 @@ mod metrics_tests {
         );
         m.adopt(&probe(ROUND1));
         assert_eq!(m.load, None, "这台机器不给 loadavg 就该空着，不是 0");
+    }
+}
+
+#[cfg(test)]
+mod mouse_tests {
+    use super::{autoscroll_plan, is_double_click};
+    use ratatui::layout::Rect;
+
+    /// 拖出终端区才滚：越得越远每跳越多，封顶 12 行；区内返回 None。
+    #[test]
+    fn dragging_past_the_edge_scrolls_faster_the_further_you_go() {
+        let area = Rect::new(0, 3, 80, 10); // 可视行 3..=12
+        assert_eq!(autoscroll_plan(area, 5, 6), None, "区内不滚");
+        assert_eq!(autoscroll_plan(area, 5, 3), None, "顶行仍是区内");
+        assert_eq!(autoscroll_plan(area, 5, 12), None, "末行仍是区内");
+        assert_eq!(autoscroll_plan(area, 5, 2), Some((5, 3, -2)), "上越一行滚两行");
+        assert_eq!(autoscroll_plan(area, 5, 0), Some((5, 3, -4)));
+        assert_eq!(autoscroll_plan(area, 5, 13), Some((5, 12, 2)), "下越一行滚两行");
+        assert_eq!(
+            autoscroll_plan(area, 5, 12 + 40),
+            Some((5, 12, 12)),
+            "再远也封顶 12 行"
+        );
+        assert_eq!(autoscroll_plan(Rect::new(0, 3, 80, 0), 5, 0), None);
+    }
+
+    /// 双击只认"同一格 + 500ms 内"：隔了格子是两次单击，超时也是两次单击。
+    #[test]
+    fn a_double_click_needs_time_and_the_same_cell() {
+        let t0 = std::time::Instant::now();
+        let at = |ms| t0 + std::time::Duration::from_millis(ms);
+        assert!(is_double_click(Some((t0, 10, 5)), at(450), 10, 5));
+        assert!(is_double_click(Some((t0, 10, 5)), at(500), 10, 5));
+        assert!(!is_double_click(Some((t0, 10, 5)), at(501), 10, 5));
+        assert!(!is_double_click(Some((t0, 10, 5)), at(50), 11, 5));
+        assert!(!is_double_click(None, t0, 10, 5));
     }
 }
