@@ -1224,7 +1224,7 @@ dependencies = [
 
 [[package]]
 name = "ells"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1255,7 +1255,7 @@ dependencies = [
 
 [[package]]
 name = "ells-core"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "anyhow",
  "argon2 0.5.3",
@@ -1283,7 +1283,7 @@ dependencies = [
 
 [[package]]
 name = "ells-term"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "crossterm",
  "vt100",
@@ -1291,7 +1291,7 @@ dependencies = [
 
 [[package]]
 name = "ells-transfer"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "anyhow",
  "futures",

@@ -10,6 +10,8 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 base64 = "0.22"
+# 容器详情里的创建/启动时间格式化成本地时间
+chrono = "0.4"
 clap.workspace = true
 dirs.workspace = true
 crossterm.workspace = true

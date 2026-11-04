@@ -23,7 +23,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{mpsc, oneshot};
 use zeroize::Zeroizing;
 
-use crate::containers::DockerView;
+use crate::containers::{
+    action_label, action_needs_confirm, detail_copy_text, ContainerAction, DockerTab, DockerView,
+    ListLine, MenuChoice,
+};
 use crate::events::{self, AppEvent};
 use crate::keybinds::{Action, Chord};
 use crate::session::{SessionAction, SessionState, TermMode};
@@ -625,6 +628,12 @@ const DOCKER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 
 /// 几百个容器的 Engine JSON 也不过几百 KB，留足空间同时挡住失控输出。
 const DOCKER_MAX_BYTES: usize = 2 * 1024 * 1024;
+
+/// 容器详情要看 inspect + stats 两跳，预算比列表宽一点。
+const DOCKER_DETAIL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(14);
+
+/// stop/restart 自带 10 秒宽限，动作自己的超时得比它长。
+const DOCKER_ACTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// 连续这么多轮回包是空的（这台机器什么都不给），就认定它采不到：停止轮询，把那一行
 /// 还给终端。
@@ -1662,6 +1671,12 @@ impl App {
                 AppEvent::DockerContainers { seq, res, .. } => {
                     self.on_docker_containers(self.work, seq, res)
                 }
+                AppEvent::DockerAction {
+                    action, name, res, ..
+                } => self.on_docker_action(self.work, action, name, res),
+                AppEvent::DockerDetail { seq, res, .. } => {
+                    self.on_docker_detail(self.work, seq, res)
+                }
                 AppEvent::Conflict { prompt, .. } => self.ask_conflict(prompt),
                 AppEvent::ImportHosts(hosts) => self.import_hosts(hosts),
                 AppEvent::ExportSshConfig => self.export_ssh_config(),
@@ -2282,6 +2297,8 @@ impl App {
             | AppEvent::MetricsTick { slot, .. }
             | AppEvent::MetricsProbe { slot, .. }
             | AppEvent::DockerContainers { slot, .. }
+            | AppEvent::DockerAction { slot, .. }
+            | AppEvent::DockerDetail { slot, .. }
             | AppEvent::Conflict { slot, .. }
             | AppEvent::SftpCwd { slot, .. }
             | AppEvent::ZmodemClear { slot, .. }
@@ -2727,19 +2744,75 @@ impl App {
             }
             return;
         }
-        // 容器视图：点外面关；点中某一行就选它。
+        // 容器视图：详情弹窗 → 操作菜单 → 列表，由内到外吃点击。
         if self.slots[self.work].docker.open {
-            let detail = self.slots[self.work].docker.detail_rows();
-            let rows = self.slots[self.work].docker.rows_len();
-            if !hit(ui::docker_popup_rect(self.last_area, rows, detail), column, row) {
-                self.slots[self.work].docker.close();
-            } else {
-                let list = ui::docker_list_rect(self.last_area, rows, detail);
-                if hit(list, column, row) {
-                    let start = ui::docker_scroll_offset(rows, list.height as usize, self.slots[self.work].docker.selected);
-                    let idx = start + (row - list.y) as usize;
-                    if idx < rows {
-                        self.slots[self.work].docker.selected = idx;
+            if self.slots[self.work].docker.detail.open {
+                if !hit(ui::docker_detail_rect(self.last_area), column, row) {
+                    self.slots[self.work].docker.close_detail();
+                }
+                return;
+            }
+            let menu_state = self.slots[self.work].docker.menu.as_ref().map(|m| {
+                (m.body_rows(), m.confirm.is_some(), m.busy, m.choices.len())
+            });
+            if let Some((body, confirming, busy, count)) = menu_state {
+                let panel = ui::docker_menu_rect(self.last_area, body);
+                if !hit(panel, column, row) {
+                    self.slots[self.work].docker.menu = None;
+                    return;
+                }
+                let inner = ui::docker_menu_inner(self.last_area, body);
+                if !confirming && !busy && hit(inner, column, row) {
+                    let idx = (row - inner.y) as usize;
+                    if idx < count {
+                        if let Some(menu) = self.slots[self.work].docker.menu.as_mut() {
+                            menu.selected = idx;
+                        }
+                        self.activate_docker_menu_choice();
+                    }
+                }
+                return;
+            }
+
+            let v = &mut self.slots[self.work].docker;
+            let total = v.line_count();
+            if !hit(ui::docker_popup_rect(self.last_area, total), column, row) {
+                v.close();
+                return;
+            }
+            let list = ui::docker_list_rect(self.last_area, total);
+            if hit(list, column, row) {
+                let visible = list.height as usize;
+                let picked = (row - list.y) as usize;
+                match v.tab {
+                    DockerTab::Containers => {
+                        let lines = v.list_lines();
+                        let start = ui::docker_scroll_window(lines.len(), visible, v.scroll);
+                        if let Some(line) = lines.get(start + picked) {
+                            match line {
+                                ListLine::Container { index } => {
+                                    let was_selected = v.selected == *index;
+                                    v.selected = *index;
+                                    // 再点一次选中的行就展开/收起，和普通表格的展开一致
+                                    if was_selected {
+                                        v.toggle_expanded();
+                                    }
+                                }
+                                ListLine::Port { container, .. } => v.selected = *container,
+                                ListLine::More { container, .. } => {
+                                    v.selected = *container;
+                                    v.toggle_expanded();
+                                }
+                            }
+                            v.ensure_selected_visible(visible);
+                        }
+                    }
+                    DockerTab::Ports => {
+                        let len = v.ports().len();
+                        let start = ui::docker_selection_window(len, visible, v.selected);
+                        if start + picked < len {
+                            v.selected = start + picked;
+                        }
                     }
                 }
             }
@@ -2990,7 +3063,28 @@ impl App {
     /// 滚轮：会话=回看历史；浏览器=移动选择（列表窗口跟随滚动）。
     fn handle_scroll(&mut self, delta: i8) {
         if self.slots[self.work].docker.open {
-            self.slots[self.work].docker.move_by(if delta > 0 { 1 } else { -1 });
+            if self.slots[self.work].docker.detail.open {
+                let visible = ui::docker_detail_body_height(self.last_area).max(1);
+                self.slots[self.work]
+                    .docker
+                    .scroll_detail(if delta > 0 { 3 } else { -3 }, visible);
+                return;
+            }
+            if let Some(menu) = self.slots[self.work].docker.menu.as_mut() {
+                if !menu.busy && menu.confirm.is_none() {
+                    menu.move_by(if delta > 0 { 1 } else { -1 });
+                }
+                return;
+            }
+            let visible = self.docker_visible_rows();
+            let v = &mut self.slots[self.work].docker;
+            let before = v.scroll;
+            v.scroll_by(if delta > 0 { 3 } else { -3 }, visible);
+            // 已经滚到头：改挪选中行，不会出现"滚轮没反应"
+            if v.scroll == before {
+                v.move_by(if delta > 0 { 1 } else { -1 });
+                v.ensure_selected_visible(visible);
+            }
             return;
         }
         match self.screen {
@@ -5033,7 +5127,32 @@ impl App {
         });
     }
 
+    /// 弹窗盖住列表：可见行数得和绘制用的是同一份几何。
+    fn docker_visible_rows(&self) -> usize {
+        let v = &self.slots[self.work].docker;
+        ui::docker_list_rect(self.last_area, v.line_count())
+            .height
+            .max(1) as usize
+    }
+
+    fn docker_target(&self) -> Option<ells_core::ssh::ProbeTarget> {
+        self.slots[self.work]
+            .session
+            .as_ref()
+            .and_then(|s| s.session.probe_target())
+    }
+
     fn handle_docker_key(&mut self, key: &KeyEvent) {
+        if self.slots[self.work].docker.detail.open {
+            self.handle_docker_detail_key(key);
+            return;
+        }
+        if self.slots[self.work].docker.menu.is_some() {
+            self.handle_docker_menu_key(key);
+            return;
+        }
+
+        let visible = self.docker_visible_rows();
         let mut reload = false;
         let mut copied = false;
         {
@@ -5043,13 +5162,31 @@ impl App {
                     v.close();
                     return;
                 }
-                KeyCode::Up | KeyCode::Char('k') => v.move_by(-1),
-                KeyCode::Down | KeyCode::Char('j') => v.move_by(1),
-                KeyCode::Home | KeyCode::Char('g') => v.selected = 0,
-                KeyCode::End | KeyCode::Char('G') => {
-                    v.selected = v.rows_len().saturating_sub(1)
+                KeyCode::Up | KeyCode::Char('k') => {
+                    v.move_by(-1);
+                    v.ensure_selected_visible(visible);
                 }
-                KeyCode::Enter | KeyCode::Char(' ') => v.expanded = !v.expanded,
+                KeyCode::Down | KeyCode::Char('j') => {
+                    v.move_by(1);
+                    v.ensure_selected_visible(visible);
+                }
+                KeyCode::PageUp => v.scroll_by(-(visible as isize), visible),
+                KeyCode::PageDown => v.scroll_by(visible as isize, visible),
+                KeyCode::Home | KeyCode::Char('g') => {
+                    v.selected = 0;
+                    v.ensure_selected_visible(visible);
+                }
+                KeyCode::End | KeyCode::Char('G') => {
+                    v.selected = v.rows_len().saturating_sub(1);
+                    v.ensure_selected_visible(visible);
+                }
+                KeyCode::Enter => {
+                    v.open_menu();
+                }
+                KeyCode::Char(' ') => {
+                    v.toggle_expanded();
+                    v.ensure_selected_visible(visible);
+                }
                 KeyCode::Tab | KeyCode::Char('p') => v.toggle_tab(),
                 KeyCode::Char('a') => {
                     v.all = !v.all;
@@ -5073,6 +5210,168 @@ impl App {
         }
     }
 
+    fn handle_docker_menu_key(&mut self, key: &KeyEvent) {
+        enum Outcome {
+            Nothing,
+            Close,
+            Run(ContainerAction),
+        }
+        let mut outcome = Outcome::Nothing;
+        let mut activate = false;
+        {
+            let v = &mut self.slots[self.work].docker;
+            let Some(menu) = v.menu.as_mut() else { return };
+            if menu.busy {
+                return;
+            }
+            if let Some(action) = menu.confirm {
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('q') => {
+                        menu.confirm = None;
+                        menu.error = None;
+                    }
+                    KeyCode::Enter | KeyCode::Char('y') => outcome = Outcome::Run(action),
+                    _ => {}
+                }
+            } else {
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') => outcome = Outcome::Close,
+                    KeyCode::Up | KeyCode::Char('k') => menu.move_by(-1),
+                    KeyCode::Down | KeyCode::Char('j') => menu.move_by(1),
+                    KeyCode::Home => menu.selected = 0,
+                    KeyCode::End => menu.selected = menu.choices.len().saturating_sub(1),
+                    KeyCode::Enter => activate = true,
+                    _ => {}
+                }
+            }
+        }
+        match outcome {
+            Outcome::Nothing => {}
+            Outcome::Close => self.slots[self.work].docker.menu = None,
+            Outcome::Run(action) => self.start_docker_action(action),
+        }
+        if activate {
+            self.activate_docker_menu_choice();
+        }
+    }
+
+    /// 对菜单当前项做决定：详情直接开，危险动作先挂起等确认。
+    fn activate_docker_menu_choice(&mut self) {
+        let mut detail = false;
+        let mut run = None;
+        {
+            let v = &mut self.slots[self.work].docker;
+            let Some(menu) = v.menu.as_mut() else { return };
+            if menu.busy || menu.confirm.is_some() {
+                return;
+            }
+            match menu.current() {
+                Some(MenuChoice::Detail) => detail = true,
+                Some(MenuChoice::Act(action)) => {
+                    if action_needs_confirm(action) {
+                        menu.confirm = Some(action);
+                        menu.error = None;
+                    } else {
+                        run = Some(action);
+                    }
+                }
+                None => {}
+            }
+        }
+        if detail {
+            self.open_docker_detail();
+        } else if let Some(action) = run {
+            self.start_docker_action(action);
+        }
+    }
+
+    fn handle_docker_detail_key(&mut self, key: &KeyEvent) {
+        let visible = ui::docker_detail_body_height(self.last_area).max(1);
+        let mut copied = false;
+        {
+            let v = &mut self.slots[self.work].docker;
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    v.close_detail();
+                    return;
+                }
+                KeyCode::Up | KeyCode::Char('k') => v.scroll_detail(-1, visible),
+                KeyCode::Down | KeyCode::Char('j') => v.scroll_detail(1, visible),
+                KeyCode::PageUp => v.scroll_detail(-(visible as isize), visible),
+                KeyCode::PageDown => v.scroll_detail(visible as isize, visible),
+                KeyCode::Home | KeyCode::Char('g') => v.detail.scroll = 0,
+                KeyCode::End | KeyCode::Char('G') => v.detail_scroll_end(visible),
+                KeyCode::Char('c') | KeyCode::Char('y') => {
+                    if let Some(data) = &v.detail.data {
+                        crate::term::copy_osc52(&detail_copy_text(data));
+                        copied = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if copied {
+            self.slots[self.work].status = Some("已复制容器详情".to_string());
+        }
+    }
+
+    /// 菜单里选了【详情】：inspect + 一次性资源占用，同一个弹窗展示。
+    fn open_docker_detail(&mut self) {
+        let Some(target) = self.docker_target() else {
+            self.slots[self.work].status = Some("容器详情需要一条活着的连接".to_string());
+            return;
+        };
+        let (id, name) = {
+            let v = &self.slots[self.work].docker;
+            let Some(menu) = v.menu.as_ref() else { return };
+            (menu.container_id.clone(), menu.container_name.clone())
+        };
+        let seq = self.slots[self.work].docker.begin_detail(&name);
+        let slot = self.slots[self.work].id;
+        let tx = self.event_tx.clone();
+        tokio::spawn(async move {
+            let res = target
+                .docker_detail(&id, DOCKER_DETAIL_TIMEOUT, DOCKER_MAX_BYTES)
+                .await
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(AppEvent::DockerDetail { slot, seq, res });
+        });
+    }
+
+    fn start_docker_action(&mut self, action: ContainerAction) {
+        let Some(target) = self.docker_target() else {
+            if let Some(menu) = self.slots[self.work].docker.menu.as_mut() {
+                menu.busy = false;
+                menu.error = Some("连接已断开，没法执行操作".to_string());
+            }
+            return;
+        };
+        let (id, name) = {
+            let v = &mut self.slots[self.work].docker;
+            let Some(menu) = v.menu.as_mut() else { return };
+            if menu.busy {
+                return;
+            }
+            menu.busy = true;
+            menu.error = None;
+            (menu.container_id.clone(), menu.container_name.clone())
+        };
+        let slot = self.slots[self.work].id;
+        let tx = self.event_tx.clone();
+        tokio::spawn(async move {
+            let res = target
+                .docker_action(&id, action, DOCKER_ACTION_TIMEOUT)
+                .await
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(AppEvent::DockerAction {
+                slot,
+                action,
+                name,
+                res,
+            });
+        });
+    }
+
     fn on_docker_containers(
         &mut self,
         idx: usize,
@@ -5080,6 +5379,40 @@ impl App {
         res: std::result::Result<Vec<ells_core::docker::DockerContainer>, String>,
     ) {
         self.slots[idx].docker.adopt(seq, res);
+    }
+
+    fn on_docker_action(
+        &mut self,
+        idx: usize,
+        action: ContainerAction,
+        name: String,
+        res: std::result::Result<(), String>,
+    ) {
+        match res {
+            Ok(()) => {
+                self.slots[idx].docker.menu = None;
+                self.slots[idx].status = Some(format!("已{}「{}」", action_label(action), name));
+                if idx == self.work {
+                    self.open_docker();
+                }
+            }
+            Err(e) => {
+                if let Some(menu) = self.slots[idx].docker.menu.as_mut() {
+                    menu.busy = false;
+                    menu.confirm = None;
+                    menu.error = Some(e);
+                }
+            }
+        }
+    }
+
+    fn on_docker_detail(
+        &mut self,
+        idx: usize,
+        seq: u64,
+        res: std::result::Result<ells_core::docker::ContainerDetail, String>,
+    ) {
+        self.slots[idx].docker.adopt_detail(seq, res);
     }
 
     /// 面板上的行：有转发规则的主机（没规则的不显示，否则整台机器列表都在）。

@@ -450,6 +450,186 @@ impl ProbeTarget {
         };
         Err(anyhow!("这台机器拿不到容器列表（{why}）"))
     }
+
+    /// 执行一个容器生命周期动作。socket 能开通道就走 Engine API；
+    /// 只有**开通道**失败才回落 CLI——停止/重启不是幂等操作，
+    /// 不能在"请求可能已经发出"的情况下再执行一遍。
+    pub async fn docker_action(
+        &self,
+        id: &str,
+        action: crate::docker::ContainerAction,
+        timeout: std::time::Duration,
+    ) -> Result<()> {
+        if !crate::docker::is_safe_container_id(id) {
+            bail!("容器 ID 含有不安全的字符");
+        }
+        let channel = match self
+            .handle
+            .channel_open_direct_streamlocal("/var/run/docker.sock")
+            .await
+        {
+            Ok(channel) => channel,
+            // 只有这里能安全回落：请求还没发出去。
+            Err(_) => {
+                let cmd = format!(
+                    "{} >/dev/null 2>&1 && echo ELLS_DOCKER_OK || echo ELLS_DOCKER_FAILED",
+                    action.cli_command(id)
+                );
+                let text = self.probe(&cmd, timeout, 64 * 1024).await?;
+                if text.contains("ELLS_DOCKER_OK") {
+                    return Ok(());
+                }
+                bail!("远端 docker 命令执行失败（没有 docker CLI，或容器当前状态不允许该操作）");
+            }
+        };
+        let mut stream = channel.into_stream();
+        let request = format!(
+            "{} {} HTTP/1.1\r\nHost: docker\r\nAccept: application/json\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            action.method(),
+            action.api_path(id)
+        );
+        let raw = tokio::time::timeout(timeout, async move {
+            stream.write_all(request.as_bytes()).await?;
+            stream.flush().await?;
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 8192];
+            loop {
+                let n = stream.read(&mut chunk).await?;
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.len() >= 256 * 1024 {
+                    break;
+                }
+            }
+            Ok::<_, std::io::Error>(buf)
+        })
+        .await
+        .context("Docker 动作等待超时")??;
+        let status = crate::docker::parse_http_status(&raw).map_err(|e| anyhow!(e))?;
+        // 204 是成功；304 表示"已经在目标状态"（停止已停的、启动已启动的），同样算成功。
+        if (200..300).contains(&status) || status == 304 {
+            return Ok(());
+        }
+        let body = raw
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .map(|i| {
+                String::from_utf8_lossy(&raw[i + 4..])
+                    .trim()
+                    .chars()
+                    .take(160)
+                    .collect::<String>()
+            })
+            .unwrap_or_default();
+        if body.is_empty() {
+            bail!("Docker 返回 HTTP {status}")
+        } else {
+            bail!("Docker 返回 HTTP {status}：{body}")
+        }
+    }
+
+    /// 详情：inspect 的摘录 + 运行中的一次性资源占用。
+    /// 资源占用读不到不影响详情本身，原因留在 `stats_error` 里。
+    pub async fn docker_detail(
+        &self,
+        id: &str,
+        timeout: std::time::Duration,
+        max_bytes: usize,
+    ) -> Result<crate::docker::ContainerDetail> {
+        if !crate::docker::is_safe_container_id(id) {
+            bail!("容器 ID 含有不安全的字符");
+        }
+        let deadline = tokio::time::Instant::now() + timeout;
+        let path = format!("/containers/{id}/json");
+        let mut socket_err = None;
+        let detail = match budget(deadline) {
+            Some(rest) => match self.docker_get(&path, rest, max_bytes).await {
+                Ok(text) => match crate::docker::parse_inspect_json(&text) {
+                    Ok(detail) => Some(detail),
+                    Err(e) => {
+                        socket_err = Some(e);
+                        None
+                    }
+                },
+                Err(e) => {
+                    socket_err = Some(format!("{e:#}"));
+                    None
+                }
+            },
+            None => {
+                socket_err = Some("超时".to_string());
+                None
+            }
+        };
+        let mut detail = match detail {
+            Some(detail) => detail,
+            None => {
+                let Some(rest) = budget(deadline) else {
+                    bail!(
+                        "读不到容器详情（socket: {}；没有剩余时间）",
+                        socket_err.unwrap_or_else(|| "超时".to_string())
+                    );
+                };
+                let cmd = format!("docker inspect {id} 2>/dev/null || echo ELLS_DOCKER_FAILED");
+                let text = self.probe(&cmd, rest, max_bytes).await?;
+                if text.contains("ELLS_DOCKER_FAILED") || text.trim().is_empty() {
+                    bail!(
+                        "读不到容器详情（socket: {}；docker inspect: 远端没有 docker 命令或无权访问）",
+                        socket_err.unwrap_or_else(|| "不可用".to_string())
+                    );
+                }
+                crate::docker::parse_inspect_json(&text).map_err(|e| anyhow!(e))?
+            }
+        };
+        if detail.is_active() {
+            match budget(deadline) {
+                Some(rest) => {
+                    let stats_timeout = rest.min(std::time::Duration::from_secs(6));
+                    match self.docker_stats(id, stats_timeout, 256 * 1024).await {
+                        Ok(stats) => detail.stats = Some(stats),
+                        Err(e) => detail.stats_error = Some(format!("{e:#}")),
+                    }
+                }
+                None => detail.stats_error = Some("读取资源占用超时".to_string()),
+            }
+        }
+        Ok(detail)
+    }
+
+    async fn docker_get(
+        &self,
+        path: &str,
+        timeout: std::time::Duration,
+        max_bytes: usize,
+    ) -> Result<String> {
+        let raw = docker_http(&self.handle, "GET", path, timeout, max_bytes).await?;
+        let body = crate::docker::parse_http_response(&raw).map_err(|e| anyhow!(e))?;
+        Ok(String::from_utf8_lossy(&body).into_owned())
+    }
+
+    async fn docker_stats(
+        &self,
+        id: &str,
+        timeout: std::time::Duration,
+        max_bytes: usize,
+    ) -> Result<crate::docker::ContainerStats> {
+        let path = format!("/containers/{id}/stats?stream=false");
+        match self.docker_get(&path, timeout, max_bytes).await {
+            Ok(text) => crate::docker::parse_stats_engine(&text).map_err(|e| anyhow!(e)),
+            Err(e) => {
+                let cmd = format!(
+                    "docker stats --no-stream --format '{{{{json .}}}}' {id} 2>/dev/null || echo ELLS_DOCKER_FAILED"
+                );
+                let text = self.probe(&cmd, timeout, max_bytes).await?;
+                if text.contains("ELLS_DOCKER_FAILED") || text.trim().is_empty() {
+                    bail!("读不到资源占用（socket: {e:#}；docker stats 不可用）");
+                }
+                crate::docker::parse_stats_cli(&text).map_err(|e| anyhow!(e))
+            }
+        }
+    }
 }
 
 /// 凑到数据才算成功：一个数都没有就报错，让界面那句状态话说明"这台采不到"。
@@ -673,20 +853,40 @@ async fn handle_docker_socket(
     timeout: std::time::Duration,
     max_bytes: usize,
 ) -> Result<Vec<crate::docker::DockerContainer>> {
-    let channel = handle
-        .channel_open_direct_streamlocal("/var/run/docker.sock")
-        .await
-        .context("服务器不允许直连 Docker socket")?;
-    let mut stream = channel.into_stream();
     let path = if all {
         "/containers/json?all=1"
     } else {
         "/containers/json"
     };
+    let raw = docker_http(handle, "GET", path, timeout, max_bytes).await?;
+    let body = crate::docker::parse_http_response(&raw).map_err(|e| anyhow!(e))?;
+    let text = String::from_utf8_lossy(&body);
+    crate::docker::parse_engine_json(&text).map_err(|e| anyhow!(e))
+}
+
+/// 在 streamlocal 通道上说完一回合 HTTP，返回原始响应（状态行 + 头 + 体）。
+/// 得到 304 也要算成功的地方（动作）由调用方自己看状态行。
+async fn docker_http(
+    handle: &russh::client::Handle<Handler>,
+    method: &str,
+    path: &str,
+    timeout: std::time::Duration,
+    max_bytes: usize,
+) -> Result<Vec<u8>> {
+    let channel = handle
+        .channel_open_direct_streamlocal("/var/run/docker.sock")
+        .await
+        .context("服务器不允许直连 Docker socket")?;
+    let mut stream = channel.into_stream();
+    let body_header = if method == "GET" {
+        ""
+    } else {
+        "Content-Length: 0\r\n"
+    };
     let request = format!(
-        "GET {path} HTTP/1.1\r\nHost: docker\r\nAccept: application/json\r\nConnection: close\r\n\r\n"
+        "{method} {path} HTTP/1.1\r\nHost: docker\r\nAccept: application/json\r\n{body_header}Connection: close\r\n\r\n"
     );
-    let raw = tokio::time::timeout(timeout, async move {
+    tokio::time::timeout(timeout, async move {
         stream.write_all(request.as_bytes()).await?;
         stream.flush().await?;
         let mut buf = Vec::new();
@@ -704,10 +904,8 @@ async fn handle_docker_socket(
         Ok::<_, std::io::Error>(buf)
     })
     .await
-    .context("Docker socket 读超时")??;
-    let body = crate::docker::parse_http_response(&raw).map_err(|e| anyhow!(e))?;
-    let text = String::from_utf8_lossy(&body);
-    crate::docker::parse_engine_json(&text).map_err(|e| anyhow!(e))
+    .context("Docker socket 读超时")?
+    .context("读取 Docker socket 失败")
 }
 
 /// Establish an authenticated handle to `host`, tunneling through the/// configured jump host (recursively, ProxyJump style) when present.

@@ -138,6 +138,19 @@ pub enum AppEvent {
         seq: u64,
         res: std::result::Result<Vec<ells_core::docker::DockerContainer>, String>,
     },
+    /// 启动/停止/重启/删除等动作在远端执行完了。`name` 只用于状态行提示。
+    DockerAction {
+        slot: u32,
+        action: ells_core::docker::ContainerAction,
+        name: String,
+        res: std::result::Result<(), String>,
+    },
+    /// 容器详情（inspect + 一次性资源占用）回来了。`seq` 顶掉关掉/换容器前的旧回包。
+    DockerDetail {
+        slot: u32,
+        seq: u64,
+        res: std::result::Result<ells_core::docker::ContainerDetail, String>,
+    },
     /// 自更新：后台检查完成。Ok(Some(tag)) = 有更新，Ok(None) = 已是最新。
     UpdateChecked(std::result::Result<Option<String>, String>),
     /// 用户在确认弹窗里点了【更 新】（回调够不着 App，只能再发一个事件回来）。
