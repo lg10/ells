@@ -38,6 +38,12 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         ScreenKind::Session => draw_session(f, app),
         ScreenKind::Browser => draw_browser(f, app),
     }
+    // 内置编辑器盖满整屏：它属于打开它的那一格，先于其它弹窗画，
+    // 再让确认/输入弹窗叠在它上面（保存失败、冲突都要能看见）。
+    if app.slots[app.active].editor.is_some() {
+        let area = app.last_area;
+        crate::editor::draw_panel(f, area, app);
+    }
     // 更新进度/待重启弹窗先画：它盖住列表与设置页，但确认弹窗仍要在它之上可答
     if app.update.modal() {
         draw_update_popup(f, app);
@@ -1622,7 +1628,7 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App) {
             crate::keybinds::platform_note(),
         ))),
         ("外观主题", std::borrow::Cow::Borrowed("设置页「界面主题」按 Enter 或 ←→ 循环四套：跟随终端（一处底色都不画，全用终端自己的主题，mac 终端/iTerm2/WezTerm/Windows Terminal 都合适，**四个平台默认都是它**）· 深色（画死黑底灰条，终端配色自己拿不准时的保底）· 高对比（去掉灰色小字，靠粗体与反显分层）· 浅色底（白底终端用深字）。切换即时预览，【保 存】才写入 settings.ini 的 theme=，【取消】还原。")),
-        ("文件浏览器", std::borrow::Cow::Borrowed("↑↓/滚轮 选择 · Enter 进入目录或下载 · u 上传文件 · U 上传整个目录 · d 下载 · m 新建目录 · n 重命名 · c 改权限（八进制 600/0644，只改权限位，不动属主和时间）· D 删除（递归，先确认）· Ctrl-C 取消全部在途传输 · r 刷新 · Backspace 上级 · Esc 返回终端")),
+        ("文件浏览器", std::borrow::Cow::Borrowed("↑↓/滚轮 选择 · Enter 进入目录或下载 · u 上传文件 · U 上传整个目录 · d 下载 · e 编辑（按「vi 打开方式」用内置面板或本地程序；取回到临时文件，保存后自动回传；取回时远端被人改过会先问要不要覆盖）· m 新建目录 · n 重命名 · c 改权限（八进制 600/0644，只改权限位，不动属主和时间）· D 删除（递归，先确认）· Ctrl-C 取消全部在途传输 · r 刷新 · Backspace 上级 · Esc 返回终端。会话终端里直接敲 vi / vim / nvim 文件名也走同一套：「设置 → vi 打开方式」默认在 ells 内置面板里改（行号 + 语法高亮，Ctrl-S 保存并回传、Ctrl-Q 退出），也可切「本地程序」用系统编辑器或「原生」交回远端 vi；只拦简单命令（选项 + 单个文件名），带管道、通配符、sudo 或补全/历史改过的行一律照旧交给远端")),
         ("主机表单", std::borrow::Cow::Borrowed("Tab/↓ 下一个字段 · ↑ 上一个 · ←→ 切换认证方式 · Ctrl-F 选私钥 · Ctrl-J 选跳板机 · Ctrl-C 清空当前字段 · 光标在「密码/私钥口令」上按 Ctrl-R 让它显形（再按一次遮回去）· Enter 在\"私钥路径/跳板机\"上直接打开选择器，保存要点【保 存】或聚焦后回车。带 ＊ 的别名、主机、用户是必填项，提交失败时只点缺的那几项的名。「分组」只影响列表归类与排序，光标停在这一栏时下面会列出已有分组和各自台数，敲同名即归入、敲新名即新建（末尾空格不算新分组）；「标签」用逗号分隔、过滤时按 #标签 命中；「转发」写 ssh 风格的 -L/-D 规则（见【端口转发】），想一列一列对着填就在列表页按 p（或隧道面板里按 Enter）进表格编辑器，本地端口那一格留空就是交给系统分配；这三栏留空即无。编辑已有主机不会丢掉它的收藏、备注和最近连接时间；按 a 新增时会把列表里选中的那台的用户/端口/认证方式/私钥路径/跳板/分组/标签/转发带过来，但别名、主机名和密码/口令一律留空 —— 身份和凭据要自己填")),
         ("解锁保险库", std::borrow::Cow::Borrowed("输入主密码后回车；首次使用会要求输入两遍（第 1 步定、第 2 步照抄一遍）。Tab 切换明文回显，确认自己没敲错再回车；回车后输入框下面亮起一条进度带，它按本机这一趟 argon2id 的真实耗时走（第一次没有实测值就按 1 秒估，最多先走到九成五，算完才收口），右边写清已用几秒。主密码不可找回，忘记只能删除 ~/.ells/vault.bin 重来。")),
         ("确认弹窗", std::borrow::Cow::Borrowed("←→/Tab 切换选项 · Enter 确认 · Esc 取消。传输冲突默认停在\"改名保留双方\"；主机密钥变更默认停在\"拒绝\"。")),
@@ -2165,7 +2171,7 @@ fn draw_browser(f: &mut Frame, app: &mut App) {
         );
     } else {
         let keys =
-            " ↑↓/滚轮 选择 · Enter 进入/下载 · u 上传文件 · U 上传目录 · d 下载 · m 新建目录 · n 重命名 · c 改权限 · D 删除 · Ctrl-C 取消传输 · r 刷新 · Esc 返回终端 ";
+            " ↑↓/滚轮 选择 · Enter 进入/下载 · u 上传文件 · U 上传目录 · d 下载 · e 本地编辑（保存自动回传）· m 新建目录 · n 重命名 · c 改权限 · D 删除 · Ctrl-C 取消传输 · r 刷新 · Esc 返回终端 ";
         f.render_widget(
             Paragraph::new(keys).style(Style::default().fg(theme::dim())),
             chunks[3],
@@ -3769,12 +3775,13 @@ fn clip_display(s: &str, width: usize) -> String {
 
 /// 设置弹窗面板。命中测试与绘制必须同源，加一行只改这一处。
 fn settings_panel(area: Rect) -> Rect {
-    centered(56, 14, area)
+    centered(56, 15, area)
 }
 
-/// 设置弹窗的 12 个可点击行：高亮 / 保活 / 主密码开关 / 修改主密码 / 快捷键 / 主题 /
-/// 检查更新 / 会话记录 / 主机指标 / 自动重连 / 保存 / 取消。必须与 draw_settings_overlay 的几何完全一致。
-pub fn settings_hit_rects(area: Rect) -> [Rect; 12] {
+/// 设置弹窗的 13 个可点击行：高亮 / 保活 / 主密码开关 / 修改主密码 / 快捷键 / 主题 /
+/// 检查更新 / 会话记录 / 主机指标 / 自动重连 / vi 打开方式 / 保存 / 取消。
+/// 必须与 draw_settings_overlay 的几何完全一致。
+pub fn settings_hit_rects(area: Rect) -> [Rect; 13] {
     let p = settings_panel(area);
     let ix = p.x + 1;
     let iy = p.y + 1;
@@ -3790,8 +3797,9 @@ pub fn settings_hit_rects(area: Rect) -> [Rect; 12] {
         Rect { x: ix, y: iy + 7, width: iw, height: 1 },
         Rect { x: ix, y: iy + 8, width: iw, height: 1 },
         Rect { x: ix, y: iy + 9, width: iw, height: 1 },
-        Rect { x: ix.saturating_add(iw / 2).saturating_sub(16), y: iy + 11, width: 14, height: 1 },
-        Rect { x: ix.saturating_add(iw / 2).saturating_add(2), y: iy + 11, width: 14, height: 1 },
+        Rect { x: ix, y: iy + 10, width: iw, height: 1 },
+        Rect { x: ix.saturating_add(iw / 2).saturating_sub(16), y: iy + 12, width: 14, height: 1 },
+        Rect { x: ix.saturating_add(iw / 2).saturating_add(2), y: iy + 12, width: 14, height: 1 },
     ]
 }
 
@@ -4017,7 +4025,27 @@ fn draw_settings_overlay(f: &mut Frame, app: &App) {
         ])),
         rects[9],
     );
-    // 行 10：操作提示（更新检查失败时这行让给它，长文案才放得下）
+    // 行 10：终端里手敲 vi / 浏览器 e 时怎么打开（内置面板 / 本地程序 / 原生）
+    let vi_color = if st.edit_open == crate::settings::EditOpen::Native {
+        theme::dim()
+    } else {
+        theme::accent()
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(" vi 打开方式：", row_base(focus == 10)),
+            Span::styled(
+                format!(" {} ", st.edit_open.label()),
+                row_base(focus == 10).fg(vi_color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "←→/Enter 切换 · 内置即终端内编辑",
+                row_base(focus == 10).fg(theme::dim()),
+            ),
+        ])),
+        rects[10],
+    );
+    // 行 11：操作提示（更新检查失败时这行让给它，长文案才放得下）
     let hint = match &app.update.error {
         Some(err) => format!(" 检查更新失败：{err}"),
         None => " ↑↓ 选择 · Enter/点击 修改 · ←→ 微调 · Esc 取消".to_string(),
@@ -4029,19 +4057,19 @@ fn draw_settings_overlay(f: &mut Frame, app: &App) {
                 .fg(if app.update.error.is_some() { theme::warn() } else { theme::dim() })
                 .bg(theme::bg()),
         ))),
-        Rect { x: rects[0].x, y: rects[0].y + 10, width: rects[0].width, height: 1 },
+        Rect { x: rects[0].x, y: rects[0].y + 11, width: rects[0].width, height: 1 },
     );
-    // 行 11：保存 / 取消按钮
+    // 行 12：保存 / 取消按钮
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             "【 保 存 】",
             Style::default()
                 .fg(theme::on_accent())
                 .bg(theme::accent_bg())
-                .add_modifier(if focus == 10 { Modifier::BOLD } else { Modifier::empty() })
-                .add_modifier(if focus == 10 { Modifier::UNDERLINED } else { Modifier::empty() }),
+                .add_modifier(if focus == 11 { Modifier::BOLD } else { Modifier::empty() })
+                .add_modifier(if focus == 11 { Modifier::UNDERLINED } else { Modifier::empty() }),
         ))),
-        rects[10],
+        rects[11],
     );
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -4049,10 +4077,10 @@ fn draw_settings_overlay(f: &mut Frame, app: &App) {
             Style::default()
                 .fg(theme::text())
                 .bg(theme::band())
-                .add_modifier(if focus == 11 { Modifier::BOLD } else { Modifier::empty() })
-                .add_modifier(if focus == 11 { Modifier::UNDERLINED } else { Modifier::empty() }),
+                .add_modifier(if focus == 12 { Modifier::BOLD } else { Modifier::empty() })
+                .add_modifier(if focus == 12 { Modifier::UNDERLINED } else { Modifier::empty() }),
         ))),
-        rects[11],
+        rects[12],
     );
 }
 
@@ -4419,15 +4447,15 @@ mod tests {
         let area = Rect::new(0, 0, 80, 24);
         let panel = settings_panel(area);
         let r = settings_hit_rects(area);
-        // 10 个可编辑项必须是连续的 10 行（… 会话记录 / 主机指标 / 自动重连）：
+        // 11 个可编辑项必须是连续的 11 行（… 主机指标 / 自动重连 / vi 打开方式）：
         // 加一行时鼠标命中不能错位，画的那一行也不能点到别的行为
-        for i in 1..10 {
+        for i in 1..11 {
             assert_eq!(r[i].y, r[i - 1].y + 1, "第 {i} 行和上一行不挨着");
         }
-        assert_eq!(r[9].y, panel.y + 10);
-        // 第 11 行是操作提示（不可点），按钮在它下面同一行
-        assert_eq!(r[10].y, r[11].y);
-        assert_eq!(r[10].y, panel.y + 12);
+        assert_eq!(r[10].y, panel.y + 11);
+        // 下一行是操作提示（不可点），按钮在它下面同一行
+        assert_eq!(r[11].y, r[12].y);
+        assert_eq!(r[11].y, panel.y + 13);
         for (i, rect) in r.iter().enumerate() {
             assert!(rect.right() <= panel.right(), "第 {i} 行超出面板右边界");
             assert!(rect.bottom() <= panel.bottom(), "第 {i} 行超出面板下边界");

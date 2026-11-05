@@ -1,4 +1,4 @@
-use vt100::{Callbacks, Parser, Screen};
+use vt100::{Callbacks, MouseProtocolEncoding, MouseProtocolMode, Parser, Screen};
 
 #[derive(Default)]
 pub struct TerminalEvents {
@@ -79,6 +79,18 @@ impl Emulator {
 
     pub fn size(&self) -> (u16, u16) {
         (self.rows, self.cols)
+    }
+
+    /// 远端是否开着 DECCKM（应用光标键）。vim/htop 启动时发 `smkx`
+    /// (`ESC [ ? 1 h`)，此后方向键必须按 SS3 编码，见 `encode`。
+    pub fn application_cursor(&self) -> bool {
+        self.parser.screen().application_cursor()
+    }
+
+    /// 远端有没有把鼠标要过去（1000/1002/1003），以及要的编码格式（1005/1006）。
+    pub fn mouse_protocol(&self) -> (MouseProtocolMode, MouseProtocolEncoding) {
+        let screen = self.parser.screen();
+        (screen.mouse_protocol_mode(), screen.mouse_protocol_encoding())
     }
 
     pub fn screen(&self) -> &Screen {
@@ -204,6 +216,7 @@ impl Emulator {
 #[cfg(test)]
 mod tests {
     use super::Emulator;
+    use vt100::{MouseProtocolEncoding, MouseProtocolMode};
 
     /// 自滚定时器只该在真的滚得动时开：到顶/到底必须能问出来，
     /// 否则拖到边界后每一跳都空转（以前还会因此把拖选状态清掉）。
@@ -224,6 +237,30 @@ mod tests {
         assert!(emu.can_scroll(1), "到顶后还能往下回");
         emu.set_scrollback(max / 2);
         assert!(emu.can_scroll(-1) && emu.can_scroll(1), "半中间两边都通");
+    }
+
+    /// vim 的 smkx/rmkx 必须能被读出来：方向键该发 CSI 还是 SS3 全靠它。
+    #[test]
+    fn tracks_application_cursor_mode_across_chunks() {
+        let mut emu = Emulator::new(3, 20);
+        assert!(!emu.application_cursor(), "默认是普通光标键模式");
+        // smkx = `ESC[?1h ESC=`，网络可能把它切成两块送进来
+        emu.process(b"\x1b[?1");
+        emu.process(b"h\x1b=");
+        assert!(emu.application_cursor(), "smkx 应打开应用光标键模式");
+        emu.process(b"\x1b[?1l\x1b>");
+        assert!(!emu.application_cursor(), "rmkx 应关掉应用光标键模式");
+    }
+
+    #[test]
+    fn reads_the_remote_mouse_protocol() {
+        let mut emu = Emulator::new(3, 20);
+        assert_eq!(emu.mouse_protocol(), (MouseProtocolMode::None, MouseProtocolEncoding::Default));
+        // vim 的 mouse=a：1002（按住拖动）+ 1006（SGR 坐标）
+        emu.process(b"\x1b[?1002h\x1b[?1006h");
+        assert_eq!(emu.mouse_protocol(), (MouseProtocolMode::ButtonMotion, MouseProtocolEncoding::Sgr));
+        emu.process(b"\x1b[?1002l\x1b[?1006l");
+        assert_eq!(emu.mouse_protocol(), (MouseProtocolMode::None, MouseProtocolEncoding::Default));
     }
 
     /// 内容行 `start..=end`（0 = 最早的历史行）的纯文本。取完会恢复当前回看偏移。

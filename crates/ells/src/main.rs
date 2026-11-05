@@ -2,6 +2,7 @@ mod app;
 mod cli;
 mod containers;
 mod dialog;
+mod editor;
 mod events;
 mod highlight;
 mod keybinds;
@@ -11,6 +12,7 @@ mod term;
 mod theme;
 mod ui;
 mod update;
+mod vi_edit;
 mod zmodem;
 
 use anyhow::Result;

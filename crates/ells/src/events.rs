@@ -1,7 +1,13 @@
-use crossterm::event::{Event as CrosstermEvent, KeyEvent, MouseEventKind};
+use std::path::PathBuf;
+
+use crossterm::event::{
+    Event as CrosstermEvent, KeyEvent, KeyModifiers, MouseButton as CrosstermMouseButton,
+    MouseEventKind,
+};
 use ells_core::ssh::{RemoteEvent, RemoteSession};
 use ells_core::vault::VaultKey;
 use ells_core::{Host, HostKeyPrompt, Probe, Vault, tunnel::TunnelEvent};
+use ells_term::MouseButton;
 use ells_transfer::{FileEntry, Progress};
 use futures::StreamExt;
 use tokio::sync::mpsc;
@@ -14,13 +20,34 @@ pub enum AppEvent {
     Paste(String),
     Resize(u16, u16),
     /// Left-button press at a terminal cell (for header buttons / progress bar).
-    MousePress { column: u16, row: u16 },
-    /// Left-button drag (text selection in the embedded terminal).
-    MouseDrag { column: u16, row: u16 },
-    /// Left-button release (finish selection → copy).
-    MouseRelease { column: u16, row: u16 },
-    /// Mouse wheel: -1 = up, +1 = down (file browser / scrollback).
-    MouseScroll { delta: i8 },
+    /// 远端应用开了鼠标报告时，这个事件也会被转成它要的报文（含右键/中键）。
+    MousePress {
+        column: u16,
+        row: u16,
+        button: MouseButton,
+        modifiers: KeyModifiers,
+    },
+    /// Button drag (text selection in the embedded terminal, or remote motion).
+    MouseDrag {
+        column: u16,
+        row: u16,
+        button: MouseButton,
+        modifiers: KeyModifiers,
+    },
+    /// Button release (finish selection → copy, or remote release).
+    MouseRelease {
+        column: u16,
+        row: u16,
+        button: MouseButton,
+        modifiers: KeyModifiers,
+    },
+    /// Mouse wheel: -1 = up, +1 = down (file browser / scrollback / remote app).
+    MouseScroll {
+        column: u16,
+        row: u16,
+        delta: i8,
+        modifiers: KeyModifiers,
+    },
     /// 以下带 `slot` 的事件属于某个标签页（多会话）：标签可能已被关掉，
     /// 收到找不到对应 id 的事件就直接丢弃，绝不能落到"当前标签"上。
     RemoteData { slot: u32, bytes: Vec<u8> },
@@ -102,6 +129,52 @@ pub enum AppEvent {
         entry: FileEntry,
         path: Option<String>,
     },
+    /// 远端文件已取回到本地临时文件，等待编辑（内置面板或外部编辑器）。
+    EditReady {
+        slot: u32,
+        remote: String,
+        local: PathBuf,
+        /// 下载那一刻远端的 mtime（Unix 秒），回传前用它判断远端有没有被改过。
+        remote_mtime: Option<u32>,
+        /// true = 用 ells 内置面板，不需要拉起外部程序，也不启动文件监视。
+        embedded: bool,
+    },
+    /// 取回 / 打开编辑器这一步失败了（下载、二进制检查、拉起编辑器）。
+    EditFailed { slot: u32, err: String },
+    /// 本地临时文件被编辑器保存了（已做去抖，不会把半截写入当成一次保存）。
+    EditSaved {
+        slot: u32,
+        remote: String,
+        local: PathBuf,
+    },
+    /// 远端文件在编辑期间被改过：要不要覆盖。
+    EditConflict {
+        slot: u32,
+        remote: String,
+        local: PathBuf,
+        remote_mtime: Option<u32>,
+        current_mtime: Option<u32>,
+    },
+    /// 回传结束。`Ok(Some(mtime))` 是写回后远端的新 mtime（下一轮冲突检测的基线）。
+    EditUploaded {
+        slot: u32,
+        remote: String,
+        local: PathBuf,
+        res: std::result::Result<Option<u32>, String>,
+    },
+    /// 编辑会话长时间没有保存，监视任务收工（临时文件仍留在磁盘上）。
+    EditExpired { slot: u32, remote: String },
+    /// 终端里手敲的 vi 命令解析成功（文件存在、可读、大小合适）：
+    /// UI 这时才清掉远端输入行并开始取回。
+    ViTargetResolved {
+        slot: u32,
+        seq: u64,
+        remote: String,
+        name: String,
+    },
+    /// 解析失败（不存在 / 是目录 / 太大 / SFTP 出错）：不接管，
+    /// 把回车补发给远端，照旧用远端 vi 打开。
+    ViTargetFailed { slot: u32, seq: u64 },
     /// 传输通过覆盖确认、真正开跑：UI 这时才登记进度条目。
     SftpStarted {
         slot: u32,
@@ -161,6 +234,14 @@ pub enum AppEvent {
     UpdateDone(std::result::Result<(), String>),
 }
 
+fn mouse_button(button: CrosstermMouseButton) -> MouseButton {
+    match button {
+        CrosstermMouseButton::Left => MouseButton::Left,
+        CrosstermMouseButton::Right => MouseButton::Right,
+        CrosstermMouseButton::Middle => MouseButton::Middle,
+    }
+}
+
 pub fn spawn_input_stream(tx: mpsc::UnboundedSender<AppEvent>) {
     tokio::spawn(async move {
         let mut stream = crossterm::event::EventStream::new();
@@ -183,24 +264,36 @@ pub fn spawn_input_stream(tx: mpsc::UnboundedSender<AppEvent>) {
                 }
                 Ok(CrosstermEvent::Mouse(m)) => {
                     let ev = match m.kind {
-                        MouseEventKind::Down(_) => Some(AppEvent::MousePress {
+                        MouseEventKind::Down(b) => Some(AppEvent::MousePress {
                             column: m.column,
                             row: m.row,
+                            button: mouse_button(b),
+                            modifiers: m.modifiers,
                         }),
-                        MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
-                            Some(AppEvent::MouseDrag {
-                                column: m.column,
-                                row: m.row,
-                            })
-                        }
-                        MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
-                            Some(AppEvent::MouseRelease {
-                                column: m.column,
-                                row: m.row,
-                            })
-                        }
-                        MouseEventKind::ScrollUp => Some(AppEvent::MouseScroll { delta: -1 }),
-                        MouseEventKind::ScrollDown => Some(AppEvent::MouseScroll { delta: 1 }),
+                        MouseEventKind::Drag(b) => Some(AppEvent::MouseDrag {
+                            column: m.column,
+                            row: m.row,
+                            button: mouse_button(b),
+                            modifiers: m.modifiers,
+                        }),
+                        MouseEventKind::Up(b) => Some(AppEvent::MouseRelease {
+                            column: m.column,
+                            row: m.row,
+                            button: mouse_button(b),
+                            modifiers: m.modifiers,
+                        }),
+                        MouseEventKind::ScrollUp => Some(AppEvent::MouseScroll {
+                            column: m.column,
+                            row: m.row,
+                            delta: -1,
+                            modifiers: m.modifiers,
+                        }),
+                        MouseEventKind::ScrollDown => Some(AppEvent::MouseScroll {
+                            column: m.column,
+                            row: m.row,
+                            delta: 1,
+                            modifiers: m.modifiers,
+                        }),
                         _ => None,
                     };
                     if let Some(ev) = ev {

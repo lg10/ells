@@ -5,6 +5,61 @@ use std::path::PathBuf;
 use crate::keybinds::{Action, Chord, KeyBinds};
 use crate::theme;
 
+/// 会话里手敲 `vi 文件` / 文件浏览器按 `e` 时怎么打开。默认用内置编辑器——
+/// 文件取回到临时文件后直接在 ells 自己的终端面板里改（行号 + 语法高亮），
+/// 不依赖本机装没装 vim，也不拉起外部窗口。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditOpen {
+    /// ells 内置面板（终端内 vim 风格编辑，Ctrl-S 保存回传）
+    Builtin,
+    /// 本机外部程序（`$ELLS_EDITOR` > `$VISUAL` > `$EDITOR` > 平台默认）
+    Local,
+    /// 交回远端原生 vi（只做原样转发，不拦截）
+    Native,
+}
+
+impl EditOpen {
+    pub const ALL: [EditOpen; 3] = [Self::Builtin, Self::Local, Self::Native];
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim() {
+            "builtin" => Some(Self::Builtin),
+            "local" => Some(Self::Local),
+            "native" => Some(Self::Native),
+            _ => None,
+        }
+    }
+
+    pub fn ini_value(self) -> &'static str {
+        match self {
+            Self::Builtin => "builtin",
+            Self::Local => "local",
+            Self::Native => "native",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Builtin => "内置编辑器",
+            Self::Local => "本地程序",
+            Self::Native => "原生（远端 vi）",
+        }
+    }
+
+    /// 设置面板里按 ←（backwards）或 →/Enter 循环。
+    pub fn shift(self, backwards: bool) -> Self {
+        let at = Self::ALL.iter().position(|m| *m == self).unwrap_or(0);
+        let len = Self::ALL.len();
+        let next = if backwards { at + len - 1 } else { at + 1 };
+        Self::ALL[next % len]
+    }
+
+    /// 终端里手敲 vi 要不要拦截下来取回文件。原生档不碰用户输入。
+    pub fn intercepts_terminal_vi(self) -> bool {
+        !matches!(self, Self::Native)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Settings {
     /// 终端输出高亮（docker ps / 日志级别）
@@ -28,6 +83,8 @@ pub struct Settings {
     /// 会话页底部那排 CPU / 内存 / 磁盘指标。关掉就不开第二条采集通道，
     /// 那一行还给终端。
     pub metrics: bool,
+    /// 终端里手敲 `vi 文件` / 浏览器按 `e` 时的打开方式。
+    pub edit_open: EditOpen,
 }
 
 impl Default for Settings {
@@ -47,6 +104,9 @@ impl Default for Settings {
             // 默认开：这排条是"连上就能看见远端负载"，等用户去设置里找就失去意义了。
             // 采不到的机器会自己降级成一行提示并停止轮询，不会一直占着那一行。
             metrics: true,
+            // 默认内置编辑器：不依赖本机装没装 vim，也不用离开终端；
+            // 想用外部程序或远端原生 vi 在设置里切。
+            edit_open: EditOpen::Builtin,
         }
     }
 }
@@ -116,6 +176,13 @@ impl Settings {
                 "auto_update" => s.auto_update = v.trim() != "false",
                 "session_log" => s.session_log = v.trim() != "false",
                 "metrics" => s.metrics = v.trim() != "false",
+                // 编辑方式：写错的值忽略，保留默认（内置编辑器）。
+                // 旧版本写的是 vi_open，继续认，升级后不用重设。
+                "edit_open" | "vi_open" => {
+                    if let Some(mode) = EditOpen::parse(v) {
+                        s.edit_open = mode;
+                    }
+                }
                 // 列表排序：写错的值忽略，回到「默认」
                 "list_sort" => {
                     if let Some(m) = crate::app::ListSort::parse(v) {
@@ -167,7 +234,7 @@ impl Settings {
             let _ = std::fs::create_dir_all(dir);
         }
         let mut text = format!(
-            "highlight={}\nkeepalive_secs={}\nmaster_password_enabled={}\ntheme={}\nauto_update={}\nsession_log={}\nmetrics={}\nlist_sort={}\nreconnect_attempts={}\nreconnect_initial_ms={}\nreconnect_max_ms={}\nreconnect_stable_secs={}\nreconnect_jitter={}\n",
+            "highlight={}\nkeepalive_secs={}\nmaster_password_enabled={}\ntheme={}\nauto_update={}\nsession_log={}\nmetrics={}\nedit_open={}\nlist_sort={}\nreconnect_attempts={}\nreconnect_initial_ms={}\nreconnect_max_ms={}\nreconnect_stable_secs={}\nreconnect_jitter={}\n",
             self.highlight,
             self.keepalive_secs,
             self.master_password_enabled,
@@ -175,6 +242,7 @@ impl Settings {
             self.auto_update,
             self.session_log,
             self.metrics,
+            self.edit_open.ini_value(),
             self.list_sort.ini_value(),
             self.reconnect.max_attempts,
             self.reconnect.initial_delay_ms,
@@ -187,5 +255,37 @@ impl Settings {
         }
         let _ = ells_core::write_atomic(&path, text.as_bytes());
         theme::apply(self.theme);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EditOpen;
+
+    #[test]
+    fn edit_open_parses_only_known_values() {
+        assert_eq!(EditOpen::parse("builtin"), Some(EditOpen::Builtin));
+        assert_eq!(EditOpen::parse("local"), Some(EditOpen::Local));
+        assert_eq!(EditOpen::parse(" native \n"), Some(EditOpen::Native));
+        assert_eq!(EditOpen::parse("remote"), None);
+        assert_eq!(EditOpen::Builtin.ini_value(), "builtin");
+        assert_eq!(EditOpen::Local.ini_value(), "local");
+        assert_eq!(EditOpen::Native.ini_value(), "native");
+    }
+
+    #[test]
+    fn edit_open_cycles_all_three_modes_both_ways() {
+        assert_eq!(EditOpen::Builtin.shift(false), EditOpen::Local);
+        assert_eq!(EditOpen::Local.shift(false), EditOpen::Native);
+        assert_eq!(EditOpen::Native.shift(false), EditOpen::Builtin);
+        assert_eq!(EditOpen::Builtin.shift(true), EditOpen::Native);
+        assert_eq!(EditOpen::Native.shift(true), EditOpen::Local);
+    }
+
+    #[test]
+    fn only_native_skips_terminal_vi_interception() {
+        assert!(EditOpen::Builtin.intercepts_terminal_vi());
+        assert!(EditOpen::Local.intercepts_terminal_vi());
+        assert!(!EditOpen::Native.intercepts_terminal_vi());
     }
 }

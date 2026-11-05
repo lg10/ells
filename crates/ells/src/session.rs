@@ -2,7 +2,8 @@ use std::io::Write;
 
 use crossterm::event::{KeyEvent, KeyEventKind};
 use ells_core::ssh::RemoteSession;
-use ells_term::{key_to_bytes, Emulator};
+use ells_term::vt100::{MouseProtocolEncoding, MouseProtocolMode};
+use ells_term::{key_to_bytes, mouse_to_bytes, Emulator, MouseAction, MouseButton};
 use ratatui::layout::Rect;
 
 use crate::keybinds::{Action, KeyBinds};
@@ -119,7 +120,11 @@ impl SessionState {
             self.request_full_redraw();
             return SessionAction::Redraw;
         }
-        if let Some(bytes) = key_to_bytes(key) {
+        // 方向键/Home/End 的编码取决于远端当前的 DECCKM 状态：vim、htop
+        // 一进来就发 smkx 打开它，此后只认 SS3。普通 shell 两种都认，
+        // 所以这个分支错了只会表现为"vi 里方向键没反应"。
+        let app_cursor = self.emu.application_cursor();
+        if let Some(bytes) = key_to_bytes(key, app_cursor) {
             self.feed_input(bytes);
         }
         SessionAction::Keep
@@ -129,6 +134,12 @@ impl SessionState {
         self.feed_input(text.as_bytes().to_vec());
     }
 
+    /// 原样写一段字节给远端。vi 拦截时用它发 Ctrl-U，清掉远端 shell 里
+    /// 还没提交的那一行（ells 已经吞掉了回车）。
+    pub fn send_raw(&mut self, bytes: &[u8]) {
+        self.feed_input(bytes.to_vec());
+    }
+
     fn feed_input(&mut self, bytes: Vec<u8>) {
         self.session.write_input(bytes);
         if self.mode == TermMode::Embedded {
@@ -136,6 +147,34 @@ impl SessionState {
                 self.session.write_input(answer);
             }
         }
+    }
+
+    /// 把一次鼠标动作编成远端要的报文。`col`/`row` 是从 1 开始的远端屏幕坐标，
+    /// 由界面层按内嵌视口或整屏换算好。远端没开鼠标报告时返回 false。
+    pub fn forward_mouse(
+        &mut self,
+        action: MouseAction,
+        button: MouseButton,
+        col: u16,
+        row: u16,
+        ctrl: bool,
+        alt: bool,
+    ) -> bool {
+        let (mode, encoding) = self.emu.mouse_protocol();
+        if mode == MouseProtocolMode::None {
+            return false;
+        }
+        if action == MouseAction::Press {
+            // 点击说的是"实时屏上的那个格子"：先把冻结的历史视图放回底部，
+            // 否则远端收到的行列对不上它自己正在画的内容。
+            self.scroll = 0;
+            self.emu.set_scrollback(0);
+            self.clear_selection();
+        }
+        if let Some(bytes) = mouse_to_bytes(action, button, col, row, ctrl, alt, mode, encoding) {
+            self.feed_input(bytes);
+        }
+        true
     }
 
     /// Feed remote output. Returns Some(event) exactly once when a ZMODEM
@@ -177,6 +216,11 @@ impl SessionState {
                 }
             }
             TermMode::Passthrough => {
+                // 直通不画仿真器，但按键编码仍要知道远端是否开着 DECCKM
+                //（vim/htop 会开），所以这一路输出也喂一遍。仿真器在直通下
+                // 尺寸对不上 PTY，它生成的应答不能当真，直接丢掉即可。
+                self.emu.process(bytes);
+                while self.emu.take_answers().is_some() {}
                 let mut stdout = std::io::stdout();
                 let _ = stdout.write_all(bytes);
                 let _ = stdout.flush();
@@ -280,7 +324,27 @@ impl SessionState {
     pub fn request_full_redraw(&mut self) {
         if self.mode == TermMode::Embedded {
             let (rows, cols) = self.emu.size();
+            // 重建仿真器会连模式位一起忘掉，但远端仍在原来的模式里：
+            // 全屏程序（vim/htop）发过 smkx 就不会再发，方向键得继续按 SS3 编码；
+            // 鼠标的 1000/1002/1003 与编码同理，丢了就再也转不出去。
+            let app_cursor = self.emu.application_cursor();
+            let (mouse_mode, mouse_encoding) = self.emu.mouse_protocol();
             self.emu.reset_screen();
+            if app_cursor {
+                self.emu.process(b"\x1b[?1h");
+            }
+            match mouse_mode {
+                MouseProtocolMode::None => {}
+                MouseProtocolMode::Press => self.emu.process(b"\x1b[?9h"),
+                MouseProtocolMode::PressRelease => self.emu.process(b"\x1b[?1000h"),
+                MouseProtocolMode::ButtonMotion => self.emu.process(b"\x1b[?1002h"),
+                MouseProtocolMode::AnyMotion => self.emu.process(b"\x1b[?1003h"),
+            }
+            match mouse_encoding {
+                MouseProtocolEncoding::Default => {}
+                MouseProtocolEncoding::Utf8 => self.emu.process(b"\x1b[?1005h"),
+                MouseProtocolEncoding::Sgr => self.emu.process(b"\x1b[?1006h"),
+            }
             self.session.resize(cols, rows.saturating_sub(1).max(1));
             self.session.resize(cols, rows);
         }

@@ -48,6 +48,8 @@ pub struct FileEntry {
 pub struct Meta {
     pub is_dir: bool,
     pub size: u64,
+    /// 远端修改时间（Unix 秒）。本地编辑回传前拿它判断"我编辑期间有人动过没有"。
+    pub mtime: Option<u32>,
 }
 
 /// 一次传输的可取消位（多个并发传输可共享同一个 Cancel：一次 Ctrl-C 全停）。
@@ -152,6 +154,7 @@ pub async fn remote_meta(sftp: &SftpSession, path: &str) -> Result<Option<Meta>>
         Ok(md) => Ok(Some(Meta {
             is_dir: md.is_dir(),
             size: md.len(),
+            mtime: md.mtime,
         })),
         Err(russh_sftp::client::error::Error::Status(status))
             if status.status_code == russh_sftp::protocol::StatusCode::NoSuchFile =>

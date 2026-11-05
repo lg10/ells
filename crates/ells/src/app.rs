@@ -1,6 +1,7 @@
 use anyhow::Result;
 use crossterm::event::{
     EnableBracketedPaste, EnableMouseCapture, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+    MouseButton as CtMouseButton, MouseEventKind as CtMouseEventKind,
 };
 use crossterm::terminal::enable_raw_mode;
 use crossterm::execute;
@@ -10,6 +11,7 @@ use ells_core::ssh::RemoteSession;
 use ells_core::vault::{self, VaultKey};
 use ells_core::{HostKeyPolicy, HostKeyPrompt, KeyTrust, PortMap, TunnelEvent, TunnelManager, TunnelState, Vault, audit, filter, hostkey, sessionlog};
 use ells_core::audit::AuditKind;
+use ells_term::{MouseAction, MouseButton};
 use ells_transfer::{self, Cancel, FileEntry, Progress};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
@@ -19,7 +21,7 @@ use std::collections::HashMap;
 use std::io::stdout;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use tokio::sync::{mpsc, oneshot};
 use zeroize::Zeroizing;
 
@@ -529,6 +531,21 @@ impl BrowserState {
     }
 }
 
+/// 一次"取回远端文件 → 本地编辑器 → 保存自动回传"的编辑会话。
+#[derive(Debug, Clone)]
+pub struct LocalEdit {
+    pub remote: String,
+    pub local: PathBuf,
+    /// 最近一次与远端对齐时的 mtime（下载时取，写回成功后更新）。
+    pub remote_mtime: Option<u32>,
+    /// 正在回传：期间再来的保存先记一笔，传完立刻补一次。
+    saving: bool,
+    pending_save: bool,
+    /// 编辑器是 ells 内置面板：没有外部程序，也没有 30 分钟的文件监视，
+    /// 面板关掉、最后一笔传完就该结束这次编辑会话。
+    embedded: bool,
+}
+
 /// 一个标签页 = 一路 SSH 会话，外加它自己的 SFTP 浏览器、zmodem 挂起态与搜索状态。
 /// 切标签只换 `App.active`：后台标签的远端输出继续进它自己的 vt100 缓冲，
 /// 在跑的传输也继续，进度/完成事件靠 `id` 找回自己所属的标签。
@@ -584,6 +601,14 @@ pub struct Slot {
     pub metrics: Metrics,
     /// 容器视图（F4）：每标签一份，断开时连数据一起清掉。
     pub docker: DockerView,
+    /// 本地编辑会话（浏览器里按 e / 终端里敲 vi）：保存后自动回传，切标签/关标签不影响监视。
+    pub edit: Option<LocalEdit>,
+    /// 内置编辑器面板（`edit_open=builtin` 时由 EditReady 建立）。
+    pub editor: Option<crate::editor::EmbeddedEdit>,
+    /// 终端里手敲 vi 命令的输入行镜像（仅内嵌模式、仅「本地编辑器」档）。
+    pub vi_line: crate::vi_edit::LineMirror,
+    /// 正在确认的 vi 拦截代号；确认窗口内的按键先不转发。
+    pub vi_pending: Option<u64>,
 }
 
 /// 采集周期。5 秒是"CPU 这根条看着像活的"和"把服务器打穿"之间的位置：CPU 那一格
@@ -1145,6 +1170,9 @@ pub struct App {
     last_press: Option<(std::time::Instant, u16, u16)>,
     /// 拖选进行中的标签 id 与指针位置（越界时据此开自滚定时器）。
     select_drag: Option<(u32, u16, u16)>,
+    /// 已经转给远端应用的按住状态（标签 id + 按键）：拖动/松手要成对转过去，
+    /// 否则 vim 里会留下一个"永远按着"的左键。
+    remote_mouse: Option<(u32, MouseButton)>,
     pub vault: Vault,
     pub vault_key: Option<VaultKey>,
     /// 待连接的主机 + 落到哪个标签下标（选标签的规则在 `start_connect` 里定）。
@@ -1378,6 +1406,7 @@ impl App {
             last_area: Rect::ZERO,
             last_press: None,
             select_drag: None,
+            remote_mouse: None,
             vault: Vault::default(),
             vault_key: None,
             pending_connect: None,
@@ -1457,6 +1486,8 @@ impl App {
             || self.transfer_popup
             || self.update.modal()
             || self.form.jump_picker.is_some()
+            // 编辑器同样是 Clear + 整屏面板：关掉时若不整屏重画，Win10 会留下残影。
+            || self.slots[self.work].editor.is_some()
     }
 
     async fn loop_run(
@@ -1550,10 +1581,18 @@ impl App {
                         }
                     }
                 }
-                AppEvent::MousePress { column, row } => self.handle_mouse(column, row),
-                AppEvent::MouseDrag { column, row } => self.handle_mouse_drag(column, row),
-                AppEvent::MouseRelease { column, row } => self.handle_mouse_release(column, row),
-                AppEvent::MouseScroll { delta } => self.handle_scroll(delta),
+                AppEvent::MousePress { column, row, button, modifiers } => {
+                    self.handle_mouse(column, row, button, modifiers)
+                }
+                AppEvent::MouseDrag { column, row, button, modifiers } => {
+                    self.handle_mouse_drag(column, row, button, modifiers)
+                }
+                AppEvent::MouseRelease { column, row, button, modifiers } => {
+                    self.handle_mouse_release(column, row, button, modifiers)
+                }
+                AppEvent::MouseScroll { column, row, delta, modifiers } => {
+                    self.handle_scroll(column, row, delta, modifiers)
+                }
                 AppEvent::RemoteData { bytes, .. } => {
                     if let Some(lg) = &mut self.slots[self.work].log {
                         lg.record(&bytes);
@@ -1625,6 +1664,10 @@ impl App {
                     slot.pending_zmodem = None;
                     slot.search = None;
                     slot.docker.reset();
+                    // 连接没了就没法回传；本地临时文件保留，监视任务会自己超时收工。
+                    slot.edit = None;
+                    slot.vi_pending = None;
+                    slot.vi_line.clear();
                     if let Some(label) = label {
                         slot.status = Some(format!("[{label}] 会话已结束"));
                     }
@@ -1986,6 +2029,254 @@ impl App {
                         self.release_rz_hold();
                     }
                 }
+                AppEvent::EditReady {
+                    remote,
+                    local,
+                    remote_mtime,
+                    embedded,
+                    ..
+                } => {
+                    let name = remote_name(&remote);
+                    let slot = &mut self.slots[self.work];
+                    slot.edit = Some(LocalEdit {
+                        remote: remote.clone(),
+                        local: local.clone(),
+                        remote_mtime,
+                        saving: false,
+                        pending_save: false,
+                        embedded,
+                    });
+                    if embedded {
+                        match crate::editor::EmbeddedEdit::open(&remote, &local, &name) {
+                            Ok(editor) => {
+                                slot.editor = Some(editor);
+                                slot.status = Some(format!(
+                                    "已取回 {name} · Ctrl-S 保存并回传 · Ctrl-Q 退出"
+                                ));
+                            }
+                            Err(err) => {
+                                slot.edit = None;
+                                slot.status = Some(err);
+                            }
+                        }
+                    } else {
+                        slot.status = Some(format!(
+                            "已取回 {name} · 在本地编辑器里保存后自动回传（临时文件 {}）",
+                            local.display()
+                        ));
+                    }
+                    // 面板是整屏模态：取回期间用户切换了标签，也要把界面带回这一格，
+                    // 否则编辑器会开在看不见的后台标签上，而 tabs_locked 又不让切回来。
+                    if embedded
+                        && self.work != self.active
+                        && self.slots[self.work].editor.is_some()
+                    {
+                        self.active = self.work;
+                        self.screen = self.slot_view(self.work);
+                        self.settings_open = false;
+                        self.transfer_popup = false;
+                    }
+                }
+                AppEvent::EditFailed { err, .. } => {
+                    let slot = &mut self.slots[self.work];
+                    slot.edit = None;
+                    slot.status = Some(err);
+                }
+                AppEvent::EditSaved { remote, local, .. } => {
+                    let slot = &mut self.slots[self.work];
+                    let sftp = slot.sftp.clone();
+                    let slot_id = slot.id;
+                    let mut spawn = None;
+                    if let Some(edit) = slot.edit.as_mut() {
+                        if edit.remote != remote || edit.local != local {
+                            // 属于另一次编辑（这个标签已经换过文件）：忽略。
+                        } else if edit.saving {
+                            // 上一笔还在传：记下来，传完立刻补一次。
+                            edit.pending_save = true;
+                        } else if let Some(sftp) = sftp {
+                            edit.saving = true;
+                            spawn = Some((
+                                sftp,
+                                remote.clone(),
+                                local.clone(),
+                                edit.remote_mtime,
+                            ));
+                            slot.status = Some(format!("正在回传 {}…", remote_name(&remote)));
+                        }
+                    }
+                    if let Some((sftp, remote, local, baseline)) = spawn {
+                        let tx = self.event_tx.clone();
+                        tokio::spawn(run_edit_upload(sftp, tx, slot_id, remote, local, baseline, false));
+                    }
+                }
+                AppEvent::EditConflict {
+                    remote,
+                    local,
+                    remote_mtime,
+                    current_mtime,
+                    ..
+                } => {
+                    let slot = &mut self.slots[self.work];
+                    if let Some(edit) = slot.edit.as_mut() {
+                        if edit.remote == remote {
+                            // 弹窗期间不算在传：用户选覆盖后重新起一笔。
+                            edit.saving = false;
+                        }
+                    }
+                    let sftp = slot.sftp.clone();
+                    let slot_id = slot.id;
+                    let tx = self.event_tx.clone();
+                    let name = remote_name(&remote);
+                    let when = match (remote_mtime, current_mtime) {
+                        (Some(a), Some(b)) => format!("远端 {a} → {b}（Unix 秒）"),
+                        _ => "远端修改时间已变化".to_string(),
+                    };
+                    let remote_for_cb = remote.clone();
+                    let local_for_cb = local.clone();
+                    self.choice = Some(Choice {
+                        title: "远端文件已改动".to_string(),
+                        lines: vec![
+                            remote.clone(),
+                            format!("{name} 在你编辑期间被改过：{when}。"),
+                            "继续保存会覆盖远端的新内容；取消则保留远端，你的改动仍在本地临时文件里。"
+                                .to_string(),
+                        ],
+                        options: vec!["覆盖远端".to_string(), "取消".to_string()],
+                        selected: 1,
+                        shortcuts: &[('y', 0), ('n', 1)],
+                        danger: true,
+                        on_pick: Box::new(move |pick| {
+                            if pick == Some(0) {
+                                if let Some(sftp) = sftp {
+                                    tokio::spawn(run_edit_upload(
+                                        sftp,
+                                        tx,
+                                        slot_id,
+                                        remote_for_cb,
+                                        local_for_cb,
+                                        None,
+                                        true,
+                                    ));
+                                }
+                            } else {
+                                let _ = tx.send(AppEvent::EditUploaded {
+                                    slot: slot_id,
+                                    remote: remote_for_cb,
+                                    local: local_for_cb,
+                                    res: Err("已取消写回：远端内容未被覆盖".to_string()),
+                                });
+                            }
+                        }),
+                    });
+                }
+                AppEvent::EditUploaded {
+                    remote,
+                    local,
+                    res,
+                    ..
+                } => {
+                    let slot = &mut self.slots[self.work];
+                    let id = slot.id;
+                    let mut again = None;
+                    let mut mine = false;
+                    if let Some(edit) = slot.edit.as_mut() {
+                        if edit.remote == remote && edit.local == local {
+                            mine = true;
+                            if let Ok(mtime) = &res {
+                                edit.remote_mtime = *mtime;
+                            }
+                            if edit.pending_save && res.is_ok() {
+                                edit.pending_save = false;
+                                if let Some(sftp) = slot.sftp.clone() {
+                                    again = Some((sftp, edit.remote.clone(), edit.local.clone(), edit.remote_mtime));
+                                } else {
+                                    edit.saving = false;
+                                }
+                            } else {
+                                edit.pending_save = false;
+                                edit.saving = false;
+                            }
+                        }
+                    }
+                    let name = remote_name(&remote);
+                    slot.status = Some(match &res {
+                        Ok(_) => format!("已写回远端：{name}"),
+                        Err(err) => format!("写回未完成：{err}"),
+                    });
+                    // 内置面板没有文件监视，也没有别的重试路径：面板已关、这笔传完
+                    // （成功或失败）就把会话收尾，否则之后手敲 vi 会一直撞上"正在编辑中"。
+                    if mine
+                        && again.is_none()
+                        && slot.editor.is_none()
+                        && slot.edit.as_ref().is_some_and(|e| e.embedded)
+                    {
+                        slot.edit = None;
+                    }
+                    if res.is_ok()
+                        && self.work == self.active
+                        && self.screen == ScreenKind::Browser
+                        && !self.slots[self.work].browser.loading
+                    {
+                        let path = self.slots[self.work].browser.path.clone();
+                        self.start_listing(path);
+                    }
+                    if let Some((sftp, remote, local, baseline)) = again {
+                        let tx = self.event_tx.clone();
+                        tokio::spawn(run_edit_upload(sftp, tx, id, remote, local, baseline, false));
+                    }
+                }
+                AppEvent::EditExpired { remote, .. } => {
+                    let slot = &mut self.slots[self.work];
+                    let local = slot
+                        .edit
+                        .as_ref()
+                        .filter(|e| e.remote == remote)
+                        .map(|e| e.local.clone());
+                    if let Some(local) = local {
+                        slot.edit = None;
+                        slot.status = Some(format!(
+                            "编辑会话已结束（30 分钟没有保存）· 临时文件保留在 {}",
+                            local.display()
+                        ));
+                    }
+                }
+                AppEvent::ViTargetResolved { seq, remote, name, .. } => {
+                    let slot = &mut self.slots[self.work];
+                    if slot.vi_pending == Some(seq) {
+                        slot.vi_pending = None;
+                        // 回车被 ells 吞掉了：先清掉远端 shell 里那一行，再取回文件。
+                        if let Some(sess) = &mut slot.session {
+                            sess.send_raw(&[0x15]);
+                        }
+                        let sftp = slot.sftp.clone();
+                        let slot_id = slot.id;
+                        if let Some(sftp) = sftp {
+                            slot.status = Some(format!("正在取回 {name}（编辑用）…"));
+                            let tx = self.event_tx.clone();
+                            spawn_local_edit(
+                                tx,
+                                slot_id,
+                                sftp,
+                                remote,
+                                name,
+                                self.settings.edit_open == crate::settings::EditOpen::Builtin,
+                            );
+                        } else {
+                            slot.status = Some("连接已断开，无法取回文件".to_string());
+                        }
+                    }
+                }
+                AppEvent::ViTargetFailed { seq, .. } => {
+                    let slot = &mut self.slots[self.work];
+                    if slot.vi_pending == Some(seq) {
+                        slot.vi_pending = None;
+                        // 解析不了就不接管：把吞掉的那个回车补回去，远端 vi 照常打开。
+                        if let Some(sess) = &mut slot.session {
+                            sess.send_raw(b"\r");
+                        }
+                        slot.status = None;
+                    }
+                }
             }
         }
         Ok(())
@@ -2023,6 +2314,12 @@ impl App {
         }
         if self.prompt.is_some() {
             self.handle_prompt_key(&key, ctrl);
+            return;
+        }
+        // 内置编辑器是全屏模态层：除了保存/退出，所有按键（含 q、Esc、方向键）
+        // 都归编辑器，不能漏到会话或全局键位上。
+        if self.slots[self.work].editor.is_some() {
+            self.handle_editor_key(&key);
             return;
         }
         if self.help_open {
@@ -2190,7 +2487,87 @@ impl App {
             self.open_search();
             return;
         }
+        // 设置里选了「内置编辑器 / 本地程序」时，手敲的 vi 命令在这里被接管；
+        // 「原生」档不拦截。任何拿不准的情况都返回 false，按键照旧发给远端。
+        if embedded && self.intercept_vi_command(key, &binds) {
+            return;
+        }
         self.forward_to_remote(key);
+    }
+
+    /// 内嵌会话里镜像输入行，认出手敲的 vi 命令。
+    /// 返回 true 表示这个键已被吞掉：回车改走本地编辑器，或正在确认中。
+    fn intercept_vi_command(
+        &mut self,
+        key: &KeyEvent,
+        binds: &crate::keybinds::KeyBinds,
+    ) -> bool {
+        let slot = &mut self.slots[self.work];
+        if !self.settings.edit_open.intercepts_terminal_vi() {
+            slot.vi_line.clear();
+            return false;
+        }
+        // 本地快捷键不写进 PTY，别让它们把镜像打成"不可信"。
+        if binds.matches(Action::Passthrough, key)
+            || binds.matches(Action::CloseTab, key)
+            || binds.matches(Action::Redraw, key)
+        {
+            return false;
+        }
+        if slot.vi_pending.is_some() {
+            // 刚按下回车、正在问远端文件在不在：这一小段窗口先别往下敲，
+            // 免得把远端 shell 那一行和镜像都弄乱。Ctrl-C 仍然能脱身。
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(key.code, KeyCode::Char('c'))
+            {
+                slot.vi_pending = None;
+                slot.vi_line.clear();
+                slot.status = None;
+                if let Some(sess) = &mut slot.session {
+                    sess.send_raw(&[0x03]);
+                }
+                return true;
+            }
+            return true;
+        }
+        let embedded = slot.session.as_ref().is_some_and(|s| s.mode == TermMode::Embedded);
+        let Some(sftp) = slot.sftp.clone().filter(|_| embedded) else {
+            slot.vi_line.clear();
+            return false;
+        };
+        let Some(target) = slot.vi_line.observe(key) else { return false; };
+        if let Some(edit) = &slot.edit {
+            slot.status = Some(format!(
+                "{} 正在编辑中，vi 命令已交给远端",
+                remote_name(&edit.remote)
+            ));
+            return false;
+        }
+        let seq = VI_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+        let cwd = slot.remote_cwd.clone();
+        let slot_id = slot.id;
+        slot.vi_pending = Some(seq);
+        slot.status = Some(format!("正在确认 {target}…"));
+        let tx = self.event_tx.clone();
+        tokio::spawn(async move {
+            // 确认阶段卡住时（服务器不回声、通道失效）要能退回原生，不能一直吞按键。
+            let resolved = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                resolve_vi_target(&sftp, &target, &cwd),
+            )
+            .await;
+            let ev = match resolved {
+                Ok(Ok((remote, name))) => AppEvent::ViTargetResolved {
+                    slot: slot_id,
+                    seq,
+                    remote,
+                    name,
+                },
+                _ => AppEvent::ViTargetFailed { slot: slot_id, seq },
+            };
+            let _ = tx.send(ev);
+        });
+        true
     }
 
     fn forward_to_remote(&mut self, key: &KeyEvent) {
@@ -2312,7 +2689,15 @@ impl App {
             | AppEvent::SftpHome { slot, .. }
             | AppEvent::SftpListed { slot, .. }
             | AppEvent::SftpProgress { slot, .. }
-            | AppEvent::SftpDone { slot, .. } => *slot,
+            | AppEvent::SftpDone { slot, .. }
+            | AppEvent::EditReady { slot, .. }
+            | AppEvent::EditFailed { slot, .. }
+            | AppEvent::EditSaved { slot, .. }
+            | AppEvent::EditConflict { slot, .. }
+            | AppEvent::EditUploaded { slot, .. }
+            | AppEvent::EditExpired { slot, .. }
+            | AppEvent::ViTargetResolved { slot, .. }
+            | AppEvent::ViTargetFailed { slot, .. } => *slot,
             _ => return Some(self.active),
         };
         self.slots.iter().position(|s| s.id == id)
@@ -2346,6 +2731,8 @@ impl App {
             || self.prompt.is_some()
             || self.dialog_open
             || self.help_open
+            // 编辑面板属于它打开时的那一格：换标签会让保存回传到错的主机。
+            || self.slots.iter().any(|s| s.editor.is_some())
     }
 
     /// 当前这一格是不是被远端独占着（直通模式，且 ells 正看着那一格的会话）：
@@ -2398,6 +2785,7 @@ impl App {
         self.work = idx;
         self.screen = view;
         self.select_drag = None;
+        self.remote_mouse = None;
         self.settings_open = false;
         self.transfer_popup = false;
         self.status = None;
@@ -2599,19 +2987,33 @@ impl App {
         false
     }
 
-    /// 顶部按钮行/弹窗的鼠标命中测试。
-    fn handle_mouse(&mut self, column: u16, row: u16) {
-        // 直通期间屏幕上没有属于 ells 的可点东西：此刻的命中测试用的还是交出去之前
-        // 那一帧的矩形，点下去等于从远端手里抢屏幕（而且抢完还看不见反馈）。
+    /// 顶部按钮行/弹窗的鼠标命中测试；终端区里远端开了鼠标报告就转给它。
+    fn handle_mouse(
+        &mut self,
+        column: u16,
+        row: u16,
+        button: MouseButton,
+        modifiers: KeyModifiers,
+    ) {
+        // 直通期间屏幕上没有属于 ells 的可点东西：命中测试用的还是交出去之前
+        // 那一帧的矩形，点下去只会从远端手里抢屏幕。整块屏幕归远端，
+        // 按下原样转过去（它开没开 1000/1002/1003 由 `forward_remote_mouse` 判断）。
         if self.remote_holds_screen() {
+            let id = self.slots[self.work].id;
+            if self.forward_remote_mouse(MouseAction::Press, button, column, row, modifiers) {
+                self.remote_mouse = Some((id, button));
+            }
             return;
         }
         // 新的按下 = 上一次拖选已经结束。松手事件可能丢在窗口外，
         // 不能让它一直挂着按距离自滚；下面若按在终端区会重新置位。
         self.select_drag = None;
         let now = std::time::Instant::now();
-        let double_click = is_double_click(self.last_press, now, column, row);
-        self.last_press = Some((now, column, row));
+        let double_click = button == MouseButton::Left
+            && is_double_click(self.last_press, now, column, row);
+        if button == MouseButton::Left {
+            self.last_press = Some((now, column, row));
+        }
         if self.choice.is_some() {
             let (lines, options) = match &self.choice {
                 Some(c) => (c.lines.len(), c.options.len()),
@@ -2631,6 +3033,13 @@ impl App {
             let panel = ui::prompt_rect(self.last_area);
             if !hit(panel, column, row) {
                 self.answer_prompt(None);
+            }
+            return;
+        }
+        // 内置编辑器盖满整屏：点击/拖拽直接定位光标或拉选区，不再走终端选词。
+        if self.slots[self.work].editor.is_some() {
+            if let Some(b) = ct_button(button) {
+                self.editor_mouse(CtMouseEventKind::Down(b), column, row, modifiers);
             }
             return;
         }
@@ -2677,6 +3086,7 @@ impl App {
                 slog_r,
                 mt_r,
                 rc_r,
+                vi_r,
                 save_r,
                 cancel_r,
             ] = ui::settings_hit_rects(self.last_area);
@@ -2708,6 +3118,9 @@ impl App {
                 self.settings_focus = 9;
                 self.settings.reconnect.max_attempts =
                     cycle_reconnect_attempts(self.settings.reconnect.max_attempts);
+            } else if hit(vi_r, column, row) {
+                self.settings_focus = 10;
+                self.shift_edit_open(false);
             } else if hit(save_r, column, row) {
                 self.save_settings();
             } else if hit(cancel_r, column, row) {
@@ -2908,9 +3321,26 @@ impl App {
                     row,
                 ) {
                     // 终端区按下 = 开始拖选（鼠标捕获后原生选择失效，由 ells 自绘）。
-                    // 双击落在词内就整词选中；落在空格/标点上仍按普通按下处理。
+                    // 远端开着鼠标报告（vim 的 mouse=a、htop 等）时优先转给它；
+                    // 按住 Shift 仍留给本地选择，和常见终端一致。
                     let area = ui::session_emu_rect(self.last_area, self.footer_rows(self.work));
                     let id = self.slots[self.work].id;
+                    if !modifiers.contains(KeyModifiers::SHIFT)
+                        && self.forward_remote_mouse(
+                            MouseAction::Press,
+                            button,
+                            column,
+                            row,
+                            modifiers,
+                        )
+                    {
+                        self.remote_mouse = Some((id, button));
+                        return;
+                    }
+                    if button != MouseButton::Left {
+                        return;
+                    }
+                    // 双击落在词内就整词选中；落在空格/标点上仍按普通按下处理。
                     if let Some(s) = &mut self.slots[self.work].session {
                         if !(double_click && s.select_word(area, column, row)) {
                             s.begin_selection(area, column, row);
@@ -2974,7 +3404,71 @@ impl App {
         }
     }
 
-    fn handle_mouse_drag(&mut self, column: u16, row: u16) {
+    /// 把一次鼠标动作转给远端应用（它必须开着 1000/1002/1003）。
+    ///
+    /// 坐标换算看模式：直通时整块屏幕都是远端的，行列直接 +1；内嵌时只有
+    /// 终端视口对应远端屏幕，先减去视口原点再 +1。按下必须落在视口里才算
+    /// （点在标题栏/底栏是 ells 自己的），拖动和松手则钳到最近的边 ——
+    /// 鼠标拖出视口时远端仍应看到指针停在边上。
+    fn forward_remote_mouse(
+        &mut self,
+        action: MouseAction,
+        button: MouseButton,
+        column: u16,
+        row: u16,
+        modifiers: KeyModifiers,
+    ) -> bool {
+        if self.screen != ScreenKind::Session {
+            return false;
+        }
+        let passthrough = self
+            .slots
+            .get(self.work)
+            .and_then(|slot| slot.session.as_ref())
+            .is_some_and(|s| s.mode == TermMode::Passthrough);
+        let (col, row) = if passthrough {
+            (column.saturating_add(1), row.saturating_add(1))
+        } else {
+            let area = ui::session_emu_rect(self.last_area, self.footer_rows(self.work));
+            if action == MouseAction::Press && !hit(area, column, row) {
+                return false;
+            }
+            emu_remote_coords(area, column, row)
+        };
+        let ctrl = modifiers.contains(KeyModifiers::CONTROL);
+        let alt = modifiers.contains(KeyModifiers::ALT);
+        match &mut self.slots[self.work].session {
+            Some(s) => s.forward_mouse(action, button, col, row, ctrl, alt),
+            None => false,
+        }
+    }
+
+    fn handle_mouse_drag(
+        &mut self,
+        column: u16,
+        row: u16,
+        button: MouseButton,
+        modifiers: KeyModifiers,
+    ) {
+        // 编辑器开着时，屏幕上的指针只属于它：拖动=按住的选区，松手=落定。
+        if self.slots[self.work].editor.is_some() {
+            if let Some(b) = ct_button(button) {
+                self.editor_mouse(CtMouseEventKind::Drag(b), column, row, modifiers);
+            }
+            return;
+        }
+        // 这次按住是转给远端的：拖动也必须转过去，哪怕指针已经出了终端视口
+        //（坐标会钳在边上），否则 vim 里选到一半就断。
+        if let Some((id, held)) = self.remote_mouse {
+            if id == self.slots[self.work].id {
+                self.forward_remote_mouse(MouseAction::Drag, held, column, row, modifiers);
+                return;
+            }
+            self.remote_mouse = None;
+        }
+        if button != MouseButton::Left {
+            return;
+        }
         if self.screen != ScreenKind::Session {
             return;
         }
@@ -3027,7 +3521,31 @@ impl App {
         }
     }
 
-    fn handle_mouse_release(&mut self, column: u16, row: u16) {
+    fn handle_mouse_release(
+        &mut self,
+        column: u16,
+        row: u16,
+        button: MouseButton,
+        modifiers: KeyModifiers,
+    ) {
+        // 编辑器开着时，屏幕上的指针只属于它：拖动=按住的选区，松手=落定。
+        if self.slots[self.work].editor.is_some() {
+            if let Some(b) = ct_button(button) {
+                self.editor_mouse(CtMouseEventKind::Up(b), column, row, modifiers);
+            }
+            return;
+        }
+        // 按下时转给了远端：松手也成对转过去，vim 的左键才不会一直按着。
+        if let Some((id, held)) = self.remote_mouse.take() {
+            if id == self.slots[self.work].id {
+                self.forward_remote_mouse(MouseAction::Release, held, column, row, modifiers);
+                return;
+            }
+        }
+        if button != MouseButton::Left {
+            self.select_drag = None;
+            return;
+        }
         // 不是从终端区按下的松手（点在标题栏、弹窗上等）：不动既有选区。
         if self.select_drag.take().is_none() {
             return;
@@ -3061,7 +3579,17 @@ impl App {
     }
 
     /// 滚轮：会话=回看历史；浏览器=移动选择（列表窗口跟随滚动）。
-    fn handle_scroll(&mut self, delta: i8) {
+    fn handle_scroll(&mut self, column: u16, row: u16, delta: i8, modifiers: KeyModifiers) {
+        // 编辑器面板里的滚轮滚的是正文视图，不是下层会话的历史。
+        if self.slots[self.work].editor.is_some() {
+            let kind = if delta > 0 {
+                CtMouseEventKind::ScrollUp
+            } else {
+                CtMouseEventKind::ScrollDown
+            };
+            self.editor_mouse(kind, column, row, modifiers);
+            return;
+        }
         if self.slots[self.work].docker.open {
             if self.slots[self.work].docker.detail.open {
                 let visible = ui::docker_detail_body_height(self.last_area).max(1);
@@ -3089,6 +3617,25 @@ impl App {
         }
         match self.screen {
             ScreenKind::Session => {
+                // 远端要鼠标（vim/htop）时滚轮也归它：翻的是远端自己的缓冲区，
+                // 本地就不再抢着回看历史。按住 Shift 仍走本地回看（常见终端习惯），
+                // 指针悬在标题栏/底栏时同理。
+                let button = if delta < 0 {
+                    MouseButton::WheelUp
+                } else {
+                    MouseButton::WheelDown
+                };
+                if !modifiers.contains(KeyModifiers::SHIFT)
+                    && self.forward_remote_mouse(
+                        MouseAction::Press,
+                        button,
+                        column,
+                        row,
+                        modifiers,
+                    )
+                {
+                    return;
+                }
                 if let Some(s) = &mut self.slots[self.work].session {
                     s.handle_wheel(delta);
                 }
@@ -3151,7 +3698,7 @@ impl App {
                 self.settings_focus = self.settings_focus.saturating_sub(1);
             }
             KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
-                self.settings_focus = (self.settings_focus + 1).min(11);
+                self.settings_focus = (self.settings_focus + 1).min(12);
             }
             KeyCode::Enter | KeyCode::Char(' ') => self.apply_settings_focus(),
             KeyCode::Left => match self.settings_focus {
@@ -3171,6 +3718,7 @@ impl App {
                     self.settings.reconnect.max_attempts =
                         step_reconnect_attempts(self.settings.reconnect.max_attempts, false);
                 }
+                10 => self.shift_edit_open(true),
                 _ => {}
             },
             KeyCode::Right => match self.settings_focus {
@@ -3190,6 +3738,7 @@ impl App {
                     self.settings.reconnect.max_attempts =
                         step_reconnect_attempts(self.settings.reconnect.max_attempts, true);
                 }
+                10 => self.shift_edit_open(false),
                 _ => {}
             },
             KeyCode::Char('h') => self.settings.highlight = !self.settings.highlight,
@@ -3304,8 +3853,19 @@ impl App {
                 self.settings.reconnect.max_attempts =
                     cycle_reconnect_attempts(self.settings.reconnect.max_attempts);
             }
-            10 => self.save_settings(),
+            10 => self.shift_edit_open(false),
+            11 => self.save_settings(),
             _ => self.cancel_settings(),
+        }
+    }
+
+    /// `backwards` = ←，其余情况（→ / Enter / 点击）往前循环。
+    fn shift_edit_open(&mut self, backwards: bool) {
+        self.settings.edit_open = self.settings.edit_open.shift(backwards);
+        // 换档时丢掉所有已镜像的输入行：旧档下记的行可能已经和远端对不上。
+        // 正在确认的那一次让它跑完，免得吞掉的回车再也没人补发。
+        for slot in &mut self.slots {
+            slot.vi_line.clear();
         }
     }
 
@@ -3568,14 +4128,15 @@ impl App {
             AuditKind::Settings,
             "settings",
             &format!(
-                "主题={} 保活={}s 高亮={} 自动更新={} 会话记录={} 主机指标={} 自动重连={}次",
+                "主题={} 保活={}s 高亮={} 自动更新={} 会话记录={} 主机指标={} 自动重连={}次 vi打开={}",
                 self.settings.theme.ini_value(),
                 self.settings.keepalive_secs,
                 self.settings.highlight,
                 self.settings.auto_update,
                 self.settings.session_log,
                 self.settings.metrics,
-                self.settings.reconnect.attempts_label()
+                self.settings.reconnect.attempts_label(),
+                self.settings.edit_open.ini_value()
             ),
         );
         ells_core::ssh::set_keepalive_interval(self.settings.keepalive_secs);
@@ -3651,6 +4212,10 @@ impl App {
         slot.sz_saveas_pending = false;
         slot.pending_zmodem = None;
         slot.search = None;
+        // 本地编辑的监视任务会自己超时；这里只断开它和这个标签的回传关系。
+        slot.edit = None;
+        slot.vi_pending = None;
+        slot.vi_line.clear();
         slot.view = ScreenKind::List;
         if let Some(label) = label {
             slot.status = Some(format!("[{label}] {status}"));
@@ -3781,6 +4346,136 @@ impl App {
             let _ = pump.await;
             let _ = tx.send(AppEvent::SftpDone { slot, rz, res });
         });
+    }
+
+    /// 浏览器 `e`：把远端文件取回到本地临时文件，交给本地编辑器；
+    /// 编辑器每保存一次就自动回传，远端在编辑期间被改过会先问要不要覆盖。
+    fn begin_local_edit(&mut self, entry: FileEntry) {
+        if self.slots[self.work].sz_pick_mode {
+            self.slots[self.work].status =
+                Some("当前是在挑下载目标：按 Enter 另存为".to_string());
+            return;
+        }
+        let Some(sftp) = self.slots[self.work].sftp.clone() else {
+            self.slots[self.work].status = Some("该服务器不支持 SFTP 文件传输".to_string());
+            return;
+        };
+        if entry.is_dir {
+            self.slots[self.work].status =
+                Some("目录不能直接编辑：进入目录后选中文件再按 e".to_string());
+            return;
+        }
+        if let Some(edit) = &self.slots[self.work].edit {
+            self.slots[self.work].status = Some(format!(
+                "{} 正在编辑中，保存后会自动回传",
+                remote_name(&edit.remote)
+            ));
+            return;
+        }
+        let tx = self.event_tx.clone();
+        let slot = self.slot_id();
+        self.slots[self.work].status = Some(format!("正在取回 {}（编辑用）…", entry.name));
+        spawn_local_edit(
+            tx,
+            slot,
+            sftp,
+            entry.path,
+            entry.name,
+            self.settings.edit_open != crate::settings::EditOpen::Local,
+        );
+    }
+
+    /// 内置编辑器面板的按键：Ctrl-S 保存回传、Ctrl-Q 退出，其余交给 edtui。
+    fn handle_editor_key(&mut self, key: &KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if ctrl && matches!(key.code, KeyCode::Char('s')) {
+            self.save_editor();
+            return;
+        }
+        if ctrl && matches!(key.code, KeyCode::Char('q')) {
+            self.close_editor();
+            return;
+        }
+        let idx = self.work;
+        let Some(ed) = self.slots[idx].editor.as_mut() else {
+            return;
+        };
+        // 提示"再按一次 Ctrl-Q"之后，用户按了别的键就说明还在编辑，撤销待确认态。
+        ed.confirm_close = false;
+        ed.on_key(*key);
+    }
+
+    fn save_editor(&mut self) {
+        let idx = self.work;
+        let Some(ed) = self.slots[idx].editor.as_mut() else {
+            return;
+        };
+        let text = ed.text();
+        let write = std::fs::write(&ed.local, text.as_bytes());
+        let (remote, local) = (ed.remote.clone(), ed.local.clone());
+        if write.is_ok() {
+            ed.mark_saved();
+        }
+        match write {
+            Ok(()) => {
+                self.slots[idx].status = Some(format!("正在回传 {}…", remote_name(&remote)));
+                // 与外部编辑器保存走同一条事件：排队、冲突确认、浏览器刷新都不用重写。
+                let _ = self.event_tx.send(AppEvent::EditSaved {
+                    slot: self.slots[idx].id,
+                    remote,
+                    local,
+                });
+            }
+            Err(err) => {
+                self.slots[idx].status = Some(format!("保存到临时文件失败：{err}"));
+            }
+        }
+    }
+
+    fn close_editor(&mut self) {
+        let idx = self.work;
+        let Some(ed) = self.slots[idx].editor.as_mut() else {
+            return;
+        };
+        let dirty = ed.dirty();
+        if dirty && !ed.confirm_close {
+            ed.confirm_close = true;
+            self.slots[idx].status = Some(
+                "有未保存的改动：再按 Ctrl-Q 放弃并退出，或 Ctrl-S 保存".to_string(),
+            );
+            return;
+        }
+        let name = ed.name.clone();
+        // 最后一笔还在传时不能把会话丢掉：丢了 pending_save 就再没人补发，
+        // 用户以为自己保存过了，远端却是旧内容。
+        let uploading = self.slots[idx]
+            .edit
+            .as_ref()
+            .is_some_and(|e| e.saving || e.pending_save);
+        let embedded = self.slots[idx].edit.as_ref().is_some_and(|e| e.embedded);
+        self.slots[idx].editor = None;
+        if !uploading && embedded {
+            self.slots[idx].edit = None;
+        }
+        self.slots[idx].status = Some(if uploading {
+            format!("已关闭 {name}：最后一笔改动仍在回传")
+        } else if dirty {
+            format!("已关闭 {name}：改动未保存，远端未被修改")
+        } else {
+            format!("已关闭 {name}")
+        });
+    }
+
+    fn editor_mouse(
+        &mut self,
+        kind: CtMouseEventKind,
+        column: u16,
+        row: u16,
+        modifiers: KeyModifiers,
+    ) {
+        if let Some(ed) = self.slots[self.work].editor.as_mut() {
+            ed.on_mouse(kind, column, row, modifiers);
+        }
     }
 
     fn start_download(&mut self, entry: FileEntry) {
@@ -4369,6 +5064,17 @@ impl App {
             KeyCode::Char('r') => {
                 let path = self.slots[self.work].browser.path.clone();
                 self.start_listing(path);
+            }
+            KeyCode::Char('e') => {
+                if let Some(entry) = self
+                    .slots[self.work]
+                    .browser
+                    .entries
+                    .get(self.slots[self.work].browser.selected)
+                    .cloned()
+                {
+                    self.begin_local_edit(entry);
+                }
             }
             KeyCode::Char('m') => self.prompt_mkdir(),
             KeyCode::Char('n') => self.prompt_rename(),
@@ -6383,8 +7089,22 @@ impl App {
         if self.choice.is_some() {
             return;
         }
+        // 内置编辑器吃掉整段粘贴：多行文本进缓冲区，不执行任何命令。
+        if self.slots[self.work].editor.is_some() {
+            if let Some(ed) = self.slots[self.work].editor.as_mut() {
+                ed.on_paste(text);
+            }
+            return;
+        }
         if self.screen == ScreenKind::Session {
             if !text.is_empty() {
+                let embedded = self.slots[self.work]
+                    .session
+                    .as_ref()
+                    .is_some_and(|s| s.mode == TermMode::Embedded);
+                if embedded && self.settings.edit_open.intercepts_terminal_vi() {
+                    self.slots[self.work].vi_line.observe_paste(text);
+                }
                 if let Some(s) = &mut self.slots[self.work].session {
                     s.handle_paste(text);
                 }
@@ -7089,6 +7809,329 @@ async fn ask_overwrite<T: Fn(&str) -> bool>(
 }
 
 /// 一次上传（文件或整个目录树）：先问覆盖，再真跑，名字可能因"改名"而变。
+/// 编辑取回的最大文件：再大就不像"文本编辑"了，取回和回传都会白白占内存与磁盘。
+const EDIT_MAX_BYTES: u64 = 16 * 1024 * 1024;
+/// 编辑会话闲多久就收工（从最后一次保存算起）。临时文件不删，用户还能自己取用。
+const EDIT_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+struct EditPrep {
+    local: PathBuf,
+    remote_mtime: Option<u32>,
+}
+
+/// vi 拦截的代号：每次拦截 +1，过期的确认回包靠它作废。
+static VI_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// 把远端文件取回本地临时文件，并做二进制检查。
+async fn prepare_local_edit(
+    sftp: &SftpSession,
+    remote: &str,
+    name: &str,
+) -> std::result::Result<EditPrep, String> {
+    let meta = ells_transfer::remote_meta(sftp, remote)
+        .await
+        .map_err(|e| format!("{e:#}"))?
+        .ok_or_else(|| format!("远端文件不存在：{remote}"))?;
+    if meta.is_dir {
+        return Err("目录不能直接编辑".to_string());
+    }
+    if meta.size > EDIT_MAX_BYTES {
+        return Err(format!(
+            "文件太大（{} MB），不适合用本地编辑器打开",
+            meta.size / 1024 / 1024
+        ));
+    }
+    let dir = std::env::temp_dir().join("ells-edit");
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| format!("无法创建临时目录 {}：{e}", dir.display()))?;
+    let temp = temp_edit_name(name);
+    let (ptx, _prx) = mpsc::unbounded_channel::<Progress>();
+    let cancel = Cancel::default();
+    let local = ells_transfer::download(sftp, remote.to_string(), &dir, ptx, &temp, &cancel)
+        .await
+        .map_err(|e| format!("取回失败：{e:#}"))?;
+    // 打开前先挡掉二进制：文本编辑器会把它们搅成乱码，保存回传就等于毁掉远端文件。
+    if is_binary_file(&local).await {
+        let _ = tokio::fs::remove_file(&local).await;
+        return Err(format!("{name} 看起来是二进制文件，已取消编辑"));
+    }
+    Ok(EditPrep {
+        local,
+        remote_mtime: meta.mtime,
+    })
+}
+
+/// 把终端里敲的文件名解析成远端绝对路径，并做一次轻量确认（存在、是文件、不太大）。
+/// 任何一步失败都返回 Err —— 调用方会把回车补发给远端，让 vi 原生打开。
+async fn resolve_vi_target(
+    sftp: &SftpSession,
+    raw: &str,
+    cwd: &str,
+) -> std::result::Result<(String, String), String> {
+    let joined = if raw.starts_with('/') {
+        raw.to_string()
+    } else if raw == "~" || raw.starts_with("~/") {
+        let home = sftp.canonicalize(".").await.map_err(|e| e.to_string())?;
+        if raw == "~" {
+            home
+        } else {
+            ells_transfer::remote_join(&home, &raw[2..])
+        }
+    } else if cwd.starts_with('/') {
+        ells_transfer::remote_join(cwd, raw)
+    } else {
+        let home = sftp.canonicalize(".").await.map_err(|e| e.to_string())?;
+        ells_transfer::remote_join(&home, raw)
+    };
+    let remote = sftp.canonicalize(&joined).await.map_err(|e| e.to_string())?;
+    let meta = ells_transfer::remote_meta(sftp, &remote)
+        .await
+        .map_err(|e| format!("{e:#}"))?
+        .ok_or_else(|| format!("远端文件不存在：{remote}"))?;
+    if meta.is_dir {
+        return Err("目录不能直接编辑".to_string());
+    }
+    if meta.size > EDIT_MAX_BYTES {
+        return Err("文件太大".to_string());
+    }
+    let name = remote
+        .rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("edit.txt")
+        .to_string();
+    Ok((remote, name))
+}
+
+/// 取回 → 交给编辑器（内置面板或外部程序）→ 守着保存。浏览器 `e` 与终端里手敲的 vi 共用。
+fn spawn_local_edit(
+    tx: mpsc::UnboundedSender<AppEvent>,
+    slot: u32,
+    sftp: Arc<SftpSession>,
+    remote: String,
+    name: String,
+    embedded: bool,
+) {
+    tokio::spawn(async move {
+        match prepare_local_edit(&sftp, &remote, &name).await {
+            Ok(prep) => {
+                let _ = tx.send(AppEvent::EditReady {
+                    slot,
+                    remote: remote.clone(),
+                    local: prep.local.clone(),
+                    remote_mtime: prep.remote_mtime,
+                    embedded,
+                });
+                // 内置面板由 UI 自己读临时文件，不需要外部程序和 mtime 监视；
+                // 保存时 UI 写完文件直接发 EditSaved，回传逻辑不变。
+                if embedded {
+                    return;
+                }
+                if let Err(err) = launch_editor(&prep.local) {
+                    let _ = tx.send(AppEvent::EditFailed { slot, err });
+                    return;
+                }
+                watch_local_edit(tx, slot, remote, prep.local).await;
+            }
+            Err(err) => {
+                let _ = tx.send(AppEvent::EditFailed { slot, err });
+            }
+        }
+    });
+}
+
+fn temp_edit_name(name: &str) -> String {
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    let base = Path::new(name)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "edit.txt".to_string());
+    // 保留扩展名，编辑器才猜得到语法；前缀保证多次编辑互不覆盖。
+    format!("ells-{}-{}-{base}", std::process::id(), n)
+}
+
+async fn is_binary_file(path: &Path) -> bool {
+    use tokio::io::AsyncReadExt;
+    let Ok(mut f) = tokio::fs::File::open(path).await else {
+        return false;
+    };
+    let mut buf = [0u8; 8192];
+    let n = f.read(&mut buf).await.unwrap_or(0);
+    buf[..n].contains(&0)
+}
+
+/// 编辑器选择：`ELLS_EDITOR` > `$VISUAL` > `$EDITOR` > 平台默认（Windows 记事本 /
+/// macOS 默认文本编辑器 / Linux `xdg-open`）。值里带参数时按空白切开。
+fn editor_command() -> (String, Vec<String>) {
+    for key in ["ELLS_EDITOR", "VISUAL", "EDITOR"] {
+        if let Ok(value) = std::env::var(key) {
+            let mut parts = value.split_whitespace();
+            if let Some(prog) = parts.next() {
+                return (prog.to_string(), parts.map(str::to_string).collect());
+            }
+        }
+    }
+    if cfg!(windows) {
+        ("notepad.exe".to_string(), Vec::new())
+    } else if cfg!(target_os = "macos") {
+        ("open".to_string(), vec!["-t".to_string()])
+    } else {
+        ("xdg-open".to_string(), Vec::new())
+    }
+}
+
+fn launch_editor(path: &Path) -> std::result::Result<(), String> {
+    let (prog, args) = editor_command();
+    let mut cmd = std::process::Command::new(&prog);
+    cmd.args(&args).arg(path);
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("无法启动编辑器 {prog}：{e}"))?;
+    // 编辑器活多久都行；单独等它只为回收进程（unix 上避免僵尸）。
+    tokio::task::spawn_blocking(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
+async fn local_mtime(path: &Path) -> Option<std::time::SystemTime> {
+    tokio::fs::metadata(path)
+        .await
+        .ok()
+        .and_then(|m| m.modified().ok())
+}
+
+/// 盯着临时文件：每次保存（mtime 变化且文件已经写稳）就通知 UI 回传。
+/// 编辑器通常"先截断再写"，所以看到变化后再等一拍，别把半截内容传上去。
+async fn watch_local_edit(
+    tx: mpsc::UnboundedSender<AppEvent>,
+    slot: u32,
+    remote: String,
+    local: PathBuf,
+) {
+    let mut last = local_mtime(&local).await;
+    let mut last_change = std::time::Instant::now();
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        if last_change.elapsed() >= EDIT_IDLE_TIMEOUT {
+            let _ = tx.send(AppEvent::EditExpired { slot, remote });
+            return;
+        }
+        let Some(mtime) = local_mtime(&local).await else {
+            continue;
+        };
+        if Some(mtime) == last {
+            continue;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        let Some(settled) = local_mtime(&local).await else {
+            continue;
+        };
+        if settled != mtime {
+            // 还在写；下一轮重新判断（`last` 不动）。
+            continue;
+        }
+        last = Some(settled);
+        last_change = std::time::Instant::now();
+        let _ = tx.send(AppEvent::EditSaved {
+            slot,
+            remote: remote.clone(),
+            local: local.clone(),
+        });
+    }
+}
+
+/// 回传一次本地编辑。`force` = 用户已在冲突弹窗里选了"覆盖远端"。
+/// 上传期间编辑器可能又保存了一次：传完对比本地 mtime，变了就再传一遍。
+async fn run_edit_upload(
+    sftp: Arc<SftpSession>,
+    tx: mpsc::UnboundedSender<AppEvent>,
+    slot: u32,
+    remote: String,
+    local: PathBuf,
+    baseline: Option<u32>,
+    force: bool,
+) {
+    if !force {
+        match ells_transfer::remote_meta(&sftp, &remote).await {
+            Ok(Some(meta)) if meta.mtime != baseline => {
+                let _ = tx.send(AppEvent::EditConflict {
+                    slot,
+                    remote,
+                    local,
+                    remote_mtime: baseline,
+                    current_mtime: meta.mtime,
+                });
+                return;
+            }
+            Ok(_) => {}
+            Err(err) => {
+                let _ = tx.send(AppEvent::EditUploaded {
+                    slot,
+                    remote,
+                    local,
+                    res: Err(format!("写回前检查远端失败：{err:#}")),
+                });
+                return;
+            }
+        }
+    }
+    let mut last = local_mtime(&local).await;
+    for attempt in 0..3 {
+        let (ptx, mut prx) = mpsc::unbounded_channel::<Progress>();
+        let pump = tokio::spawn(async move { while prx.recv().await.is_some() {} });
+        let cancel = Cancel::default();
+        let result = ells_transfer::upload(&sftp, &local, remote.clone(), ptx, &cancel).await;
+        let _ = pump.await;
+        if let Err(err) = result {
+            let _ = tx.send(AppEvent::EditUploaded {
+                slot,
+                remote,
+                local,
+                res: Err(format!("{err:#}")),
+            });
+            return;
+        }
+        let now = local_mtime(&local).await;
+        if now == last || attempt == 2 {
+            break;
+        }
+        last = now;
+    }
+    let mtime = ells_transfer::remote_meta(&sftp, &remote)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|m| m.mtime);
+    let _ = tx.send(AppEvent::EditUploaded {
+        slot,
+        remote,
+        local,
+        res: Ok(mtime),
+    });
+}
+
+fn ct_button(button: MouseButton) -> Option<CtMouseButton> {
+    match button {
+        MouseButton::Left => Some(CtMouseButton::Left),
+        MouseButton::Right => Some(CtMouseButton::Right),
+        MouseButton::Middle => Some(CtMouseButton::Middle),
+        // 滚轮走 MouseScroll，不经过按下事件。
+        MouseButton::WheelUp | MouseButton::WheelDown => None,
+    }
+}
+
+fn remote_name(remote: &str) -> &str {
+    remote
+        .rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(remote)
+}
+
 async fn run_upload(
     sftp: Arc<SftpSession>,
     local: PathBuf,
@@ -7230,6 +8273,16 @@ fn hit(r: Rect, column: u16, row: u16) -> bool {
         && column < r.x.saturating_add(r.width)
         && row >= r.y
         && row < r.y.saturating_add(r.height)
+}
+
+/// 界面格子 → 远端鼠标坐标（1 起算，越界钳到最近的边）。
+/// 终端鼠标报文都是 1-based；内嵌视口的 (0,0) 对应远端屏幕的 (1,1)。
+fn emu_remote_coords(area: Rect, column: u16, row: u16) -> (u16, u16) {
+    let c = column
+        .saturating_sub(area.x)
+        .min(area.width.saturating_sub(1));
+    let r = row.saturating_sub(area.y).min(area.height.saturating_sub(1));
+    (c.saturating_add(1), r.saturating_add(1))
 }
 
 /// 保活间隔在 15/30/60/120/300 之间步进（已是区间外自定义值时向档位靠拢）。
@@ -8139,7 +9192,7 @@ mod metrics_tests {
 
 #[cfg(test)]
 mod mouse_tests {
-    use super::{autoscroll_plan, is_double_click};
+    use super::{autoscroll_plan, emu_remote_coords, is_double_click};
     use ratatui::layout::Rect;
 
     /// 拖出终端区才滚：越得越远每跳越多，封顶 12 行；区内返回 None。
@@ -8170,5 +9223,21 @@ mod mouse_tests {
         assert!(!is_double_click(Some((t0, 10, 5)), at(501), 10, 5));
         assert!(!is_double_click(Some((t0, 10, 5)), at(50), 11, 5));
         assert!(!is_double_click(None, t0, 10, 5));
+    }
+
+    /// 界面坐标 → 远端鼠标坐标：视口原点对应 (1,1)，1 起算；
+    /// 拖出视口时钳到最近的边，远端才不会收到 0 或越界行列。
+    #[test]
+    fn remote_mouse_coords_are_one_based_and_clamped_to_the_viewport() {
+        let area = Rect::new(0, 4, 80, 20);
+        assert_eq!(emu_remote_coords(area, 0, 4), (1, 1), "视口左上角");
+        assert_eq!(emu_remote_coords(area, 9, 13), (10, 10));
+        assert_eq!(emu_remote_coords(area, 79, 23), (80, 20), "视口右下角");
+        assert_eq!(emu_remote_coords(area, 5, 0), (6, 1), "上越界钳到首行");
+        assert_eq!(emu_remote_coords(area, 5, 50), (6, 20), "下越界钳到末行");
+        assert_eq!(emu_remote_coords(area, 200, 10), (80, 7), "右越界钳到末列");
+        // 视口有非零原点时，减原点再 +1
+        assert_eq!(emu_remote_coords(Rect::new(3, 7, 40, 10), 3, 7), (1, 1));
+        assert_eq!(emu_remote_coords(Rect::new(3, 7, 40, 10), 10, 9), (8, 3));
     }
 }
