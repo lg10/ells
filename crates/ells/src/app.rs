@@ -1078,6 +1078,8 @@ pub struct App {
     /// 键盘/鼠标来自界面时等于 `active`。所有会话级助手都读写 `slots[work]`，
     /// 需要动全局界面（切屏/弹系统对话框）时先判 `work == active`。
     work: usize,
+    /// 当前是否已把终端光标切成编辑器用的闪烁细竖线（关掉编辑器要切回默认）。
+    cursor_bar: bool,
     next_slot_id: u32,
     /// A native file dialog is currently on screen (only one at a time).
     dialog_open: bool,
@@ -1354,6 +1356,7 @@ impl App {
             slots: vec![Slot::new(0)],
             active: 0,
             work: 0,
+            cursor_bar: false,
             next_slot_id: 1,
             dialog_open: false,
             settings,
@@ -1544,6 +1547,13 @@ impl App {
                 self.passthrough_last = false;
                 self.overlay_last = overlays;
                 self.dialog_last = dialog;
+            }
+            // 编辑器里的方块光标已换成终端硬件光标的闪烁细竖线：
+            // 形状是终端级状态，只在开/关编辑器时切换一次，退出时由 restore_terminal 兜底。
+            let editor_bar = self.slots[self.active].editor.is_some();
+            if editor_bar != self.cursor_bar {
+                term::set_editor_cursor(editor_bar);
+                self.cursor_bar = editor_bar;
             }
             // Connect only AFTER the "正在连接…" frame is on screen.
             if let Some((host, idx)) = self.pending_connect.take() {
@@ -2536,6 +2546,12 @@ impl App {
         binds: &crate::keybinds::KeyBinds,
     ) -> bool {
         let slot = &mut self.slots[self.work];
+        // 远端全屏程序（vim/htop/less）占着屏幕时，用户不是在 shell 提示符下敲命令：
+        // 既不拦截，也别把程序里的按键记进镜像。
+        if slot.session.as_ref().is_some_and(|s| s.emu.alternate_screen()) {
+            slot.vi_line.clear();
+            return false;
+        }
         if !self.settings.edit_open.intercepts_terminal_vi() {
             slot.vi_line.clear();
             return false;
@@ -2598,11 +2614,32 @@ impl App {
                 return true;
             }
         }
-        let Some(target) = slot.vi_line.observe(key) else {
+        // 每个键交给远端之前对一次账：屏幕光标左侧应当正好是镜像里的文本。
+        // 记下提示符的宽度和原文，箭头键/历史把镜像弄丢后还能从屏幕把命令捞回来。
+        if slot.vi_line.is_trusted() {
+            let typed = slot.vi_line.text().to_string();
+            if let Some(sess) = slot.session.as_mut() {
+                sess.note_prompt_anchor(&typed);
+            }
+        }
+        let was_trusted = slot.vi_line.is_trusted();
+        let observed = slot.vi_line.observe(key);
+        // ↑↓ 回忆历史、←→ 改行之后本地镜像不可信，但屏幕上这一行仍是真命令：
+        // 回车时照屏幕再认一次，认出来就照常接管（这是"内置编辑器没生效"最常见的原因）。
+        let target = match observed {
+            Some(target) => Some(target),
+            None if matches!(key.code, KeyCode::Enter) && !was_trusted => slot
+                .session
+                .as_ref()
+                .and_then(|s| s.screen_input_line())
+                .and_then(|line| crate::vi_edit::vi_target(&line)),
+            None => None,
+        };
+        let Some(target) = target else {
             // 回车被放行、但这行看着像 vi 命令：告诉用户是补全/光标动过，不是设置没生效。
             if let Some(name) = slot.vi_line.take_skipped() {
                 slot.status = Some(format!(
-                    "这行动过光标或被补全过，内置编辑器不接管；{name} 交给远端 vi"
+                    "这行动过光标（↑↓ 历史等）或被补全过，内置编辑器不接管；{name} 交给远端 vi"
                 ));
             }
             return false;

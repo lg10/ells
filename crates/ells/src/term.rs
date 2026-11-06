@@ -5,6 +5,7 @@
 
 use std::io::{stdout, Write};
 
+use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{DisableBracketedPaste, DisableMouseCapture};
 use crossterm::terminal::{disable_raw_mode, LeaveAlternateScreen};
 use crossterm::execute;
@@ -17,13 +18,28 @@ pub fn restore_terminal() {
         out,
         DisableBracketedPaste,
         DisableMouseCapture,
-        LeaveAlternateScreen
+        LeaveAlternateScreen,
+        SetCursorStyle::DefaultUserShape
     );
     // 撤销可能残留的颜色/加粗与光标隐藏，否则用户下一条命令是彩色的
     let _ = out.write_all(b"\x1b[0m\x1b[?25h");
     let _ = out.flush();
     // 空标题 = 让终端回落到默认标签名（Windows Terminal/iTerm2 均如此处理）
     set_term_title("");
+}
+
+/// 内置编辑器的光标形状：闪烁细竖线（DECSCUSR 5），关闭时恢复终端默认。
+/// 形状由终端绘制，所以不会像反显格子那样盖掉光标下的字符；
+/// 不认这条指令的终端会保持原样，不会更差。
+pub fn set_editor_cursor(on: bool) {
+    let mut out = stdout();
+    let shape = if on {
+        SetCursorStyle::BlinkingBar
+    } else {
+        SetCursorStyle::DefaultUserShape
+    };
+    let _ = execute!(out, shape);
+    let _ = out.flush();
 }
 
 /// 通过 OSC 52 转义序列把文本放进终端模拟器的剪贴板

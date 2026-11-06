@@ -113,7 +113,7 @@ impl LineMirror {
 
 /// 从一整行里认出"可接管的 vi 命令"，给出那个文件名。
 /// 多个文件、无文件名、命令前缀（sudo/env/…）一律返回 None。
-fn vi_target(line: &str) -> Option<String> {
+pub fn vi_target(line: &str) -> Option<String> {
     let tokens: Vec<&str> = line.split_whitespace().collect();
     let first = *tokens.first()?;
     // ./vi 这类当前目录里的脚本不是系统编辑器，别替它做文件接管。

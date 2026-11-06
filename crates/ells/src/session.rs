@@ -41,6 +41,9 @@ pub struct SessionState {
     hold_receive: bool,
     /// 远端输出里刚出现过 `docker ps` 的表头：底栏借这个提一句"F4 看容器"。
     docker_hint: crate::containers::DockerHintClock,
+    /// 提示符锚点（宽度 + 原文）：↑↓ 回忆历史后本地镜像不可信，
+    /// 但屏幕上这一行仍是真相，回车时据此把命令捞回来。
+    prompt_anchor: Option<(u16, String)>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -82,6 +85,7 @@ impl SessionState {
             abort_retries: 0,
             hold_receive: false,
             docker_hint: Default::default(),
+            prompt_anchor: None,
         }
     }
 
@@ -138,6 +142,22 @@ impl SessionState {
     /// 还没提交的那一行（ells 已经吞掉了回车）。
     pub fn send_raw(&mut self, bytes: &[u8]) {
         self.feed_input(bytes.to_vec());
+    }
+
+    /// 每个按键交给远端之前对一次账：屏幕光标左侧应该正好是本地镜像里的文本，
+    /// 对上了就把"提示符占几列、原文是什么"记下来。回声还没跟上的那一下不更新，
+    /// 宁可沿用上一次的锚点（提示符宽度一般不变）。
+    pub fn note_prompt_anchor(&mut self, typed: &str) {
+        if let Some(anchor) = prompt_anchor(self.emu.screen(), typed) {
+            self.prompt_anchor = Some(anchor);
+        }
+    }
+
+    /// 光标所在行、提示符之后的命令文本。只在提示符原文没被盖掉时返回：
+    /// 滚动或后台输出动过这一行就放弃——宁可交给远端，也不猜。
+    pub fn screen_input_line(&self) -> Option<String> {
+        let anchor = self.prompt_anchor.as_ref()?;
+        input_after_anchor(self.emu.screen(), anchor, self.emu.size().1)
     }
 
     fn feed_input(&mut self, bytes: Vec<u8>) {
@@ -673,10 +693,119 @@ fn term_size() -> (u16, u16) {
     crossterm::terminal::size().map(|(c, r)| (c as u16, r as u16)).unwrap_or((80, 24))
 }
 
+/// 屏幕上 `row` 行 `[from, to)` 列的纯文本（宽字符占格、续格为空串）。
+fn screen_text(screen: &ells_term::vt100::Screen, row: u16, from: u16, to: u16) -> String {
+    (from..to)
+        .filter_map(|col| screen.cell(row, col))
+        .map(|cell| cell.contents())
+        .collect()
+}
+
+/// 光标左侧 `typed` 对应的提示符锚点：`(提示符列数, 提示符原文)`。
+/// 屏幕上还没回显这段文本时返回 `None`——这一下不记，免得把命令算进提示符。
+fn prompt_anchor(
+    screen: &ells_term::vt100::Screen,
+    typed: &str,
+) -> Option<(u16, String)> {
+    use unicode_width::UnicodeWidthChar;
+    let (row, col) = screen.cursor_position();
+    let width: usize = typed.chars().map(|c| c.width().unwrap_or(0)).sum();
+    if width > col as usize {
+        return None;
+    }
+    let start = col - width as u16;
+    if width > 0 && screen_text(screen, row, start, col) != typed {
+        return None;
+    }
+    Some((start, screen_text(screen, row, 0, start)))
+}
+
+/// 光标那一行、锚点之后的内容；提示符原文对不上（这行已经不是原来那行了）就放弃。
+fn input_after_anchor(
+    screen: &ells_term::vt100::Screen,
+    (start, prefix): &(u16, String),
+    cols: u16,
+) -> Option<String> {
+    let (row, _) = screen.cursor_position();
+    if screen_text(screen, row, 0, *start) != *prefix {
+        return None;
+    }
+    let mut line = screen_text(screen, row, *start, cols);
+    line.truncate(line.trim_end().len());
+    (!line.is_empty()).then_some(line)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{reading_order, selection_covers, slice_columns, view_line, word_columns, word_selection};
+    use super::{
+        input_after_anchor, prompt_anchor, reading_order, selection_covers, slice_columns,
+        view_line, word_columns, word_selection,
+    };
+    use ells_term::vt100::Parser;
     use ratatui::layout::Rect;
+
+    fn parser(bytes: &[u8]) -> Parser {
+        let mut p = Parser::new(10, 60, 0);
+        p.process(bytes);
+        p
+    }
+
+    /// 核心场景：↑ 回忆历史后本地镜像不可信，回车要靠屏幕上这一行把命令捞回来。
+    #[test]
+    fn history_recall_is_recovered_from_the_screen() {
+        let mut p = parser(b"[root@host ~]# vi cli");
+        let anchor = prompt_anchor(p.screen(), "vi cli").expect("提示符锚点");
+        assert_eq!(anchor.0, 15, "提示符占 15 列");
+        // readline 清行并回显上一条历史命令
+        p.process(b"\r\x1b[2K[root@host ~]# vi client.ovpn");
+        let line = input_after_anchor(p.screen(), &anchor, 60).expect("从屏幕还原命令");
+        assert_eq!(line, "vi client.ovpn");
+    }
+
+    /// 光标停在行中间（按过 ←/Home）也要取整行，不能只取到光标。
+    #[test]
+    fn the_whole_line_is_read_even_mid_cursor() {
+        let mut p = parser(b"[root@host ~]# vi client.ovpn");
+        let anchor = prompt_anchor(p.screen(), "vi client.ovpn").unwrap();
+        p.process(b"\x1b[9D");
+        assert_eq!(
+            input_after_anchor(p.screen(), &anchor, 60).as_deref(),
+            Some("vi client.ovpn")
+        );
+    }
+
+    /// 提示符行被别的东西盖掉（滚动、后台输出）就不猜。
+    #[test]
+    fn a_changed_prompt_row_invalidates_the_anchor() {
+        let mut p = parser(b"[root@host ~]# ls");
+        let anchor = prompt_anchor(p.screen(), "ls").unwrap();
+        p.process(b"\r\x1b[2K[other@box ~]$ vi client.ovpn");
+        assert_eq!(input_after_anchor(p.screen(), &anchor, 60), None);
+    }
+
+    /// 回声还没跟上时不要记锚点，否则会把命令的一部分算进提示符。
+    #[test]
+    fn an_echo_that_lags_behind_does_not_set_the_anchor() {
+        let p = parser(b"[root@host ~]# ");
+        assert_eq!(prompt_anchor(p.screen(), "vi"), None);
+    }
+
+    /// 宽字符按显示列算：中文文件名占两列。
+    #[test]
+    fn wide_characters_count_in_columns_not_chars() {
+        let p = parser("[root@host ~]# vi 中文.md".as_bytes());
+        let anchor = prompt_anchor(p.screen(), "vi 中文.md").expect("宽字符按两列算");
+        assert_eq!(anchor.0, 15);
+    }
+
+    /// 空行没有命令可还原；提示符原文仍然记得下来供下一行用。
+    #[test]
+    fn an_empty_line_has_nothing_to_recover() {
+        let p = parser(b"[root@host ~]# ");
+        let anchor = prompt_anchor(p.screen(), "").unwrap();
+        assert_eq!(anchor, (15, "[root@host ~]# ".to_string()));
+        assert_eq!(input_after_anchor(p.screen(), &anchor, 60), None);
+    }
 
     /// 视口行 → 内容行：回看时顶行会往历史里退，实时底部时顶行就是历史长度的位置。
     #[test]

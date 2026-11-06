@@ -290,6 +290,44 @@ fn syntect_theme() -> &'static str {
     }
 }
 
+fn editor_theme() -> EditorTheme<'static> {
+    let base = Style::default().fg(theme::text()).bg(theme::bg());
+    EditorTheme::default()
+        .base(base)
+        // 光标交给终端硬件光标（闪烁细竖线）：光标格必须和正文同色，
+        // 否则 edtui 会把整格刷成方块，反而把字盖住。
+        .cursor_style(base)
+        .selection_style(Style::default().fg(theme::on_accent()).bg(theme::select_bg()))
+        .line_numbers_style(Style::default().fg(theme::muted()).bg(theme::bg()))
+        .hide_status_line()
+}
+
+/// `:` 命令行的硬件光标位置：紧跟在 `:{buf}` 之后，宽字符按显示列算。
+fn ex_cursor(area: Rect, buf: &str) -> ratatui::layout::Position {
+    use unicode_width::UnicodeWidthStr;
+    let x = area.x.saturating_add(1 + UnicodeWidthStr::width(buf) as u16);
+    ratatui::layout::Position::new(x.min(area.right().saturating_sub(1)), area.y)
+}
+
+/// 渲染正文，并把 edtui 算出的光标位置（绝对屏幕坐标）交回去。
+fn render_body(
+    f: &mut Frame,
+    area: Rect,
+    ed: &mut EmbeddedEdit,
+    theme: EditorTheme<'static>,
+    highlighter: Option<SyntaxHighlighter>,
+) -> Option<ratatui::layout::Position> {
+    let view = EditorView::new(&mut ed.state)
+        .theme(theme)
+        .line_numbers(LineNumbers::Absolute)
+        .wrap(false)
+        .tab_width(4)
+        .syntax_highlighter(highlighter);
+    view.render(area, f.buffer_mut());
+    let pos = ed.state.cursor_screen_position()?;
+    area.contains(pos).then_some(pos)
+}
+
 pub fn draw_panel(f: &mut Frame, area: Rect, app: &mut crate::app::App) {
     let idx = app.active;
     let status = app.slots[idx].status.clone();
@@ -320,17 +358,6 @@ pub fn draw_panel(f: &mut Frame, area: Rect, app: &mut crate::app::App) {
     }
     let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
 
-    let editor_theme = EditorTheme::default()
-        .base(Style::default().fg(theme::text()).bg(theme::bg()))
-        .cursor_style(
-            Style::default()
-                .fg(theme::on_accent())
-                .bg(theme::accent_bg())
-                .add_modifier(Modifier::BOLD),
-        )
-        .selection_style(Style::default().fg(theme::on_accent()).bg(theme::select_bg()))
-        .line_numbers_style(Style::default().fg(theme::muted()).bg(theme::bg()))
-        .hide_status_line();
     let highlighter = if ed.highlight {
         ed.extension
             .as_deref()
@@ -338,19 +365,21 @@ pub fn draw_panel(f: &mut Frame, area: Rect, app: &mut crate::app::App) {
     } else {
         None
     };
-    let view = EditorView::new(&mut ed.state)
-        .theme(editor_theme)
-        .line_numbers(LineNumbers::Absolute)
-        .wrap(false)
-        .tab_width(4)
-        .syntax_highlighter(highlighter);
-    view.render(chunks[0], f.buffer_mut());
+    let cursor = render_body(f, chunks[0], ed, editor_theme(), highlighter);
+    // `:` 命令行打开时，硬件光标跟着它走；否则留在正文里。
+    let cursor = match &ed.ex {
+        Some(buf) => Some(ex_cursor(chunks[1], buf)),
+        None => cursor,
+    };
+    if let Some(pos) = cursor {
+        f.set_cursor_position(pos);
+    }
 
     // 命令行打开时整条底栏让给它，和 vim 的 `:` 行一致。
     let line = if let Some(buf) = &ed.ex {
         Line::from(vec![
             Span::styled(
-                format!(":{buf}▏"),
+                format!(":{buf}"),
                 Style::default()
                     .fg(theme::on_accent())
                     .bg(theme::accent_bg())
@@ -397,6 +426,8 @@ mod tests {
         HIGHLIGHT_MAX_LINES, WHEEL_LINES,
     };
     use edtui::clipboard::ClipboardTrait;
+
+    use crate::theme;
 
     fn temp_file(contents: &[u8], suffix: &str) -> PathBuf {
         static SEQ: AtomicU32 = AtomicU32::new(0);
@@ -555,5 +586,58 @@ mod tests {
         let mut cb = TerminalClipboard { text: String::new(), emit: false };
         cb.set_text("hi".to_string());
         assert_eq!(cb.get_text(), "hi");
+    }
+
+    /// 光标必须交给终端硬件光标画：edtui 只报位置，光标格保持正文样式。
+    /// 否则会退回到"整格反显方块"，把光标下的字符盖掉。
+    #[test]
+    fn the_cursor_is_handed_to_the_terminal_instead_of_painted_as_a_block() {
+        use ratatui::backend::TestBackend;
+        use ratatui::style::Modifier;
+        use ratatui::Terminal;
+
+        theme::apply(theme::Theme::Dark);
+        let path = temp_file(b"hello\nworld\n", ".txt");
+        let mut ed = EmbeddedEdit::open("/tmp/a.txt", &path, "a.txt").expect("open");
+        ed.state.cursor.col = 2;
+
+        let mut terminal = Terminal::new(TestBackend::new(30, 6)).unwrap();
+        let mut pos = None;
+        let mut base_bg = None;
+        terminal
+            .draw(|f| {
+                let theme = super::editor_theme();
+                base_bg = theme.base.bg;
+                pos = super::render_body(f, f.area(), &mut ed, theme, None);
+                if let Some(p) = pos {
+                    f.set_cursor_position(p);
+                }
+            })
+            .unwrap();
+
+        let pos = pos.expect("光标位置要交回框架");
+        assert_eq!(pos.y, 0);
+        assert!(terminal.backend().cursor_visible(), "硬件光标要显示出来");
+        assert_eq!(terminal.get_cursor_position().unwrap(), pos);
+
+        let cell = &terminal.backend().buffer()[(pos.x, pos.y)];
+        assert_eq!(cell.symbol(), "l", "光标下的字符不能被盖掉");
+        assert_eq!(cell.style().bg, base_bg, "光标格不再是方块底色");
+        assert!(!cell.style().add_modifier.contains(Modifier::REVERSED));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// `:` 行的光标跟在输入后面；中文按显示列算，超宽时钳在行尾。
+    #[test]
+    fn the_ex_prompt_cursor_sits_right_after_the_typed_text() {
+        use ratatui::layout::{Position, Rect};
+
+        let area = Rect::new(2, 20, 40, 1);
+        assert_eq!(super::ex_cursor(area, "w"), Position::new(4, 20));
+        assert_eq!(super::ex_cursor(area, "w 文件"), Position::new(9, 20));
+        assert_eq!(
+            super::ex_cursor(Rect::new(0, 0, 5, 1), "wwwwww"),
+            Position::new(4, 0)
+        );
     }
 }

@@ -87,6 +87,11 @@ impl Emulator {
         self.parser.screen().application_cursor()
     }
 
+    /// 远端当前是不是占着备用屏（vim / htop / less 这类全屏程序）。
+    pub fn alternate_screen(&self) -> bool {
+        self.parser.screen().alternate_screen()
+    }
+
     /// 远端有没有把鼠标要过去（1000/1002/1003），以及要的编码格式（1005/1006）。
     pub fn mouse_protocol(&self) -> (MouseProtocolMode, MouseProtocolEncoding) {
         let screen = self.parser.screen();
