@@ -9,6 +9,15 @@ English summary lives in each GitHub Release note; this file is the full history
 发版流程：把下面的 `[未发布 / Unreleased]` 小节改名为 `[x.y.z] - 日期`，再打 tag。
 CI 的 release 作业会按 tag 从本文件截取对应小节，作为 GitHub Release 说明。
 
+## [0.2.11] - 2026-11-06
+
+### 修复
+- **补齐 macOS 产物**：GitHub 已退役 macOS 14 运行器（作业报
+  `The configuration 'macos-14-arm64-us-default' is not supported`），v0.2.10 的 Release
+  在 macOS 作业上被取消、没有产出安装包。CI 与 Release 工作流改用 `macos-15`（arm64，
+  x86_64 继续交叉编译），本版重新发布三平台产物；功能变更与 [0.2.10] 相同——内置编辑器桌面
+  手感、面板内 `:w` / `:wq` / `:q` / `:q!`、vi 文件名 Tab 补全不再绕开接管、`:wq` 竞态修复。
+
 ## [0.2.10] - 2026-11-06
 
 ### 新增

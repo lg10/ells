@@ -17,10 +17,10 @@ jobs:
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             artifact: ells-linux-x86_64
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
             artifact: ells-macos-aarch64
-          - os: macos-14
+          - os: macos-15
             target: x86_64-apple-darwin
             artifact: ells-macos-x86_64
           - os: windows-latest
@@ -84,7 +84,7 @@ jobs:
   # 用 macOS 自带 /bin/sh（GNU bash 3.2）在 LC_ALL=C 下真跑一遍安装 + 卸载：
   # C locale 会复现"展开后紧跟多字节字符被并入变量名"这类老 shell 崩溃
   install-smoke:
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
       - name: Lint shell expansions
