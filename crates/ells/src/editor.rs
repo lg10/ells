@@ -5,7 +5,12 @@
 
 use std::path::Path;
 
-use crossterm::event::{KeyEvent, KeyModifiers, MouseEvent as CtMouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent as CtMouseEvent, MouseEventKind};
+use edtui::actions::motion::{MoveToFirstRow, MoveToLastRow};
+use edtui::actions::{
+    CopySelection, MoveToEndOfLine, MoveToStartOfLine, Redo, SwitchMode, Undo,
+};
+use edtui::clipboard::ClipboardTrait;
 use edtui::{
     EditorEventHandler, EditorMode, EditorState, EditorTheme, EditorView, LineNumbers, Lines,
     SyntaxHighlighter,
@@ -23,6 +28,53 @@ use crate::theme;
 pub const HIGHLIGHT_MAX_BYTES: usize = 512 * 1024;
 pub const HIGHLIGHT_MAX_LINES: usize = 10_000;
 
+/// 一格滚轮走几行：edtui 自己一格只走 1 行，桌面编辑器的手感通常是 3 行。
+pub const WHEEL_LINES: usize = 3;
+
+/// 滚轮方向：delta > 0 是向下滚（events.rs 里 ScrollDown），正文要往下走。
+pub fn wheel_kind(delta: i8) -> MouseEventKind {
+    if delta > 0 {
+        MouseEventKind::ScrollDown
+    } else {
+        MouseEventKind::ScrollUp
+    }
+}
+
+/// 系统剪贴板：写出走 OSC 52，与会话里拖选复制同一条路（SSH 里也能落到本机）；
+/// 读回由终端粘贴事件负责，这里保留内部副本供 vim 的 `p` 使用。
+struct TerminalClipboard {
+    text: String,
+    emit: bool,
+}
+
+impl Default for TerminalClipboard {
+    fn default() -> Self {
+        Self { text: String::new(), emit: true }
+    }
+}
+
+impl ClipboardTrait for TerminalClipboard {
+    fn set_text(&mut self, text: String) {
+        if self.emit && !text.is_empty() {
+            crate::term::copy_osc52(&text);
+        }
+        self.text = text;
+    }
+
+    fn get_text(&mut self) -> String {
+        self.text.clone()
+    }
+}
+
+/// `:` 命令行执行结果：由 app 负责保存 / 关闭，编辑器只管解析。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExAction {
+    None,
+    Save { close: bool },
+    Quit { force: bool },
+    Unknown,
+}
+
 pub struct EmbeddedEdit {
     pub remote: String,
     pub local: std::path::PathBuf,
@@ -38,6 +90,8 @@ pub struct EmbeddedEdit {
     pub highlight: bool,
     /// 有未保存改动时第一次 Ctrl-Q 只提示，再按一次才丢弃。
     pub confirm_close: bool,
+    /// `:` 命令行缓冲：Some("") 表示冒号已按下、正在输入命令。
+    pub ex: Option<String>,
 }
 
 impl EmbeddedEdit {
@@ -55,17 +109,22 @@ impl EmbeddedEdit {
         let highlight = extension.is_some()
             && text.len() <= HIGHLIGHT_MAX_BYTES
             && text.lines().count() <= HIGHLIGHT_MAX_LINES;
+        // 打开就能打字（INSERT），不是先按 i；复制 / 粘贴接到系统剪贴板。
+        let mut state = EditorState::new(Lines::from(text.as_str()));
+        state.mode = EditorMode::Insert;
+        state.set_clipboard(TerminalClipboard::default());
         Ok(Self {
             remote: remote.to_string(),
             local: local.to_path_buf(),
             name: name.to_string(),
-            state: EditorState::new(Lines::from(text.as_str())),
+            state,
             handler: EditorEventHandler::default(),
             saved_text: text,
             extension,
             crlf,
             highlight,
             confirm_close: false,
+            ex: None,
         })
     }
 
@@ -122,6 +181,76 @@ impl EmbeddedEdit {
         self.handler.on_mouse_event(ev, &mut self.state);
     }
 
+    pub fn normal_mode(&self) -> bool {
+        self.state.mode == EditorMode::Normal
+    }
+
+    /// Ctrl-A：整篇选上（进入 VISUAL，随后 Ctrl-C / y 即可复制）。
+    pub fn select_all(&mut self) {
+        self.state.execute(MoveToFirstRow());
+        self.state.execute(MoveToStartOfLine());
+        self.state.execute(SwitchMode(EditorMode::Visual));
+        self.state.execute(MoveToLastRow());
+        self.state.execute(MoveToEndOfLine());
+    }
+
+    /// Ctrl-C：把当前选区写进系统剪贴板；没有选区时返回 false。
+    pub fn copy_selection(&mut self) -> bool {
+        if self.state.selection.is_none() {
+            return false;
+        }
+        self.state.execute(CopySelection);
+        if self.state.mode == EditorMode::Visual {
+            self.state.execute(SwitchMode(EditorMode::Normal));
+        }
+        true
+    }
+
+    pub fn undo(&mut self) {
+        self.state.execute(Undo);
+    }
+
+    pub fn redo(&mut self) {
+        self.state.execute(Redo);
+    }
+
+    pub fn ex_active(&self) -> bool {
+        self.ex.is_some()
+    }
+
+    pub fn ex_start(&mut self) {
+        self.ex = Some(String::new());
+    }
+
+    /// `:` 命令行的按键。Enter 时返回要执行的动作，缓冲区随即关闭。
+    pub fn ex_input(&mut self, key: KeyEvent) -> ExAction {
+        match key.code {
+            KeyCode::Esc => {
+                self.ex = None;
+            }
+            KeyCode::Enter => {
+                let cmd = self.ex.take().unwrap_or_default();
+                return parse_ex(cmd.trim());
+            }
+            KeyCode::Backspace => {
+                if let Some(buf) = self.ex.as_mut() {
+                    buf.pop();
+                }
+            }
+            KeyCode::Char(c)
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT)
+                    && !c.is_control() =>
+            {
+                if let Some(buf) = self.ex.as_mut() {
+                    buf.push(c);
+                }
+            }
+            _ => {}
+        }
+        ExAction::None
+    }
+
     fn mode_label(&self) -> &'static str {
         match self.state.mode {
             EditorMode::Normal => "NORMAL",
@@ -129,6 +258,16 @@ impl EmbeddedEdit {
             EditorMode::Visual => "VISUAL",
             EditorMode::Search => "SEARCH",
         }
+    }
+}
+
+fn parse_ex(cmd: &str) -> ExAction {
+    match cmd {
+        "w" | "write" => ExAction::Save { close: false },
+        "wq" | "x" | "exit" => ExAction::Save { close: true },
+        "q" | "quit" => ExAction::Quit { force: false },
+        "q!" | "quit!" => ExAction::Quit { force: true },
+        _ => ExAction::Unknown,
     }
 }
 
@@ -207,19 +346,38 @@ pub fn draw_panel(f: &mut Frame, area: Rect, app: &mut crate::app::App) {
         .syntax_highlighter(highlighter);
     view.render(chunks[0], f.buffer_mut());
 
-    let hint = status.unwrap_or_else(|| {
-        if ed.highlight {
-            "Ctrl-S 保存并回传 · Esc 退回 NORMAL".to_string()
-        } else {
-            "大文件已关高亮 · Ctrl-S 保存并回传".to_string()
-        }
-    });
-    let info = format!(" {} · {} 行", ed.remote, ed.line_count());
-    let line = Line::from(vec![
-        Span::styled(info, Style::default().fg(theme::dim()).bg(theme::bg())),
-        Span::raw("  "),
-        Span::styled(hint, Style::default().fg(theme::warn()).bg(theme::bg())),
-    ]);
+    // 命令行打开时整条底栏让给它，和 vim 的 `:` 行一致。
+    let line = if let Some(buf) = &ed.ex {
+        Line::from(vec![
+            Span::styled(
+                format!(":{buf}▏"),
+                Style::default()
+                    .fg(theme::on_accent())
+                    .bg(theme::accent_bg())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                "Enter 执行 · Esc 取消（:w · :wq · :q · :q!）",
+                Style::default().fg(theme::dim()).bg(theme::bg()),
+            ),
+        ])
+    } else {
+        let hint = status.unwrap_or_else(|| {
+            let tail = "Ctrl-S 保存 · Ctrl-Q 退出 · 拖选后 Ctrl-C 复制 · Ctrl-A 全选";
+            if ed.highlight {
+                tail.to_string()
+            } else {
+                format!("大文件已关高亮 · {tail}")
+            }
+        });
+        let info = format!(" {} · {} 行", ed.remote, ed.line_count());
+        Line::from(vec![
+            Span::styled(info, Style::default().fg(theme::dim()).bg(theme::bg())),
+            Span::raw("  "),
+            Span::styled(hint, Style::default().fg(theme::warn()).bg(theme::bg())),
+        ])
+    };
     f.render_widget(
         Paragraph::new(line).style(Style::default().bg(theme::bg())),
         chunks[1],
@@ -231,7 +389,14 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    use super::{language_extension, EmbeddedEdit, HIGHLIGHT_MAX_LINES};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEventKind};
+    use edtui::EditorMode;
+
+    use super::{
+        language_extension, wheel_kind, ExAction, TerminalClipboard, EmbeddedEdit,
+        HIGHLIGHT_MAX_LINES, WHEEL_LINES,
+    };
+    use edtui::clipboard::ClipboardTrait;
 
     fn temp_file(contents: &[u8], suffix: &str) -> PathBuf {
         static SEQ: AtomicU32 = AtomicU32::new(0);
@@ -312,5 +477,83 @@ mod tests {
         assert_eq!(language_extension("Makefile"), None);
         assert_eq!(language_extension("trailing."), None);
         assert_eq!(language_extension("a.reallylongextension"), None);
+    }
+
+    fn press(ed: &mut EmbeddedEdit, code: KeyCode) {
+        ed.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    fn run_ex(ed: &mut EmbeddedEdit, text: &str) -> ExAction {
+        ed.ex_start();
+        for c in text.chars() {
+            ed.ex_input(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        ed.ex_input(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+    }
+
+    #[test]
+    fn opens_in_insert_mode_so_typing_works_immediately() {
+        let path = temp_file(b"hello\n", ".txt");
+        let mut ed = EmbeddedEdit::open("/tmp/a.txt", &path, "a.txt").expect("open");
+        assert_eq!(ed.state.mode, EditorMode::Insert);
+        press(&mut ed, KeyCode::Char('X'));
+        assert!(ed.text().starts_with('X'), "打开即可打字，不用先按 i");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn wheel_down_scrolls_the_view_down_three_lines() {
+        assert_eq!(wheel_kind(1), MouseEventKind::ScrollDown);
+        assert_eq!(wheel_kind(-1), MouseEventKind::ScrollUp);
+        assert_eq!(WHEEL_LINES, 3);
+    }
+
+    #[test]
+    fn select_all_then_copy_covers_the_buffer_and_returns_to_normal() {
+        let path = temp_file(b"one\ntwo\nthree", ".txt");
+        let mut ed = EmbeddedEdit::open("/tmp/a.txt", &path, "a.txt").expect("open");
+        ed.select_all();
+        assert!(ed.state.selection.is_some());
+        assert_eq!(ed.state.cursor.row, 2, "选区一直拉到末行");
+        assert!(ed.copy_selection());
+        assert!(ed.state.selection.is_none(), "复制后选区清空");
+        assert_eq!(ed.state.mode, EditorMode::Normal);
+        assert!(!ed.copy_selection(), "没有选区时复制不做事");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn ex_commands_map_to_save_and_quit() {
+        let path = temp_file(b"hello\n", ".txt");
+        let mut ed = EmbeddedEdit::open("/tmp/a.txt", &path, "a.txt").expect("open");
+        assert_eq!(run_ex(&mut ed, "w"), ExAction::Save { close: false });
+        assert_eq!(run_ex(&mut ed, "wq"), ExAction::Save { close: true });
+        assert_eq!(run_ex(&mut ed, "x"), ExAction::Save { close: true });
+        assert_eq!(run_ex(&mut ed, "q"), ExAction::Quit { force: false });
+        assert_eq!(run_ex(&mut ed, "quit!"), ExAction::Quit { force: true });
+        assert_eq!(run_ex(&mut ed, "zz"), ExAction::Unknown);
+        assert!(!ed.ex_active(), "执行后命令行关闭");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn esc_cancels_the_ex_command_line() {
+        let path = temp_file(b"hello\n", ".txt");
+        let mut ed = EmbeddedEdit::open("/tmp/a.txt", &path, "a.txt").expect("open");
+        ed.ex_start();
+        press(&mut ed, KeyCode::Char('w'));
+        assert_eq!(
+            ed.ex_input(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            ExAction::None
+        );
+        assert!(!ed.ex_active());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn terminal_clipboard_keeps_the_last_text() {
+        let mut cb = TerminalClipboard { text: String::new(), emit: false };
+        cb.set_text("hi".to_string());
+        assert_eq!(cb.get_text(), "hi");
     }
 }

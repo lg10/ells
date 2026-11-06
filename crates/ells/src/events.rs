@@ -172,9 +172,17 @@ pub enum AppEvent {
         remote: String,
         name: String,
     },
-    /// 解析失败（不存在 / 是目录 / 太大 / SFTP 出错）：不接管，
-    /// 把回车补发给远端，照旧用远端 vi 打开。
-    ViTargetFailed { slot: u32, seq: u64 },
+    /// 解析失败（不存在 / 是目录 / 太大 / SFTP 出错 / 超时）：不接管，
+    /// 把回车补发给远端，照旧用远端 vi 打开。`reason` 写进状态行，别再静默。
+    ViTargetFailed { slot: u32, seq: u64, reason: String },
+    /// 输入行里的文件名用 SFTP 补全完成。`append` 是要补进远端和镜像的字符；
+    /// `None` 表示补不了（没有匹配 / 多个候选 / 出错），`reason` 说明原因。
+    ViCompleted {
+        slot: u32,
+        seq: u64,
+        append: Option<String>,
+        reason: String,
+    },
     /// 传输通过覆盖确认、真正开跑：UI 这时才登记进度条目。
     SftpStarted {
         slot: u32,

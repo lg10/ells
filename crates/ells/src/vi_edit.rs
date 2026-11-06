@@ -20,6 +20,8 @@ const UNSAFE: [char; 19] = [
 pub struct LineMirror {
     text: String,
     trusted: bool,
+    /// 回车提交时这行已经不可信、但看着像 vi 命令：留给调用方提示"为什么没接管"。
+    skipped: Option<String>,
 }
 
 impl Default for LineMirror {
@@ -30,18 +32,38 @@ impl Default for LineMirror {
 
 impl LineMirror {
     pub fn new() -> Self {
-        Self { text: String::new(), trusted: true }
+        Self { text: String::new(), trusted: true, skipped: None }
     }
 
     /// 清空并恢复可信：回车已经提交、或用户按 Ctrl-C 重新开了一行。
     pub fn clear(&mut self) {
         self.text.clear();
         self.trusted = true;
+        self.skipped = None;
     }
 
-    #[cfg(test)]
-    fn text(&self) -> &str {
+    pub fn text(&self) -> &str {
         &self.text
+    }
+
+    /// 本地补全把远端回显也补上来的字符：镜像跟着走，这行仍然可信。
+    pub fn push_str(&mut self, s: &str) {
+        self.text.push_str(s);
+    }
+
+    /// 只有可信的行才敢在本地补全：动过光标之后镜像可能已经不是远端那行了。
+    pub fn is_trusted(&self) -> bool {
+        self.trusted
+    }
+
+    /// 补全失败时把这一行标成不可信：后续回车交给远端。
+    pub fn mark_untrusted(&mut self) {
+        self.trusted = false;
+    }
+
+    /// 取走"回车时被放行的 vi 命令目标"，只在刚回车后调用一次。
+    pub fn take_skipped(&mut self) -> Option<String> {
+        self.skipped.take()
     }
 
     /// 记录一个按键。回车时如果整行是一条可直接接管的 vi 命令，
@@ -54,9 +76,13 @@ impl LineMirror {
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         match key.code {
             KeyCode::Enter => {
-                let target = if self.trusted { vi_target(&self.text) } else { None };
+                let target = vi_target(&self.text);
+                let accepted = if self.trusted { target.clone() } else { None };
+                // 不可信的行仍然认出目标，只为了告诉用户"这行本来能接管，但因为动过光标/补全放弃了"。
+                let skipped = if accepted.is_none() && !self.trusted { target } else { None };
                 self.clear();
-                return target;
+                self.skipped = skipped;
+                return accepted;
             }
             // Ctrl-C 在 shell 里意味着"这一行作废、新起一行"。
             KeyCode::Char('c') if ctrl => self.clear(),
@@ -124,6 +150,54 @@ fn plain_path(path: &str) -> bool {
         None => path,
     };
     !rest.chars().any(|c| c.is_control() || UNSAFE.contains(&c))
+}
+
+/// 这一行现在要补全的「目录 + 前缀」：`vi /etc/ng` → (`/etc/`, `ng`)。
+///
+/// 只认正在写的最后一个文件名：行尾是空格（参数已写完）、已经出现过别的文件名
+/// （vi 多文件本就不接管）、或者不是一条可接管的 vi 命令时返回 None —— 调用方
+/// 把 Tab 原样交给远端。
+pub fn completion_request(line: &str) -> Option<(String, String)> {
+    if line.is_empty() || line.ends_with(char::is_whitespace) {
+        return None;
+    }
+    let tokens: Vec<&str> = line.split_whitespace().collect();
+    let first = *tokens.first()?;
+    if first.contains('/') && !first.starts_with('/') {
+        return None;
+    }
+    let base = first.rsplit('/').next().unwrap_or(first);
+    if !EDITORS.contains(&base) {
+        return None;
+    }
+    let partial = *tokens.last()?;
+    if partial == first {
+        return None;
+    }
+    // 前面已经写过一个文件名：vi 多文件不接管，补全也不该假装接管。
+    for tok in &tokens[1..tokens.len() - 1] {
+        if !tok.starts_with('-') && !tok.starts_with('+') {
+            return None;
+        }
+    }
+    if !plain_path(partial) {
+        return None;
+    }
+    if partial == "~" {
+        return Some(("~".to_string(), String::new()));
+    }
+    Some(match partial.rfind('/') {
+        Some(i) => (partial[..=i].to_string(), partial[i + 1..].to_string()),
+        None => (String::new(), partial.to_string()),
+    })
+}
+
+/// 名字里带空格 / 通配符 / 引号时，bash 会自己转义；本地补出去的回显就对不上了。
+pub fn completion_name_safe(name: &str) -> bool {
+    !name.is_empty()
+        && !name
+            .chars()
+            .any(|c| c.is_control() || c.is_whitespace() || UNSAFE.contains(&c))
 }
 
 #[cfg(test)]
@@ -280,5 +354,72 @@ mod tests {
         type_line(&mut m, "vi /etc/hostss");
         m.observe(&key(KeyCode::Backspace));
         assert_eq!(m.observe(&key(KeyCode::Enter)).as_deref(), Some("/etc/hosts"));
+    }
+
+    #[test]
+    fn completion_splits_the_word_being_written() {
+        assert_eq!(
+            completion_request("vi /etc/ng"),
+            Some(("/etc/".to_string(), "ng".to_string()))
+        );
+        assert_eq!(
+            completion_request("vim notes.t"),
+            Some((String::new(), "notes.t".to_string()))
+        );
+        assert_eq!(
+            completion_request("nvim ~/do"),
+            Some(("~/".to_string(), "do".to_string()))
+        );
+        assert_eq!(
+            completion_request("vi ~"),
+            Some(("~".to_string(), String::new()))
+        );
+        assert_eq!(
+            completion_request("vim -R +120 /var/lo"),
+            Some(("/var/".to_string(), "lo".to_string()))
+        );
+    }
+
+    #[test]
+    fn completion_stops_at_lines_it_would_not_take_over() {
+        for line in [
+            "vi",
+            "vi ",
+            "vi a.txt ",
+            "sudo vi /etc/ng",
+            "vi one two.txt",
+            "vi \"a b",
+            "./vi x",
+        ] {
+            assert_eq!(completion_request(line), None, "{line} 不该补全");
+        }
+    }
+
+    #[test]
+    fn names_bash_would_escape_are_not_completed_locally() {
+        assert!(completion_name_safe("notes.txt"));
+        assert!(completion_name_safe("中文.md"));
+        assert!(!completion_name_safe("my notes.txt"));
+        assert!(!completion_name_safe("$x"));
+        assert!(!completion_name_safe("a*b"));
+        assert!(!completion_name_safe(""));
+    }
+
+    #[test]
+    fn an_untrusted_line_reports_the_target_it_skipped() {
+        let mut m = LineMirror::new();
+        type_line(&mut m, "vi a.txt");
+        m.observe(&key(KeyCode::Left));
+        assert_eq!(m.observe(&key(KeyCode::Enter)), None);
+        assert_eq!(m.take_skipped().as_deref(), Some("a.txt"));
+        assert_eq!(m.take_skipped(), None, "提示只取一次");
+    }
+
+    #[test]
+    fn a_completed_suffix_keeps_the_line_interceptable() {
+        let mut m = LineMirror::new();
+        type_line(&mut m, "vi no");
+        m.push_str("tes.txt ");
+        assert_eq!(m.observe(&key(KeyCode::Enter)).as_deref(), Some("notes.txt"));
     }
 }

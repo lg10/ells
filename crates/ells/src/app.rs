@@ -541,6 +541,9 @@ pub struct LocalEdit {
     /// 正在回传：期间再来的保存先记一笔，传完立刻补一次。
     saving: bool,
     pending_save: bool,
+    /// 已经写好临时文件、EditSaved 还在事件队列里：这时关面板不能把会话丢掉，
+    /// 否则 `:wq` 会"看起来保存了"，回传任务却找不到这次编辑。
+    awaiting_save: bool,
     /// 编辑器是 ells 内置面板：没有外部程序，也没有 30 分钟的文件监视，
     /// 面板关掉、最后一笔传完就该结束这次编辑会话。
     embedded: bool,
@@ -2044,6 +2047,7 @@ impl App {
                         remote_mtime,
                         saving: false,
                         pending_save: false,
+                        awaiting_save: false,
                         embedded,
                     });
                     if embedded {
@@ -2090,11 +2094,13 @@ impl App {
                     if let Some(edit) = slot.edit.as_mut() {
                         if edit.remote != remote || edit.local != local {
                             // 属于另一次编辑（这个标签已经换过文件）：忽略。
+                            edit.awaiting_save = false;
                         } else if edit.saving {
                             // 上一笔还在传：记下来，传完立刻补一次。
                             edit.pending_save = true;
                         } else if let Some(sftp) = sftp {
                             edit.saving = true;
+                            edit.awaiting_save = false;
                             spawn = Some((
                                 sftp,
                                 remote.clone(),
@@ -2102,6 +2108,10 @@ impl App {
                                 edit.remote_mtime,
                             ));
                             slot.status = Some(format!("正在回传 {}…", remote_name(&remote)));
+                        } else {
+                            // 连接没了：这一笔传不出去，别让会话永远挂在"保存中"。
+                            edit.awaiting_save = false;
+                            edit.pending_save = false;
                         }
                     }
                     if let Some((sftp, remote, local, baseline)) = spawn {
@@ -2266,7 +2276,7 @@ impl App {
                         }
                     }
                 }
-                AppEvent::ViTargetFailed { seq, .. } => {
+                AppEvent::ViTargetFailed { seq, reason, .. } => {
                     let slot = &mut self.slots[self.work];
                     if slot.vi_pending == Some(seq) {
                         slot.vi_pending = None;
@@ -2274,7 +2284,30 @@ impl App {
                         if let Some(sess) = &mut slot.session {
                             sess.send_raw(b"\r");
                         }
-                        slot.status = None;
+                        slot.status = Some(format!("内置编辑器没接管：{reason} · 已交给远端 vi"));
+                    }
+                }
+                AppEvent::ViCompleted { seq, append, reason, .. } => {
+                    let slot = &mut self.slots[self.work];
+                    if slot.vi_pending == Some(seq) {
+                        slot.vi_pending = None;
+                        match append {
+                            Some(text) => {
+                                if let Some(sess) = &mut slot.session {
+                                    sess.send_raw(text.as_bytes());
+                                }
+                                slot.vi_line.push_str(&text);
+                                slot.status = None;
+                            }
+                            None => {
+                                // 补不了就把 Tab 交给远端，这行以后不再接管（回车时会说明原因）。
+                                slot.vi_line.mark_untrusted();
+                                if let Some(sess) = &mut slot.session {
+                                    sess.send_raw(b"\t");
+                                }
+                                slot.status = Some(format!("{reason} · 这次交给远端补全"));
+                            }
+                        }
                     }
                 }
             }
@@ -2530,12 +2563,50 @@ impl App {
             }
             return true;
         }
-        let embedded = slot.session.as_ref().is_some_and(|s| s.mode == TermMode::Embedded);
-        let Some(sftp) = slot.sftp.clone().filter(|_| embedded) else {
-            slot.vi_line.clear();
+        // Tab 先在本地补全文件名：补上了，镜像仍然可信，回车照样会被接管。
+        // 不这么做的话，只要用过一次补全，这行就永远交给远端 vi —— 这是最容易
+        // 让人以为"内置编辑器根本没生效"的路径。
+        if matches!(key.code, KeyCode::Tab)
+            && !key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::ALT)
+        {
+            let line = slot.vi_line.text().to_string();
+            if slot.vi_line.is_trusted() && crate::vi_edit::completion_request(&line).is_some() {
+                let Some(sftp) = slot.sftp.clone() else {
+                    slot.vi_line.mark_untrusted();
+                    return false;
+                };
+                let seq = VI_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+                let cwd = slot.remote_cwd.clone();
+                let slot_id = slot.id;
+                slot.vi_pending = Some(seq);
+                slot.status = Some("正在补全…".to_string());
+                let tx = self.event_tx.clone();
+                tokio::spawn(async move {
+                    let res = tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        resolve_vi_completion(&sftp, &line, &cwd),
+                    )
+                    .await;
+                    let (append, reason) = match res {
+                        Ok(Ok(text)) => (Some(text), String::new()),
+                        Ok(Err(err)) => (None, err),
+                        Err(_) => (None, "补全超时".to_string()),
+                    };
+                    let _ = tx.send(AppEvent::ViCompleted { slot: slot_id, seq, append, reason });
+                });
+                return true;
+            }
+        }
+        let Some(target) = slot.vi_line.observe(key) else {
+            // 回车被放行、但这行看着像 vi 命令：告诉用户是补全/光标动过，不是设置没生效。
+            if let Some(name) = slot.vi_line.take_skipped() {
+                slot.status = Some(format!(
+                    "这行动过光标或被补全过，内置编辑器不接管；{name} 交给远端 vi"
+                ));
+            }
             return false;
         };
-        let Some(target) = slot.vi_line.observe(key) else { return false; };
         if let Some(edit) = &slot.edit {
             slot.status = Some(format!(
                 "{} 正在编辑中，vi 命令已交给远端",
@@ -2543,6 +2614,10 @@ impl App {
             ));
             return false;
         }
+        let Some(sftp) = slot.sftp.clone() else {
+            slot.status = Some(format!("这条连接没有 SFTP，{target} 交给远端 vi"));
+            return false;
+        };
         let seq = VI_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
         let cwd = slot.remote_cwd.clone();
         let slot_id = slot.id;
@@ -2563,7 +2638,12 @@ impl App {
                     remote,
                     name,
                 },
-                _ => AppEvent::ViTargetFailed { slot: slot_id, seq },
+                Ok(Err(reason)) => AppEvent::ViTargetFailed { slot: slot_id, seq, reason },
+                Err(_) => AppEvent::ViTargetFailed {
+                    slot: slot_id,
+                    seq,
+                    reason: "确认超时".to_string(),
+                },
             };
             let _ = tx.send(ev);
         });
@@ -2697,7 +2777,8 @@ impl App {
             | AppEvent::EditUploaded { slot, .. }
             | AppEvent::EditExpired { slot, .. }
             | AppEvent::ViTargetResolved { slot, .. }
-            | AppEvent::ViTargetFailed { slot, .. } => *slot,
+            | AppEvent::ViTargetFailed { slot, .. }
+            | AppEvent::ViCompleted { slot, .. } => *slot,
             _ => return Some(self.active),
         };
         self.slots.iter().position(|s| s.id == id)
@@ -3582,12 +3663,10 @@ impl App {
     fn handle_scroll(&mut self, column: u16, row: u16, delta: i8, modifiers: KeyModifiers) {
         // 编辑器面板里的滚轮滚的是正文视图，不是下层会话的历史。
         if self.slots[self.work].editor.is_some() {
-            let kind = if delta > 0 {
-                CtMouseEventKind::ScrollUp
-            } else {
-                CtMouseEventKind::ScrollDown
-            };
-            self.editor_mouse(kind, column, row, modifiers);
+            let kind = crate::editor::wheel_kind(delta);
+            for _ in 0..crate::editor::WHEEL_LINES {
+                self.editor_mouse(kind, column, row, modifiers);
+            }
             return;
         }
         if self.slots[self.work].docker.open {
@@ -4385,9 +4464,41 @@ impl App {
         );
     }
 
-    /// 内置编辑器面板的按键：Ctrl-S 保存回传、Ctrl-Q 退出，其余交给 edtui。
+    /// 内置编辑器面板的按键：桌面快捷键 + `:` 命令行，其余交给 edtui。
     fn handle_editor_key(&mut self, key: &KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        // `:` 命令行打开时它先吃按键，免得被当成正文输入。
+        if self.slots[self.work]
+            .editor
+            .as_ref()
+            .is_some_and(|e| e.ex_active())
+        {
+            let action = self.slots[self.work]
+                .editor
+                .as_mut()
+                .map(|ed| ed.ex_input(*key));
+            match action {
+                Some(crate::editor::ExAction::Save { close }) => {
+                    self.save_editor();
+                    if close {
+                        self.close_editor();
+                    }
+                }
+                Some(crate::editor::ExAction::Quit { force }) => {
+                    if force {
+                        self.force_close_editor();
+                    } else {
+                        self.close_editor();
+                    }
+                }
+                Some(crate::editor::ExAction::Unknown) => {
+                    self.slots[self.work].status =
+                        Some("只认 :w / :wq / :q / :q!".to_string());
+                }
+                _ => {}
+            }
+            return;
+        }
         if ctrl && matches!(key.code, KeyCode::Char('s')) {
             self.save_editor();
             return;
@@ -4396,13 +4507,71 @@ impl App {
             self.close_editor();
             return;
         }
+        if ctrl {
+            match key.code {
+                KeyCode::Char('c') => {
+                    self.copy_editor_selection();
+                    return;
+                }
+                KeyCode::Char('a') => {
+                    if let Some(ed) = self.slots[self.work].editor.as_mut() {
+                        ed.select_all();
+                    }
+                    return;
+                }
+                KeyCode::Char('z') => {
+                    if let Some(ed) = self.slots[self.work].editor.as_mut() {
+                        ed.undo();
+                    }
+                    return;
+                }
+                KeyCode::Char('y') => {
+                    if let Some(ed) = self.slots[self.work].editor.as_mut() {
+                        ed.redo();
+                    }
+                    return;
+                }
+                _ => {}
+            }
+        }
         let idx = self.work;
+        // NORMAL 模式下冒号开命令行（INSERT 里冒号仍是普通字符）。
+        let start_ex = !ctrl
+            && matches!(key.code, KeyCode::Char(':'))
+            && self.slots[idx].editor.as_ref().is_some_and(|e| e.normal_mode());
+        if start_ex {
+            if let Some(ed) = self.slots[idx].editor.as_mut() {
+                ed.ex_start();
+            }
+            return;
+        }
         let Some(ed) = self.slots[idx].editor.as_mut() else {
             return;
         };
         // 提示"再按一次 Ctrl-Q"之后，用户按了别的键就说明还在编辑，撤销待确认态。
         ed.confirm_close = false;
         ed.on_key(*key);
+    }
+
+    fn copy_editor_selection(&mut self) {
+        let idx = self.work;
+        let copied = self.slots[idx]
+            .editor
+            .as_mut()
+            .is_some_and(|ed| ed.copy_selection());
+        self.slots[idx].status = Some(if copied {
+            "已复制选区到系统剪贴板".to_string()
+        } else {
+            "没有选中内容：拖选文本或按 Ctrl-A 全选".to_string()
+        });
+    }
+
+    fn force_close_editor(&mut self) {
+        let idx = self.work;
+        if let Some(ed) = self.slots[idx].editor.as_mut() {
+            ed.confirm_close = true;
+        }
+        self.close_editor();
     }
 
     fn save_editor(&mut self) {
@@ -4419,6 +4588,10 @@ impl App {
         match write {
             Ok(()) => {
                 self.slots[idx].status = Some(format!("正在回传 {}…", remote_name(&remote)));
+                // 事件还没被处理：这段时间关面板不能把 slot.edit 丢掉（`:wq` 就是连着的）。
+                if let Some(edit) = self.slots[idx].edit.as_mut() {
+                    edit.awaiting_save = true;
+                }
                 // 与外部编辑器保存走同一条事件：排队、冲突确认、浏览器刷新都不用重写。
                 let _ = self.event_tx.send(AppEvent::EditSaved {
                     slot: self.slots[idx].id,
@@ -4441,7 +4614,8 @@ impl App {
         if dirty && !ed.confirm_close {
             ed.confirm_close = true;
             self.slots[idx].status = Some(
-                "有未保存的改动：再按 Ctrl-Q 放弃并退出，或 Ctrl-S 保存".to_string(),
+                "有未保存的改动：再按 Ctrl-Q（或 :q!）放弃并退出，或 Ctrl-S / :w 保存"
+                    .to_string(),
             );
             return;
         }
@@ -4451,7 +4625,7 @@ impl App {
         let uploading = self.slots[idx]
             .edit
             .as_ref()
-            .is_some_and(|e| e.saving || e.pending_save);
+            .is_some_and(|e| e.saving || e.pending_save || e.awaiting_save);
         let embedded = self.slots[idx].edit.as_ref().is_some_and(|e| e.embedded);
         self.slots[idx].editor = None;
         if !uploading && embedded {
@@ -7860,6 +8034,50 @@ async fn prepare_local_edit(
         local,
         remote_mtime: meta.mtime,
     })
+}
+
+/// 给终端里那行 `vi <前缀>` 做一次本地补全：返回要补进远端输入行的字符。
+/// 唯一匹配才返回；没有匹配、多个候选、文件名需要 bash 转义时都算补不了。
+async fn resolve_vi_completion(
+    sftp: &SftpSession,
+    raw: &str,
+    cwd: &str,
+) -> std::result::Result<String, String> {
+    let (dir, prefix) = crate::vi_edit::completion_request(raw)
+        .ok_or_else(|| "这行不需要补全".to_string())?;
+    let base = if dir.is_empty() {
+        if cwd.starts_with('/') {
+            cwd.to_string()
+        } else {
+            sftp.canonicalize(".").await.map_err(|e| e.to_string())?
+        }
+    } else if dir == "~" || dir == "~/" {
+        sftp.canonicalize(".").await.map_err(|e| e.to_string())?
+    } else if let Some(rest) = dir.strip_prefix("~/") {
+        let home = sftp.canonicalize(".").await.map_err(|e| e.to_string())?;
+        ells_transfer::remote_join(&home, rest)
+    } else {
+        dir
+    };
+    // 目录名末尾的 '/' 只对补全前缀有意义，列目录时去掉（根目录除外）。
+    let base = if base == "/" { base } else { base.trim_end_matches('/').to_string() };
+    let entries = ells_transfer::list(sftp, &base)
+        .await
+        .map_err(|e| format!("{e:#}"))?;
+    let matches: Vec<&FileEntry> = entries
+        .iter()
+        .filter(|e| e.name.starts_with(&prefix) && crate::vi_edit::completion_name_safe(&e.name))
+        .collect();
+    match matches.as_slice() {
+        [one] => {
+            let mut append = one.name[prefix.len()..].to_string();
+            // 目录补 '/' 继续往下写，文件补空格收尾（与 bash 的习惯一致）。
+            append.push(if one.is_dir { '/' } else { ' ' });
+            Ok(append)
+        }
+        [] => Err(format!("没有匹配 {prefix} 的文件")),
+        many => Err(format!("有 {} 个候选", many.len())),
+    }
 }
 
 /// 把终端里敲的文件名解析成远端绝对路径，并做一次轻量确认（存在、是文件、不太大）。
