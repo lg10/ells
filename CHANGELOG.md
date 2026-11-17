@@ -9,6 +9,18 @@ English summary lives in each GitHub Release note; this file is the full history
 发版流程：把下面的 `[未发布 / Unreleased]` 小节改名为 `[x.y.z] - 日期`，再打 tag。
 CI 的 release 作业会按 tag 从本文件截取对应小节，作为 GitHub Release 说明。
 
+## [0.2.13] - 2026-11-17
+
+### 修复
+- **`vi 新文件名` 不再退回远端编辑器**：远端还不存在的文件按父目录解析成绝对路径，内置面板
+  直接打开一个空缓冲区，标题与状态行写「新建」；保存时才在远端创建这个文件。上传基线 mtime
+  留空，保存前若别人抢先建了同名文件仍会触发冲突确认，不会静默覆盖。
+- **macOS 上按 Cmd 没反应**：启动时用 Kitty 键盘协议向终端询问并打开扩展键（自带 250ms
+  超时，终端不支持时不再白等 crossterm 默认的 2 秒）；内置编辑器同时接受 Ctrl 与 Cmd
+  （含 Cmd-Shift-Z 重做），认不出的 Cmd 组合不再当正文输进缓冲区，Cmd 组合也不会被当成
+  普通字符打进远端 shell。面板、状态行与帮助只在终端确实能收到 Cmd 时显示 ⌘，否则只提示
+  Ctrl。Terminal.app 不转发 Cmd，仍需使用 Ctrl；WezTerm 需开 `enable_kitty_keyboard`。
+
 ## [0.2.12] - 2026-11-06
 
 ### 修复
