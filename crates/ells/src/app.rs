@@ -1211,6 +1211,8 @@ pub struct App {
 /// unix 上 restart 走 exec，必须发生在主线程，工作线程里只能做标记。
 pub async fn run(alias: Option<String>, dev: bool, yes: bool) -> Result<bool> {
     enable_raw_mode()?;
+    // 必须在输入流启动前问：查询要独占读 /dev/tty。
+    term::enable_keyboard_enhancement();
     let mut out = stdout();
     // 括号粘贴：粘贴整段命令时终端会包上 ESC[200~/201~，ells 据此把它当一次
     // 粘贴处理，而不是逐字符输入（也避免换行被当成回车立刻执行）。
@@ -1316,6 +1318,48 @@ fn is_double_click(
         (c, r) == (column, row)
             && now.duration_since(t) <= std::time::Duration::from_millis(500)
     })
+}
+
+/// 内置编辑器里与桌面习惯一致的快捷键（macOS 上 Cmd 也算）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditorCommand {
+    Save,
+    Quit,
+    Copy,
+    SelectAll,
+    Undo,
+    Redo,
+}
+
+/// Ctrl 是通用键；macOS 终端支持 Kitty 键盘协议时 Cmd 会以 SUPER 送进来，
+/// 两套都认，用户在哪个终端里都不用改指法。
+fn editor_shortcut(key: &KeyEvent) -> Option<EditorCommand> {
+    let cmd = key.modifiers.contains(KeyModifiers::SUPER);
+    if !(cmd || key.modifiers.contains(KeyModifiers::CONTROL)) {
+        return None;
+    }
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    Some(match key.code {
+        KeyCode::Char('s') => EditorCommand::Save,
+        KeyCode::Char('q') => EditorCommand::Quit,
+        KeyCode::Char('c') => EditorCommand::Copy,
+        KeyCode::Char('a') => EditorCommand::SelectAll,
+        // macOS 的重做是 Cmd-Shift-Z；Ctrl-Y 留给习惯 Windows 的人。
+        KeyCode::Char('z') if cmd && shift => EditorCommand::Redo,
+        KeyCode::Char('z') => EditorCommand::Undo,
+        KeyCode::Char('y') => EditorCommand::Redo,
+        _ => return None,
+    })
+}
+
+/// 状态行里的快捷键写法：终端不转发 Cmd 时不提它，免得承诺一个按了没反应的键。
+fn edit_key_hint(letter: char) -> String {
+    let ctrl = format!("Ctrl-{}", letter.to_ascii_uppercase());
+    if cfg!(target_os = "macos") && term::cmd_shortcuts_available() {
+        format!("⌘{} / {ctrl}", letter.to_ascii_uppercase())
+    } else {
+        ctrl
+    }
 }
 
 impl App {
@@ -2047,6 +2091,7 @@ impl App {
                     local,
                     remote_mtime,
                     embedded,
+                    new_file,
                     ..
                 } => {
                     let name = remote_name(&remote);
@@ -2064,9 +2109,13 @@ impl App {
                         match crate::editor::EmbeddedEdit::open(&remote, &local, &name) {
                             Ok(editor) => {
                                 slot.editor = Some(editor);
-                                slot.status = Some(format!(
-                                    "已取回 {name} · Ctrl-S 保存并回传 · Ctrl-Q 退出"
-                                ));
+                                let save = edit_key_hint('s');
+                                let quit = edit_key_hint('q');
+                                slot.status = Some(if new_file {
+                                    format!("新建 {name} · {save} 保存并创建远端文件 · {quit} 退出")
+                                } else {
+                                    format!("已取回 {name} · {save} 保存并回传 · {quit} 退出")
+                                });
                             }
                             Err(err) => {
                                 slot.edit = None;
@@ -2074,10 +2123,17 @@ impl App {
                             }
                         }
                     } else {
-                        slot.status = Some(format!(
-                            "已取回 {name} · 在本地编辑器里保存后自动回传（临时文件 {}）",
-                            local.display()
-                        ));
+                        slot.status = Some(if new_file {
+                            format!(
+                                "新建 {name} · 在本地编辑器里保存后创建远端文件（临时文件 {}）",
+                                local.display()
+                            )
+                        } else {
+                            format!(
+                                "已取回 {name} · 在本地编辑器里保存后自动回传（临时文件 {}）",
+                                local.display()
+                            )
+                        });
                     }
                     // 面板是整屏模态：取回期间用户切换了标签，也要把界面带回这一格，
                     // 否则编辑器会开在看不见的后台标签上，而 tabs_locked 又不让切回来。
@@ -2260,7 +2316,7 @@ impl App {
                         ));
                     }
                 }
-                AppEvent::ViTargetResolved { seq, remote, name, .. } => {
+                AppEvent::ViTargetResolved { seq, remote, name, new_file, .. } => {
                     let slot = &mut self.slots[self.work];
                     if slot.vi_pending == Some(seq) {
                         slot.vi_pending = None;
@@ -2271,7 +2327,11 @@ impl App {
                         let sftp = slot.sftp.clone();
                         let slot_id = slot.id;
                         if let Some(sftp) = sftp {
-                            slot.status = Some(format!("正在取回 {name}（编辑用）…"));
+                            slot.status = Some(if new_file {
+                                format!("正在新建 {name}（编辑用）…")
+                            } else {
+                                format!("正在取回 {name}（编辑用）…")
+                            });
                             let tx = self.event_tx.clone();
                             spawn_local_edit(
                                 tx,
@@ -2280,6 +2340,7 @@ impl App {
                                 remote,
                                 name,
                                 self.settings.edit_open == crate::settings::EditOpen::Builtin,
+                                new_file,
                             );
                         } else {
                             slot.status = Some("连接已断开，无法取回文件".to_string());
@@ -2669,11 +2730,12 @@ impl App {
             )
             .await;
             let ev = match resolved {
-                Ok(Ok((remote, name))) => AppEvent::ViTargetResolved {
+                Ok(Ok((remote, name, new_file))) => AppEvent::ViTargetResolved {
                     slot: slot_id,
                     seq,
                     remote,
                     name,
+                    new_file,
                 },
                 Ok(Err(reason)) => AppEvent::ViTargetFailed { slot: slot_id, seq, reason },
                 Err(_) => AppEvent::ViTargetFailed {
@@ -4498,6 +4560,7 @@ impl App {
             entry.path,
             entry.name,
             self.settings.edit_open != crate::settings::EditOpen::Local,
+            false,
         );
     }
 
@@ -4536,50 +4599,44 @@ impl App {
             }
             return;
         }
-        if ctrl && matches!(key.code, KeyCode::Char('s')) {
-            self.save_editor();
-            return;
-        }
-        if ctrl && matches!(key.code, KeyCode::Char('q')) {
-            self.close_editor();
-            return;
-        }
-        if ctrl {
-            match key.code {
-                KeyCode::Char('c') => {
-                    self.copy_editor_selection();
-                    return;
-                }
-                KeyCode::Char('a') => {
+        if let Some(command) = editor_shortcut(key) {
+            match command {
+                EditorCommand::Save => self.save_editor(),
+                EditorCommand::Quit => self.close_editor(),
+                EditorCommand::Copy => self.copy_editor_selection(),
+                EditorCommand::SelectAll => {
                     if let Some(ed) = self.slots[self.work].editor.as_mut() {
                         ed.select_all();
                     }
-                    return;
                 }
-                KeyCode::Char('z') => {
+                EditorCommand::Undo => {
                     if let Some(ed) = self.slots[self.work].editor.as_mut() {
                         ed.undo();
                     }
-                    return;
                 }
-                KeyCode::Char('y') => {
+                EditorCommand::Redo => {
                     if let Some(ed) = self.slots[self.work].editor.as_mut() {
                         ed.redo();
                     }
-                    return;
                 }
-                _ => {}
             }
+            return;
         }
+        let cmd_key = key.modifiers.contains(KeyModifiers::SUPER);
         let idx = self.work;
         // NORMAL 模式下冒号开命令行（INSERT 里冒号仍是普通字符）。
         let start_ex = !ctrl
+            && !cmd_key
             && matches!(key.code, KeyCode::Char(':'))
             && self.slots[idx].editor.as_ref().is_some_and(|e| e.normal_mode());
         if start_ex {
             if let Some(ed) = self.slots[idx].editor.as_mut() {
                 ed.ex_start();
             }
+            return;
+        }
+        if cmd_key {
+            // Cmd 是 macOS 的界面键：认不出的组合不能当正文输进去。
             return;
         }
         let Some(ed) = self.slots[idx].editor.as_mut() else {
@@ -4599,7 +4656,7 @@ impl App {
         self.slots[idx].status = Some(if copied {
             "已复制选区到系统剪贴板".to_string()
         } else {
-            "没有选中内容：拖选文本或按 Ctrl-A 全选".to_string()
+            format!("没有选中内容：拖选文本或按 {} 全选", edit_key_hint('a'))
         });
     }
 
@@ -4650,10 +4707,11 @@ impl App {
         let dirty = ed.dirty();
         if dirty && !ed.confirm_close {
             ed.confirm_close = true;
-            self.slots[idx].status = Some(
-                "有未保存的改动：再按 Ctrl-Q（或 :q!）放弃并退出，或 Ctrl-S / :w 保存"
-                    .to_string(),
-            );
+            self.slots[idx].status = Some(format!(
+                "有未保存的改动：再按 {}（或 :q!）放弃并退出，或 {} / :w 保存",
+                edit_key_hint('q'),
+                edit_key_hint('s')
+            ));
             return;
         }
         let name = ed.name.clone();
@@ -8028,48 +8086,67 @@ const EDIT_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30
 struct EditPrep {
     local: PathBuf,
     remote_mtime: Option<u32>,
+    /// 远端还没有这个文件：本地给一个空临时文件，保存时由上传链路创建。
+    new_file: bool,
 }
 
 /// vi 拦截的代号：每次拦截 +1，过期的确认回包靠它作废。
 static VI_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// 把远端文件取回本地临时文件，并做二进制检查。
+///
+/// `allow_new` = 允许远端尚未存在这个文件（`vi 新名字`）：这时给一个空临时文件，
+/// 保存后由上传链路创建远端文件；`remote_mtime` 留空，回传前若有人抢先建了同名
+/// 文件会照常走冲突确认，不会悄悄覆盖。
 async fn prepare_local_edit(
     sftp: &SftpSession,
     remote: &str,
     name: &str,
+    allow_new: bool,
 ) -> std::result::Result<EditPrep, String> {
     let meta = ells_transfer::remote_meta(sftp, remote)
         .await
-        .map_err(|e| format!("{e:#}"))?
-        .ok_or_else(|| format!("远端文件不存在：{remote}"))?;
-    if meta.is_dir {
-        return Err("目录不能直接编辑".to_string());
-    }
-    if meta.size > EDIT_MAX_BYTES {
-        return Err(format!(
-            "文件太大（{} MB），不适合用本地编辑器打开",
-            meta.size / 1024 / 1024
-        ));
+        .map_err(|e| format!("{e:#}"))?;
+    if let Some(meta) = &meta {
+        if meta.is_dir {
+            return Err("目录不能直接编辑".to_string());
+        }
+        if meta.size > EDIT_MAX_BYTES {
+            return Err(format!(
+                "文件太大（{} MB），不适合用本地编辑器打开",
+                meta.size / 1024 / 1024
+            ));
+        }
+    } else if !allow_new {
+        return Err(format!("远端文件不存在：{remote}"));
     }
     let dir = std::env::temp_dir().join("ells-edit");
     tokio::fs::create_dir_all(&dir)
         .await
         .map_err(|e| format!("无法创建临时目录 {}：{e}", dir.display()))?;
     let temp = temp_edit_name(name);
-    let (ptx, _prx) = mpsc::unbounded_channel::<Progress>();
-    let cancel = Cancel::default();
-    let local = ells_transfer::download(sftp, remote.to_string(), &dir, ptx, &temp, &cancel)
-        .await
-        .map_err(|e| format!("取回失败：{e:#}"))?;
+    let local = if meta.is_some() {
+        let (ptx, _prx) = mpsc::unbounded_channel::<Progress>();
+        let cancel = Cancel::default();
+        ells_transfer::download(sftp, remote.to_string(), &dir, ptx, &temp, &cancel)
+            .await
+            .map_err(|e| format!("取回失败：{e:#}"))?
+    } else {
+        let local = dir.join(&temp);
+        tokio::fs::write(&local, b"")
+            .await
+            .map_err(|e| format!("无法创建临时文件 {}：{e}", local.display()))?;
+        local
+    };
     // 打开前先挡掉二进制：文本编辑器会把它们搅成乱码，保存回传就等于毁掉远端文件。
-    if is_binary_file(&local).await {
+    if meta.is_some() && is_binary_file(&local).await {
         let _ = tokio::fs::remove_file(&local).await;
         return Err(format!("{name} 看起来是二进制文件，已取消编辑"));
     }
     Ok(EditPrep {
         local,
-        remote_mtime: meta.mtime,
+        remote_mtime: meta.as_ref().and_then(|m| m.mtime),
+        new_file: meta.is_none(),
     })
 }
 
@@ -8118,12 +8195,13 @@ async fn resolve_vi_completion(
 }
 
 /// 把终端里敲的文件名解析成远端绝对路径，并做一次轻量确认（存在、是文件、不太大）。
+/// 还不存在的名字按"新文件"接管：父目录必须存在，编辑器保存时才创建它。
 /// 任何一步失败都返回 Err —— 调用方会把回车补发给远端，让 vi 原生打开。
 async fn resolve_vi_target(
     sftp: &SftpSession,
     raw: &str,
     cwd: &str,
-) -> std::result::Result<(String, String), String> {
+) -> std::result::Result<(String, String, bool), String> {
     let joined = if raw.starts_with('/') {
         raw.to_string()
     } else if raw == "~" || raw.starts_with("~/") {
@@ -8139,16 +8217,30 @@ async fn resolve_vi_target(
         let home = sftp.canonicalize(".").await.map_err(|e| e.to_string())?;
         ells_transfer::remote_join(&home, raw)
     };
-    let remote = sftp.canonicalize(&joined).await.map_err(|e| e.to_string())?;
+    // realpath 只对已存在的路径成功；新文件按父目录解析出绝对路径，
+    // 父目录都找不到就交给远端 vi（远端同样会报错，但别把错误吞进本地）。
+    let (remote, missing) = match sftp.canonicalize(&joined).await {
+        Ok(path) => (path, false),
+        Err(_) => {
+            let (parent, base) = split_remote_parent(&joined)
+                .ok_or_else(|| format!("远端路径不可用：{joined}"))?;
+            let parent = sftp
+                .canonicalize(parent)
+                .await
+                .map_err(|e| format!("远端目录不可用：{e}"))?;
+            (ells_transfer::remote_join(&parent, base), true)
+        }
+    };
     let meta = ells_transfer::remote_meta(sftp, &remote)
         .await
-        .map_err(|e| format!("{e:#}"))?
-        .ok_or_else(|| format!("远端文件不存在：{remote}"))?;
-    if meta.is_dir {
-        return Err("目录不能直接编辑".to_string());
-    }
-    if meta.size > EDIT_MAX_BYTES {
-        return Err("文件太大".to_string());
+        .map_err(|e| format!("{e:#}"))?;
+    if let Some(meta) = &meta {
+        if meta.is_dir {
+            return Err("目录不能直接编辑".to_string());
+        }
+        if meta.size > EDIT_MAX_BYTES {
+            return Err("文件太大".to_string());
+        }
     }
     let name = remote
         .rsplit('/')
@@ -8156,7 +8248,18 @@ async fn resolve_vi_target(
         .filter(|s| !s.is_empty())
         .unwrap_or("edit.txt")
         .to_string();
-    Ok((remote, name))
+    Ok((remote, name, missing || meta.is_none()))
+}
+
+/// 远端路径的父目录与最后一段：`/etc/nginx.conf` → (`/etc`, `nginx.conf`)。
+/// 末尾是 `/`、`..` 或空名时不认为是新文件名，返回 None。
+fn split_remote_parent(path: &str) -> Option<(&str, &str)> {
+    let (parent, base) = path.rsplit_once('/')?;
+    let parent = if parent.is_empty() { "/" } else { parent };
+    if base.is_empty() || base == "." || base == ".." {
+        return None;
+    }
+    Some((parent, base))
 }
 
 /// 取回 → 交给编辑器（内置面板或外部程序）→ 守着保存。浏览器 `e` 与终端里手敲的 vi 共用。
@@ -8167,9 +8270,10 @@ fn spawn_local_edit(
     remote: String,
     name: String,
     embedded: bool,
+    allow_new: bool,
 ) {
     tokio::spawn(async move {
-        match prepare_local_edit(&sftp, &remote, &name).await {
+        match prepare_local_edit(&sftp, &remote, &name, allow_new).await {
             Ok(prep) => {
                 let _ = tx.send(AppEvent::EditReady {
                     slot,
@@ -8177,6 +8281,7 @@ fn spawn_local_edit(
                     local: prep.local.clone(),
                     remote_mtime: prep.remote_mtime,
                     embedded,
+                    new_file: prep.new_file,
                 });
                 // 内置面板由 UI 自己读临时文件，不需要外部程序和 mtime 监视；
                 // 保存时 UI 写完文件直接发 EditSaved，回传逻辑不变。
@@ -9494,5 +9599,71 @@ mod mouse_tests {
         // 视口有非零原点时，减原点再 +1
         assert_eq!(emu_remote_coords(Rect::new(3, 7, 40, 10), 3, 7), (1, 1));
         assert_eq!(emu_remote_coords(Rect::new(3, 7, 40, 10), 10, 9), (8, 3));
+    }
+}
+
+#[cfg(test)]
+mod editor_shortcut_tests {
+    use super::{editor_shortcut, split_remote_parent, EditorCommand};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, mods)
+    }
+
+    /// macOS 上 Cmd 是用户的本能；终端能把它送进来时（Kitty 协议）就和 Ctrl 同效。
+    #[test]
+    fn cmd_and_ctrl_mean_the_same_in_the_builtin_editor() {
+        for mods in [KeyModifiers::CONTROL, KeyModifiers::SUPER] {
+            assert_eq!(
+                editor_shortcut(&key(KeyCode::Char('s'), mods)),
+                Some(EditorCommand::Save)
+            );
+            assert_eq!(
+                editor_shortcut(&key(KeyCode::Char('q'), mods)),
+                Some(EditorCommand::Quit)
+            );
+        }
+        assert_eq!(
+            editor_shortcut(&key(KeyCode::Char('c'), KeyModifiers::SUPER)),
+            Some(EditorCommand::Copy)
+        );
+        assert_eq!(
+            editor_shortcut(&key(KeyCode::Char('a'), KeyModifiers::SUPER)),
+            Some(EditorCommand::SelectAll)
+        );
+        assert_eq!(
+            editor_shortcut(&key(KeyCode::Char('z'), KeyModifiers::SUPER)),
+            Some(EditorCommand::Undo)
+        );
+        // macOS 的重做是 Cmd-Shift-Z。
+        assert_eq!(
+            editor_shortcut(&key(
+                KeyCode::Char('z'),
+                KeyModifiers::SUPER | KeyModifiers::SHIFT
+            )),
+            Some(EditorCommand::Redo)
+        );
+        // 只按 s 是正文输入，不能当保存。
+        assert_eq!(
+            editor_shortcut(&key(KeyCode::Char('s'), KeyModifiers::NONE)),
+            None
+        );
+    }
+
+    /// `vi 新名字` 里 realpath 失败时，按父目录拼出绝对路径；目录本身或 `..` 不算新文件。
+    #[test]
+    fn a_new_file_name_resolves_against_its_parent_directory() {
+        assert_eq!(
+            split_remote_parent("/etc/nginx.conf"),
+            Some(("/etc", "nginx.conf"))
+        );
+        assert_eq!(
+            split_remote_parent("/nginx.conf"),
+            Some(("/", "nginx.conf"))
+        );
+        assert_eq!(split_remote_parent("/etc/"), None);
+        assert_eq!(split_remote_parent("/etc/.."), None);
+        assert_eq!(split_remote_parent("nginx.conf"), None);
     }
 }

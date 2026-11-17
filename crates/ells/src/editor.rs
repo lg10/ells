@@ -328,6 +328,17 @@ fn render_body(
     area.contains(pos).then_some(pos)
 }
 
+/// 面板里的快捷键写法：macOS 且终端能送 Cmd 时把 ⌘ 一起写上。
+fn key_hint(letter: char) -> String {
+    let upper = letter.to_ascii_uppercase();
+    let ctrl = format!("Ctrl-{upper}");
+    if cfg!(target_os = "macos") && crate::term::cmd_shortcuts_available() {
+        format!("⌘{upper} / {ctrl}")
+    } else {
+        ctrl
+    }
+}
+
 pub fn draw_panel(f: &mut Frame, area: Rect, app: &mut crate::app::App) {
     let idx = app.active;
     let status = app.slots[idx].status.clone();
@@ -336,9 +347,11 @@ pub fn draw_panel(f: &mut Frame, area: Rect, app: &mut crate::app::App) {
     };
 
     let title = format!(
-        " 编辑 {} · {} · Ctrl-S 保存 · Ctrl-Q 退出 ",
+        " 编辑 {} · {} · {} 保存 · {} 退出 ",
         ed.name,
-        ed.mode_label()
+        ed.mode_label(),
+        key_hint('s'),
+        key_hint('q')
     );
     let block = Block::default()
         .borders(Borders::ALL)
@@ -393,9 +406,15 @@ pub fn draw_panel(f: &mut Frame, area: Rect, app: &mut crate::app::App) {
         ])
     } else {
         let hint = status.unwrap_or_else(|| {
-            let tail = "Ctrl-S 保存 · Ctrl-Q 退出 · 拖选后 Ctrl-C 复制 · Ctrl-A 全选";
+            let tail = format!(
+                "{} 保存 · {} 退出 · 拖选后 {} 复制 · {} 全选",
+                key_hint('s'),
+                key_hint('q'),
+                key_hint('c'),
+                key_hint('a')
+            );
             if ed.highlight {
-                tail.to_string()
+                tail
             } else {
                 format!("大文件已关高亮 · {tail}")
             }

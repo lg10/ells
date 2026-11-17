@@ -133,6 +133,11 @@ pub fn key_to_bytes(key: &KeyEvent, app_cursor: bool) -> Option<Vec<u8>> {
     let ctrl = m.contains(KeyModifiers::CONTROL);
     let alt = m.contains(KeyModifiers::ALT);
     let shift = m.contains(KeyModifiers::SHIFT);
+    // Cmd/Win 是宿主界面键（ellS 的快捷键）。终端开了 Kitty 扩展键后这些组合
+    // 也会送进来，但绝不能把 Cmd-S 当成字母 s 打进远端 shell。
+    if m.contains(KeyModifiers::SUPER) {
+        return None;
+    }
 
     match key.code {
         KeyCode::Char(c) => {
@@ -312,6 +317,17 @@ mod tests {
                 "普通模式下 {code:?} 仍发 CSI"
             );
         }
+    }
+
+    /// 终端开着 Kitty 扩展键时 Cmd-S 会作为 SUPER 送进来；它是 ells 的快捷键，
+    /// 不能退化成字母 s 打进远端 shell。
+    #[test]
+    fn super_shortcuts_are_not_typed_into_the_remote_shell() {
+        let cmd_s = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::SUPER);
+        assert_eq!(key_to_bytes(&cmd_s, false), None);
+        let cmd_shift_z =
+            KeyEvent::new(KeyCode::Char('z'), KeyModifiers::SUPER | KeyModifiers::SHIFT);
+        assert_eq!(key_to_bytes(&cmd_shift_z, false), None);
     }
 
     #[test]

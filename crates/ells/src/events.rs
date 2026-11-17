@@ -138,6 +138,8 @@ pub enum AppEvent {
         remote_mtime: Option<u32>,
         /// true = 用 ells 内置面板，不需要拉起外部程序，也不启动文件监视。
         embedded: bool,
+        /// true = 远端还没有这个文件（`vi 新名字`）：编辑的是空内容，保存时才创建。
+        new_file: bool,
     },
     /// 取回 / 打开编辑器这一步失败了（下载、二进制检查、拉起编辑器）。
     EditFailed { slot: u32, err: String },
@@ -171,6 +173,8 @@ pub enum AppEvent {
         seq: u64,
         remote: String,
         name: String,
+        /// 远端尚无此文件：在编辑器里保存等于在远端新建它。
+        new_file: bool,
     },
     /// 解析失败（不存在 / 是目录 / 太大 / SFTP 出错 / 超时）：不接管，
     /// 把回车补发给远端，照旧用远端 vi 打开。`reason` 写进状态行，别再静默。
