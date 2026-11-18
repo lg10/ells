@@ -19,7 +19,7 @@ Homepage: [https://ells.cn](https://ells.cn) · Repo: [GitHub](https://github.co
 ells is an all-in-one terminal SSH client written in pure Rust. It embeds a real terminal emulator (vt100) inside a fast TUI, so remote sessions keep their colors and programs like `vim`/`htop` render correctly — while adding the workflow features a plain `ssh` lacks: an encrypted credential vault, SFTP file browsing, Xshell-style `sz`/`rz` transfer interception, local port forwarding with a tunnel manager, an operation log and session transcripts you can actually read back, and a headless CLI so the same vault works from scripts and CI. All of it driven with a few keystrokes or the mouse.
 
 <p align="center">
-  <img src="docs/images/host-list.png" alt="ells host list">
+  <img src="docs/images/en/host-list.png" alt="ells host list">
   <br>
   <sub>Host list — groups, favorites, live sessions, per-host forwards and a last-used stamp on every row.</sub>
 </p>
@@ -122,14 +122,14 @@ Uninstalling removes the binaries, the PATH entry and the PowerShell `s` functio
 ## A look around
 
 <p align="center">
-  <img src="docs/images/session.png" alt="Session view">
+  <img src="docs/images/en/session.png" alt="Session view">
   <br>
   <sub>Session view — embedded terminal, column-coloured <code>docker ps</code>, and the remote metrics row.</sub>
 </p>
 
 <p align="center">
-  <img src="docs/images/sftp.png" width="49%" alt="SFTP browser">
-  <img src="docs/images/tunnels.png" width="49%" alt="Port forwarding panel">
+  <img src="docs/images/en/sftp.png" width="49%" alt="SFTP browser">
+  <img src="docs/images/en/tunnels.png" width="49%" alt="Port forwarding panel">
   <br>
   <sub>SFTP browser · Port forwarding with the live port map.</sub>
 </p>
