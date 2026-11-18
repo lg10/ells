@@ -22,8 +22,7 @@ echo
 echo "== 相关环境变量（若有残留会干扰安装脚本）=="
 echo "ELLS_VERSION      = ${ELLS_VERSION:-（未设置）}"
 echo "ELLS_INSTALL_DIR  = ${ELLS_INSTALL_DIR:-（未设置）}"
-echo "ELLS_API_URL      = ${ELLS_API_URL:-（未设置）}"
-echo "ELLS_DOWNLOAD_URL = ${ELLS_DOWNLOAD_URL:-（未设置）}"
+echo "ELLS_UPDATE_SOURCES = ${ELLS_UPDATE_SOURCES:-（未设置，用内置源）}"
 
 echo
 echo "== 网络 =="

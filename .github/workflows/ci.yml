@@ -92,9 +92,11 @@ jobs:
       - name: Fake release server + install/uninstall via /bin/sh (C locale)
         run: |
           set -eu
-          mkdir -p fake/v0.0.0-test
-          printf 'fake-macos-binary' > fake/v0.0.0-test/ells-macos-universal
-          (cd fake/v0.0.0-test && echo "$(shasum -a 256 < ells-macos-universal)  ells-macos-universal" > SHA256SUMS.txt)
+          # 镜像前缀会把完整 GitHub URL 拼在后面，假服务器按同样的路径放文件
+          FAKE_REL="https:/github.com/lg10/ells/releases/download/v0.0.0-test"
+          mkdir -p "fake/$FAKE_REL"
+          { printf '\317\372\355\376'; dd if=/dev/zero bs=1024 count=64 2>/dev/null; } > "fake/$FAKE_REL/ells-macos-universal"
+          (cd "fake/$FAKE_REL" && echo "$(shasum -a 256 < ells-macos-universal)  ells-macos-universal" > SHA256SUMS.txt)
           (cd fake && python3 -m http.server 18098 >/dev/null 2>&1 &)
           sleep 1
           FAKE_HOME="$RUNNER_TEMP/fakehome"
@@ -105,7 +107,7 @@ jobs:
           mkdir -p "$FAKE_HOME/.ells"
           printf 'fake-vault' > "$FAKE_HOME/.ells/vault.bin"
           LC_ALL=C LANG=C \
-          ELLS_VERSION=v0.0.0-test ELLS_DOWNLOAD_URL=http://127.0.0.1:18098 \
+          ELLS_VERSION=v0.0.0-test ELLS_UPDATE_SOURCES=http://127.0.0.1:18098 \
             HOME="$FAKE_HOME" ELLS_INSTALL_DIR="$FAKE_BIN" \
             /bin/sh install.sh
           test -x "$FAKE_BIN/ells"

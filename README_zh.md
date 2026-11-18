@@ -63,13 +63,14 @@ irm https://raw.githubusercontent.com/lg10/ells/main/install.ps1 | iex
 
 安装完成后**重新打开终端**，`ells` 与短命令 `s` 即可直接使用（脚本会自动配置 PATH；PowerShell 下会在配置文件里注册 `s` 函数，cmd 无需额外处理）。脚本会强制校验 `SHA256SUMS.txt`，校验不过直接退出。
 
-### 指定版本 / 安装目录 / 镜像
+### 指定版本 / 安装目录 / 更新源
 
 macOS / Linux：
 
 ```bash
 ELLS_VERSION=v0.2.8 curl -fsSL https://raw.githubusercontent.com/lg10/ells/main/install.sh | sh
 ELLS_INSTALL_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/lg10/ells/main/install.sh | sh
+ELLS_UPDATE_SOURCES="https://gh-proxy.com,https://ghfast.top" curl -fsSL https://raw.githubusercontent.com/lg10/ells/main/install.sh | sh
 ```
 
 Windows PowerShell：
@@ -77,16 +78,17 @@ Windows PowerShell：
 ```powershell
 $env:ELLS_VERSION='v0.2.8'; irm https://raw.githubusercontent.com/lg10/ells/main/install.ps1 | iex
 $env:ELLS_INSTALL_DIR="$env:USERPROFILE\bin"; irm https://raw.githubusercontent.com/lg10/ells/main/install.ps1 | iex
+$env:ELLS_UPDATE_SOURCES="https://gh-proxy.com,https://ghfast.top"; irm https://raw.githubusercontent.com/lg10/ells/main/install.ps1 | iex
 ```
 
-`ELLS_API_URL` / `ELLS_DOWNLOAD_URL` 可把发布查询与下载地址换成内网或镜像源。安装出问题时先跑 `sh diagnose.sh`，它会打印本机 shell / curl / 架构 / 代理等判定结果。
+`ELLS_UPDATE_SOURCES` 指定更新源（逗号 / 分号 / 空格分隔）：`github` 表示官方直连，也可以写镜像前缀（如 `https://gh-proxy.com`）。留空则用内置的官方 + 多个公开加速镜像；每次并行测速、按版本与延迟排序，失败自动换源，校验和会跨源核对。安装出问题时先跑 `sh diagnose.sh`，它会打印本机 shell / curl / 架构 / 代理等判定结果。
 
 ### 应用内更新
 
-装好之后一般不用再跑安装脚本。ells **每次启动**都在后台问一次"有没有新版本"——只发一个 HEAD 请求、从 GitHub 的重定向地址读版本号，不下载任何内容，也不占匿名 API 限额。有新版本时主机列表顶部会出现 `【vX.Y.Z 可更新】` 徽标，点它（或进设置把光标移到「自动更新」按 Enter）弹确认框，确认后按顺序做四件事：
+装好之后一般不用再跑安装脚本。ells **每次启动**都在后台问一次"有没有新版本"——内置官方直连与多个公开加速镜像，并行探测版本与延迟，挑版本最新、响应最快的源；失败自动换下一个，全程不下载二进制、也不占匿名 API 限额。有新版本时主机列表顶部会出现 `【vX.Y.Z 可更新】` 徽标，点它（或进设置把光标移到「自动更新」按 Enter）弹确认框，确认后按顺序做四件事：
 
 1. 下载本平台对应的发布资产（`ells-linux-x86_64` / `ells-macos-universal` / `ells-windows-x86_64.exe`）到 ells 所在目录的临时文件；
-2. **边下边算 SHA256**，和发布里的 `SHA256SUMS.txt` 比对，校验不过（或没下完）就直接删掉临时文件，**绝不替换**；
+2. **边下边算 SHA256**，和发布里的 `SHA256SUMS.txt` 比对：官方直连的校验和优先，没有官方结果时要求至少两个源一致；不一致、没下完或内容不像本平台二进制（过小 / HTML 错误页）就删掉临时文件、自动换源，**绝不替换**；
 3. 原地换上新二进制。Windows 上正在运行的镜像删不掉但能改名，于是先把 `ells.exe` 改成 `ells.exe.old` 再把新文件换进去，本次会话照常跑完；换失败会原样改回来；
 4. 提示"新版本已就位"——盘上是新的了，进程还是旧的，点【立即重启】或按 Enter 换新安。确认框里会先说明这会断开手上几路会话。
 
@@ -95,7 +97,8 @@ $env:ELLS_INSTALL_DIR="$env:USERPROFILE\bin"; irm https://raw.githubusercontent.
 - 不想让它自己查：进设置把「自动更新」按 `←` 关掉（写入 `settings.ini` 的 `auto_update=false`），之后仍可在同一行按 Enter 手动检查。
 - 脚本 / 排障：`ells --check-update` 只查版本、打印结果就退出，不启动界面、不碰终端。
 - 上次检查的时间与版本号缓存于 `~/.ells/update.cache`（只有这两行，没有任何主机信息）。
-- 镜像 / 内网：`ELLS_DOWNLOAD_URL`（资产基址）与 `ELLS_API_URL`（发布查询），和安装脚本同一套约定。
+- 更新源：`ELLS_UPDATE_SOURCES`（逗号 / 分号分隔的 `github` 或镜像前缀），也可以在 `settings.ini` 里写 `update_sources=`；留空用内置列表。和安装脚本同一套约定。
+- 旧的 `ELLS_API_URL` / `ELLS_DOWNLOAD_URL` / `ELLS_RELEASE_URL` 已废弃并被忽略。
 - 没有预编译包的平台（例如 Linux aarch64）不会尝试自替换，而是提示改用安装脚本。
 
 ### 卸载
@@ -155,8 +158,8 @@ ells <子命令> …            无界面，脚本 / CI 用：list · exec · sf
 
 环境变量：ELLS_LOG=1 把内部日志写到 stderr；ELLS_ZMODEM_LOG=1 额外把 sz/rz
 拦截诊断写入 ~/.ells/zmodem.log；ELLS_YES=1 等价于 -y；ELLS_MASTER 给无头子命令
-喂主密码（管道里也可以把主密码作为 stdin 第一行）；ELLS_API_URL /
-ELLS_DOWNLOAD_URL 把更新检查指到镜像或内网。
+喂主密码（管道里也可以把主密码作为 stdin 第一行）；ELLS_UPDATE_SOURCES
+指定更新源（`github` 或镜像前缀，逗号 / 分号分隔）。
 
 配置文件都在 ~/.ells/：vault.bin（保险库）、settings.ini（设置）、
 known_hosts（主机密钥记录）、audit.log（操作记录）、logs/（会话记录）、

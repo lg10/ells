@@ -145,7 +145,7 @@ def main():
     env = dict(os.environ)
     env["HOME"] = home
     env["TERM"] = "xterm-256color"
-    for key in ("ELLS_LOG", "ELLS_MASTER", "ELLS_YES", "ELLS_API_URL", "ELLS_DOWNLOAD_URL"):
+    for key in ("ELLS_LOG", "ELLS_MASTER", "ELLS_YES", "ELLS_UPDATE_SOURCES"):
         env.pop(key, None)
 
     master, slave = pty.openpty()

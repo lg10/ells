@@ -4280,17 +4280,22 @@ fn draw_update_popup(f: &mut Frame, app: &App) {
     let (title, head, note, ratio, button) = if u.downloading {
         let asset = crate::update::asset_name().unwrap_or("更新包");
         let r = ratio_of(u.transferred, u.total);
+        let head = format!(
+            " 已下载 {}{}（{}%）",
+            human_size(u.transferred),
+            u.total
+                .map(|t| format!(" / {}", human_size(t)))
+                .unwrap_or_default(),
+            (r * 100.0) as u8
+        );
+        let head = match &u.source {
+            Some(src) => format!("{head} · 源 {src}"),
+            None => head,
+        };
         (
             format!(" 正在更新 · {asset} "),
-            format!(
-                " 已下载 {}{}（{}%）",
-                human_size(u.transferred),
-                u.total
-                    .map(|t| format!(" / {}", human_size(t)))
-                    .unwrap_or_default(),
-                (r * 100.0) as u8
-            ),
-            " 校验通过才会替换文件，中途可取消。".to_string(),
+            head,
+            " 校验和会跨源核对；不通过或内容异常就自动换源，中途可取消。".to_string(),
             r,
             "【 取消下载 】",
         )

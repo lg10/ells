@@ -1025,6 +1025,8 @@ pub struct UpdateState {
     pub downloading: bool,
     pub transferred: u64,
     pub total: Option<u64>,
+    /// 当前正在下载的源（多源自动切换时让用户看见换源了）
+    pub source: Option<String>,
     /// 已经替换到位，只差重启
     pub applied: bool,
     /// 换上去的目标版本（`latest` 在成功后要清空，弹窗文案得留着它）
@@ -1754,9 +1756,16 @@ impl App {
                         self.spawn_update_apply(tag);
                     }
                 }
-                AppEvent::UpdateProgress { transferred, total } => {
+                AppEvent::UpdateProgress {
+                    transferred,
+                    total,
+                    source,
+                } => {
                     self.update.transferred = transferred;
                     self.update.total = total;
+                    if source.is_some() {
+                        self.update.source = source;
+                    }
                 }
                 AppEvent::UpdateDone(res) => self.on_update_done(res),
                 AppEvent::Connected { res, .. } => self.on_connected(res),
@@ -4058,6 +4067,9 @@ impl App {
     fn spawn_update_check(&mut self) {
         self.update.checking = true;
         self.update.error = None;
+        if let Some(note) = update::deprecated_env_notice() {
+            self.status = Some(note);
+        }
         let tx = self.event_tx.clone();
         tokio::spawn(async move {
             let res = tokio::task::spawn_blocking(update::check)
@@ -4136,6 +4148,7 @@ impl App {
         self.update.applied_tag = Some(tag.clone());
         self.update.transferred = 0;
         self.update.total = None;
+        self.update.source = None;
         self.update.error = None;
         // 弹窗已经吃掉下层界面，设置页留着只会让用户以为还能点
         self.settings_open = false;
@@ -4144,12 +4157,17 @@ impl App {
         tokio::spawn(async move {
             let report = tx.clone();
             let res = tokio::task::spawn_blocking(move || {
-                update::apply(&tag, &cancel, &mut |done, total| {
-                    let _ = report.send(AppEvent::UpdateProgress {
-                        transferred: done,
-                        total,
-                    });
-                })
+                update::apply(
+                    &tag,
+                    &cancel,
+                    &mut |done: u64, total: Option<u64>, source: Option<String>| {
+                        let _ = report.send(AppEvent::UpdateProgress {
+                            transferred: done,
+                            total,
+                            source,
+                        });
+                    },
+                )
             })
             .await
             .map_err(|e| format!("后台任务异常: {e}"))

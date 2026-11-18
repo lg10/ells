@@ -3,15 +3,16 @@
 //! 三条约束解释了下面这些看起来多余的写法：
 //! - **不新增序列化依赖**：`tag_name` 与 `SHA256SUMS.txt` 都用极小的手写解析，
 //!   并且解析失败一律当"没有新版本"，绝不拿猜出来的版本去替换二进制。
-//! - **不信任下载内容**：校验和与二进制同取自一个 Release 资产，SHA256 不过就删临时件、
-//!   不替换（信任模型与 `install.sh` 一致：信 GitHub 的发布物 + TLS）。
+//! - **不信任任何单一来源**：内置 GitHub 直连与多个加速镜像，先并行探测可用性与延迟，
+//!   再从最快的源开始下载；校验和先在多个源之间交叉核对，SHA256 不过或内容不像本平台
+//!   二进制就删临时件、换下一个源，绝不用一个坏文件替换自己。
 //! - **不占 UI 线程**：`check` / `apply` 都按 `spawn_blocking` 的形态写，进度走回调。
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::OnceLock;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ureq::ResponseExt as _;
 
@@ -39,8 +40,7 @@ impl Version {
     pub fn parse(text: &str) -> Option<Self> {
         let text = text.trim().trim_start_matches(['v', 'V']);
         let mut parts = text.split('.');
-        let (Some(major), Some(minor), Some(patch)) =
-            (parts.next(), parts.next(), parts.next())
+        let (Some(major), Some(minor), Some(patch)) = (parts.next(), parts.next(), parts.next())
         else {
             return None;
         };
@@ -87,32 +87,144 @@ pub fn unsupported_hint() -> String {
     )
 }
 
-fn env_url(key: &str, default: &str) -> String {
-    match std::env::var(key) {
-        Ok(v) if !v.trim().is_empty() => v.trim().to_string(),
-        _ => default.to_string(),
+/// 一个更新源。`github` 直连没有前缀；镜像站是“前缀型”——把完整的 GitHub URL
+/// 拼在它后面（例如 `https://gh-proxy.com/https://github.com/...`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Source {
+    /// 界面与错误里用的短名（`github` / `gh-proxy.com` / 自定义主机名）
+    pub name: String,
+    /// 前缀；`None` = 官方 GitHub 直连
+    pub prefix: Option<String>,
+}
+
+impl Source {
+    pub fn github() -> Self {
+        Self {
+            name: "github".to_string(),
+            prefix: None,
+        }
+    }
+
+    fn from_token(token: &str) -> Option<Self> {
+        let t = token.trim().trim_end_matches('/');
+        if t.is_empty() {
+            return None;
+        }
+        if t.eq_ignore_ascii_case("github") || t.eq_ignore_ascii_case("https://github.com") {
+            return Some(Self::github());
+        }
+        if !(t.starts_with("https://") || t.starts_with("http://")) {
+            return None;
+        }
+        let host = t
+            .split_once("://")
+            .map(|(_, rest)| rest.split('/').next().unwrap_or(rest))
+            .unwrap_or(t);
+        Some(Self {
+            name: if host.is_empty() {
+                t.to_string()
+            } else {
+                host.to_string()
+            },
+            prefix: Some(t.to_string()),
+        })
+    }
+
+    /// 把 GitHub 的完整 URL 放到这个源上。
+    fn resolve(&self, github_url: &str) -> String {
+        match &self.prefix {
+            None => github_url.to_string(),
+            Some(prefix) => {
+                format!("{}/{}", prefix.trim_end_matches('/'), github_url)
+            }
+        }
     }
 }
 
-fn api_url() -> String {
-    env_url("ELLS_API_URL", API_URL)
+/// 默认源：官方在前，其次是几个公开加速前缀。探测会并行测速，这里的顺序只在
+/// 延迟接近时决定谁先上。
+fn builtin_sources() -> Vec<Source> {
+    const MIRRORS: [&str; 4] = [
+        "https://gh-proxy.com",
+        "https://ghproxy.net",
+        "https://ghfast.top",
+        "https://gh.llkk.cc",
+    ];
+    let mut out = vec![Source::github()];
+    out.extend(MIRRORS.into_iter().filter_map(Source::from_token));
+    out
 }
 
-fn page_url() -> String {
-    env_url("ELLS_RELEASE_URL", PAGE_URL)
+/// 逗号 / 分号 / 空白都算分隔符，方便环境变量和 settings.ini 共用一份写法。
+fn parse_sources(text: &str) -> Vec<Source> {
+    let mut out: Vec<Source> = Vec::new();
+    for token in text.split(|c: char| c == ',' || c == ';' || c.is_whitespace()) {
+        if let Some(source) = Source::from_token(token)
+            && !out.contains(&source)
+        {
+            out.push(source);
+        }
+    }
+    out
 }
 
-fn download_base() -> String {
-    env_url("ELLS_DOWNLOAD_URL", DOWNLOAD_BASE).trim_end_matches('/').to_string()
+/// 实际生效的源列表：`ELLS_UPDATE_SOURCES` > `settings.ini update_sources=` > 内置。
+pub fn configured_sources() -> Vec<Source> {
+    if let Ok(text) = std::env::var("ELLS_UPDATE_SOURCES") {
+        let parsed = parse_sources(&text);
+        if !parsed.is_empty() {
+            return parsed;
+        }
+    }
+    let parsed = parse_sources(&crate::settings::Settings::load().update_sources);
+    if !parsed.is_empty() {
+        return parsed;
+    }
+    builtin_sources()
 }
 
+/// 旧单源环境变量已废弃；返回一句话给界面/命令行提示，不参与任何请求。
+pub fn deprecated_env_notice() -> Option<String> {
+    let old: Vec<&str> = ["ELLS_API_URL", "ELLS_DOWNLOAD_URL", "ELLS_RELEASE_URL"]
+        .into_iter()
+        .filter(|key| std::env::var(key).is_ok_and(|v| !v.trim().is_empty()))
+        .collect();
+    (!old.is_empty()).then(|| {
+        format!(
+            "{} 已废弃且不再生效；请改用 ELLS_UPDATE_SOURCES=github,https://镜像前缀/",
+            old.join(" / ")
+        )
+    })
+}
+
+#[cfg(test)]
 fn asset_url(tag: &str, name: &str) -> String {
-    join_download(&download_base(), tag, name)
+    join_download(DOWNLOAD_BASE, tag, name)
 }
 
-/// 镜像地址允许带或不带尾斜杠（`ELLS_DOWNLOAD_URL` 与安装脚本同一份契约）。
+/// 把 tag / 资产名拼进发布下载路径；所有源都基于同一个 GitHub URL 做前缀代理。
 fn join_download(base: &str, tag: &str, name: &str) -> String {
     format!("{}/{}/{}", base.trim_end_matches('/'), tag, name)
+}
+
+/// 最近一次探测得到的顺序。下载时沿用，避免为了同一个版本再测一轮。
+static RANKED_SOURCES: OnceLock<Mutex<Vec<Source>>> = OnceLock::new();
+
+fn remember_ranked(sources: Vec<Source>) {
+    let slot = RANKED_SOURCES.get_or_init(|| Mutex::new(Vec::new()));
+    if let Ok(mut ranked) = slot.lock() {
+        *ranked = sources;
+    }
+}
+
+fn ranked_sources() -> Vec<Source> {
+    if let Some(slot) = RANKED_SOURCES.get()
+        && let Ok(ranked) = slot.lock()
+        && !ranked.is_empty()
+    {
+        return ranked.clone();
+    }
+    configured_sources()
 }
 
 /// 从 `…/releases/tag/v0.1.6` 取 tag；形状不对返回 None。
@@ -151,10 +263,7 @@ pub fn sha_from_sums(text: &str, asset: &str) -> Option<String> {
         let name = name.trim().trim_start_matches('*');
         // 有的工具写带路径的文件名，只比最后一段
         let base = name.rsplit('/').next().unwrap_or(name);
-        if base == asset
-            && sum.len() == 64
-            && sum.chars().all(|c| c.is_ascii_hexdigit())
-        {
+        if base == asset && sum.len() == 64 && sum.chars().all(|c| c.is_ascii_hexdigit()) {
             return Some(sum.to_ascii_lowercase());
         }
     }
@@ -173,6 +282,8 @@ fn unix_now() -> u64 {
 pub struct Cache {
     pub checked_at: u64,
     pub latest: String,
+    /// 上次查到这个版本时跑得最快的源（只用于显示，可能为空）
+    pub source: Option<String>,
 }
 
 fn cache_path() -> Option<PathBuf> {
@@ -182,6 +293,7 @@ fn cache_path() -> Option<PathBuf> {
 pub fn read_cache() -> Option<Cache> {
     let text = std::fs::read_to_string(cache_path()?).ok()?;
     let (mut checked_at, mut latest) = (0u64, String::new());
+    let mut source = None;
     for line in text.lines() {
         let Some((k, v)) = line.split_once('=') else {
             continue;
@@ -189,18 +301,32 @@ pub fn read_cache() -> Option<Cache> {
         match k.trim() {
             "checked_at" => checked_at = v.trim().parse().unwrap_or(0),
             "latest" => latest = v.trim().to_string(),
+            "source" if !v.trim().is_empty() => source = Some(v.trim().to_string()),
             _ => {}
         }
     }
-    (checked_at > 0 && !latest.is_empty()).then_some(Cache { checked_at, latest })
+    (checked_at > 0 && !latest.is_empty()).then_some(Cache {
+        checked_at,
+        latest,
+        source,
+    })
 }
 
-pub fn write_cache(latest: &str) {
+pub fn write_cache(latest: &str, source: Option<&str>) {
     let Some(path) = cache_path() else { return };
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let _ = std::fs::write(&path, format!("checked_at={}\nlatest={}\n", unix_now(), latest));
+    let source = source.unwrap_or("").replace(['\n', '\r'], "");
+    let _ = std::fs::write(
+        &path,
+        format!(
+            "checked_at={}\nlatest={}\nsource={}\n",
+            unix_now(),
+            latest,
+            source
+        ),
+    );
 }
 
 /// 把"上次检查"说成人话：只关心多久之前，不必拉日历进来。
@@ -231,44 +357,84 @@ fn agent(recv_timeout: Duration) -> ureq::Agent {
 fn net_msg(e: &ureq::Error) -> String {
     use ureq::Error::*;
     match e {
-        StatusCode(404) => "GitHub 上没有这个发布（404）".to_string(),
+        StatusCode(404) => "更新源上没有这个发布（404）".to_string(),
         StatusCode(403) | StatusCode(429) => {
-            "GitHub 拒绝了请求（访问频率受限或需要代理），稍后再试".to_string()
+            "更新源拒绝了请求（访问频率受限或需要代理），稍后再试".to_string()
         }
-        StatusCode(n) => format!("GitHub 返回状态码 {n}"),
+        StatusCode(n) => format!("更新源返回状态码 {n}"),
         Timeout(_) => "网络超时，请检查连通性后重试".to_string(),
-        HostNotFound | ConnectionFailed => "连不上 GitHub，请检查网络或代理设置".to_string(),
-        BadUri(_) | InvalidProxyUrl => "下载地址不合法（检查 ELLS_API_URL / ELLS_DOWNLOAD_URL）".to_string(),
+        HostNotFound | ConnectionFailed => "连不上更新源，请检查网络或代理设置".to_string(),
+        BadUri(_) | InvalidProxyUrl => "更新地址不合法（检查 ELLS_UPDATE_SOURCES）".to_string(),
         Io(io) => format!("网络错误：{io}"),
         other => format!("网络错误：{other}"),
     }
 }
 
-/// 查一次新版本：`Ok(None)` = 已是最新，`Ok(Some(tag))` = 有更新，`Err` = 失败文案。
-///
-/// 顺带把结果写进缓存，失败时不写（保留上次成功的记录）。
-pub fn check() -> Result<Option<String>, String> {
-    let tag = probe_tag()?;
-    write_cache(&tag);
-    // 自动回退过的版本不再推给用户：不然就是"回退 → 又提示更新 → 又起不来 → 又回退"
-    if is_rejected(&tag) {
-        tracing::info!(%tag, "这个版本自动回退过，本次不再提示更新");
-        return Ok(None);
-    }
-    Ok(is_newer(&tag).then_some(tag))
+/// 探测用的单源超时：启动检查在后台跑，但也不该让一台死镜像拖住十几秒。
+const PROBE_TIMEOUT: Duration = Duration::from_secs(4);
+
+#[derive(Debug, Clone)]
+struct Probed {
+    source: Source,
+    tag: String,
+    latency: Duration,
 }
 
-/// 先 HEAD 发布页跟重定向（不计 API 限额），失败再退回 API JSON。
-fn probe_tag() -> Result<String, String> {
-    match head_tag() {
+/// 并行问所有源：谁先答、答的版本号是多少。返回按“版本最高 → 延迟最低”排好的可用源。
+fn probe_sources(sources: &[Source]) -> (Vec<Probed>, Vec<String>) {
+    let mut ok = Vec::new();
+    let mut errors = Vec::new();
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = sources
+            .iter()
+            .cloned()
+            .map(|source| {
+                scope.spawn(move || {
+                    let started = Instant::now();
+                    match probe_source(&source) {
+                        Ok(tag) => Ok((source, tag, started.elapsed())),
+                        Err(e) => Err(format!("{}：{e}", source.name)),
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            match handle.join() {
+                Ok(Ok((source, tag, latency))) => ok.push(Probed {
+                    source,
+                    tag,
+                    latency,
+                }),
+                Ok(Err(e)) => errors.push(e),
+                Err(_) => errors.push("更新源探测线程异常退出".to_string()),
+            }
+        }
+    });
+    // 先按版本降序：镜像可能缓存了旧响应，不能只看谁答得快。
+    // 版本相同（或都解析不出）再按延迟。
+    ok.sort_by_key(|p| (std::cmp::Reverse(Version::parse(&p.tag)), p.latency));
+    (ok, errors)
+}
+
+fn probe_source(source: &Source) -> Result<String, String> {
+    // 官方直连先 HEAD 发布页跟重定向：零正文、不计 API 限额。
+    // 镜像反过来先问 API：不少加速前缀不保留 302，HEAD 拿不到 tag。
+    if source.prefix.is_none()
+        && let Ok(tag) = head_tag(source)
+    {
+        return Ok(tag);
+    }
+    match api_tag(source) {
         Ok(tag) => Ok(tag),
-        Err(first) => api_tag().map_err(|second| format!("{first}；备用接口也失败：{second}")),
+        Err(api_err) => {
+            head_tag(source).map_err(|head_err| format!("{api_err}；发布页也失败：{head_err}"))
+        }
     }
 }
 
-fn head_tag() -> Result<String, String> {
-    let url = page_url();
-    let res = agent(Duration::from_secs(10))
+fn head_tag(source: &Source) -> Result<String, String> {
+    let url = source.resolve(PAGE_URL);
+    let res = agent(PROBE_TIMEOUT)
         .head(&url)
         .call()
         .map_err(|e| net_msg(&e))?;
@@ -277,9 +443,10 @@ fn head_tag() -> Result<String, String> {
     tag_from_uri(&uri).ok_or_else(|| "发布页重定向地址里没有版本号".to_string())
 }
 
-fn api_tag() -> Result<String, String> {
-    let mut res = agent(Duration::from_secs(10))
-        .get(&api_url())
+fn api_tag(source: &Source) -> Result<String, String> {
+    let url = source.resolve(API_URL);
+    let mut res = agent(PROBE_TIMEOUT)
+        .get(&url)
         .call()
         .map_err(|e| net_msg(&e))?;
     let mut text = String::new();
@@ -289,6 +456,48 @@ fn api_tag() -> Result<String, String> {
         .read_to_string(&mut text)
         .map_err(|e| format!("读取版本接口响应失败：{e}"))?;
     tag_from_api(&text).ok_or_else(|| "无法从版本接口响应里解析 tag_name".to_string())
+}
+
+/// 探测一轮并记下下载顺序：探测失败的源也留在末尾，下载时再给一次机会。
+fn probe_best() -> Result<(String, Source), String> {
+    let configured = configured_sources();
+    let (probed, errors) = probe_sources(&configured);
+    let Some(best) = probed.first() else {
+        return Err(if errors.is_empty() {
+            "没有配置任何更新源".to_string()
+        } else {
+            format!("所有更新源都不可用：{}", errors.join("；"))
+        });
+    };
+    let (tag, source) = (best.tag.clone(), best.source.clone());
+    let mut ranked: Vec<Source> = probed.into_iter().map(|p| p.source).collect();
+    for source in configured {
+        if !ranked.contains(&source) {
+            ranked.push(source);
+        }
+    }
+    remember_ranked(ranked);
+    Ok((tag, source))
+}
+
+/// 查一次新版本：`Ok(None)` = 已是最新，`Ok(Some(tag))` = 有更新，`Err` = 失败文案。
+///
+/// 顺带把结果写进缓存，失败时不写（保留上次成功的记录）。
+pub fn check() -> Result<Option<String>, String> {
+    let (tag, source) = probe_best()?;
+    write_cache(&tag, Some(&source.name));
+    // 自动回退过的版本不再推给用户：不然就是"回退 → 又提示更新 → 又起不来 → 又回退"
+    if is_rejected(&tag) {
+        tracing::info!(%tag, "这个版本自动回退过，本次不再提示更新");
+        return Ok(None);
+    }
+    Ok(is_newer(&tag).then_some(tag))
+}
+
+/// 只取版本号（忽略源），给诊断/测试用。
+#[cfg(test)]
+fn probe_tag() -> Result<String, String> {
+    probe_best().map(|(tag, _)| tag)
 }
 
 /// 替换发生后 Windows 上 `current_exe()` 会跟着改名后的 `.old` 走，
@@ -319,7 +528,7 @@ fn old_path(exe: &Path) -> PathBuf {
 pub fn apply(
     tag: &str,
     cancel: &AtomicBool,
-    progress: impl FnMut(u64, Option<u64>),
+    progress: impl FnMut(u64, Option<u64>, Option<String>),
 ) -> Result<(), String> {
     let exe = exe_path()?;
     let result = apply_to(&exe, tag, cancel, progress);
@@ -346,13 +555,17 @@ pub enum Startup {
 }
 
 fn pending_path(exe: &Path) -> PathBuf {
-    exe.parent().map(|d| d.join("ells.update.pending")).unwrap_or_else(|| PathBuf::from("ells.update.pending"))
+    exe.parent()
+        .map(|d| d.join("ells.update.pending"))
+        .unwrap_or_else(|| PathBuf::from("ells.update.pending"))
 }
 
 /// 已经自动退回过的版本：别再把它当成"有更新"推给用户，否则就是
 /// 回退 → 提示更新 → 再崩 → 再回退的死循环。
 fn rejected_path(exe: &Path) -> PathBuf {
-    exe.parent().map(|d| d.join("ells.update.rejected")).unwrap_or_else(|| PathBuf::from("ells.update.rejected"))
+    exe.parent()
+        .map(|d| d.join("ells.update.rejected"))
+        .unwrap_or_else(|| PathBuf::from("ells.update.rejected"))
 }
 
 fn read_pending(exe: &Path) -> Option<Pending> {
@@ -361,7 +574,9 @@ fn read_pending(exe: &Path) -> Option<Pending> {
     let mut backup = PathBuf::new();
     let mut tries = 0u32;
     for line in text.lines() {
-        let Some((k, v)) = line.split_once('=') else { continue };
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
         match k.trim() {
             "tag" => tag = v.trim().to_string(),
             "backup" => backup = PathBuf::from(v.trim()),
@@ -420,7 +635,13 @@ fn recover_from(exe: &Path, current: &str) -> Startup {
     }
     if pending.tries == 0 {
         // 这是换上新版本后的第一次启动，先给它一次机会，只把次数记下来
-        write_pending(exe, &Pending { tries: 1, ..pending.clone() });
+        write_pending(
+            exe,
+            &Pending {
+                tries: 1,
+                ..pending.clone()
+            },
+        );
         return Startup::Ready;
     }
     let tag = pending.tag.clone();
@@ -639,14 +860,22 @@ fn digest_of(path: &Path) -> Option<String> {
         }
         ctx.update(&buf[..n]);
     }
-    Some(ctx.finish().as_ref().iter().map(|b| format!("{b:02x}")).collect())
+    Some(
+        ctx.finish()
+            .as_ref()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect(),
+    )
 }
 
 /// 按安装脚本的形状补上启动名：unix 是指向同目录主二进制的软链，Windows 只能再拷一份。
 fn link_launcher(exe: &Path, path: &Path) {
     #[cfg(unix)]
     {
-        let Some(target) = exe.file_name() else { return };
+        let Some(target) = exe.file_name() else {
+            return;
+        };
         match std::os::unix::fs::symlink(target, path) {
             Ok(_) => tracing::info!(path = %path.display(), "缺失的启动名已补上软链"),
             Err(e) => tracing::warn!(path = %path.display(), "启动名补不出来：{e}"),
@@ -674,7 +903,19 @@ fn apply_to(
     exe: &Path,
     tag: &str,
     cancel: &AtomicBool,
-    mut progress: impl FnMut(u64, Option<u64>),
+    progress: impl FnMut(u64, Option<u64>, Option<String>),
+) -> Result<(), String> {
+    let sources = ranked_sources();
+    apply_with_sources(exe, tag, &sources, cancel, progress)
+}
+
+/// 多源下载与替换。`sources` 显式传入，测试才能拿假 HTTP 服务跑完整链路。
+fn apply_with_sources(
+    exe: &Path,
+    tag: &str,
+    sources: &[Source],
+    cancel: &AtomicBool,
+    mut progress: impl FnMut(u64, Option<u64>, Option<String>),
 ) -> Result<(), String> {
     let asset = asset_name().ok_or_else(unsupported_hint)?;
     // tag 来自上一次网络响应，这里再收一次口，防止被拼接成越界路径
@@ -682,37 +923,127 @@ fn apply_to(
     let dir = exe.parent().ok_or("无法定位 ells 所在目录")?;
     let tmp = dir.join(format!("ells.update.{}.tmp", std::process::id()));
 
-    let result = (|| -> Result<(), String> {
-        let want = fetch_sum(&tag, asset)?;
-        let got = download(&tag, asset, &tmp, cancel, &mut progress)?;
-        if !got.eq_ignore_ascii_case(&want) {
-            return Err(format!(
-                "SHA256 校验不通过（期望 {}…，实到 {}…），已放弃替换",
-                &want[..12],
-                &got[..12]
-            ));
-        }
-        mark_executable(&tmp)?;
-        install_in_place(exe, &tmp)
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    } else {
-        let _ = INSTALL_TARGET.set(exe.to_path_buf());
-        // 盘上换好了，但"能不能跑起来"只有下一帧才知道。先登记待验证，
-        // 万一这份新二进制开局就崩，下次启动还有 `.old` 可以退回去。
-        write_pending(
-            exe,
-            &Pending { tag: tag.clone(), backup: old_path(exe), tries: 0 },
-        );
-        tracing::info!(%tag, path = %exe.display(), "ells 已更新");
+    let fetched = fetch_sums(sources, &tag, asset);
+    let (strict, per_source, mut errors) = choose_checksums(&fetched);
+    if strict.is_none() && per_source.is_empty() {
+        return Err(format!("取不到任何可用的校验文件：{}", errors.join("；")));
     }
-    result
+
+    // 先试校验和通过交叉核对的源；其余源排在后面，仍按同一份校验和验货。
+    // 这样“最快的镜像恰好返回了错误页”不会拖死整次更新。
+    let mut ordered: Vec<Source> = Vec::new();
+    if let Some(sum) = &strict {
+        for (source, got) in &per_source {
+            if got == sum && !ordered.contains(source) {
+                ordered.push(source.clone());
+            }
+        }
+    }
+    for source in sources {
+        if !ordered.contains(source) {
+            ordered.push(source.clone());
+        }
+    }
+
+    for source in &ordered {
+        if cancel.load(Ordering::Relaxed) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err("已取消下载".to_string());
+        }
+        let want = strict.clone().or_else(|| {
+            per_source
+                .iter()
+                .find(|(s, _)| s == source)
+                .map(|(_, sum)| sum.clone())
+        });
+        let Some(want) = want else {
+            errors.push(format!("{}：没有校验和", source.name));
+            continue;
+        };
+        for attempt in 0..2 {
+            if attempt > 0 {
+                // 同一源再给一次机会：多数失败是传输被截断/代理回了错误页，重试一次就过
+                let _ = std::fs::remove_file(&tmp);
+                std::thread::sleep(Duration::from_millis(300));
+            }
+            if cancel.load(Ordering::Relaxed) {
+                let _ = std::fs::remove_file(&tmp);
+                return Err("已取消下载".to_string());
+            }
+            match download(source, &tag, asset, &tmp, cancel, &mut progress) {
+                Ok(got) if got.eq_ignore_ascii_case(&want) => {
+                    if let Err(e) = ensure_binary(&tmp) {
+                        errors.push(format!("{}：{e}", source.name));
+                        continue;
+                    }
+                    mark_executable(&tmp)?;
+                    if let Err(e) = install_in_place(exe, &tmp) {
+                        let _ = std::fs::remove_file(&tmp);
+                        return Err(e);
+                    }
+                    let _ = INSTALL_TARGET.set(exe.to_path_buf());
+                    // 盘上换好了，但"能不能跑起来"只有下一帧才知道。先登记待验证，
+                    // 万一这份新二进制开局就崩，下次启动还有 `.old` 可以退回去。
+                    write_pending(
+                        exe,
+                        &Pending {
+                            tag: tag.clone(),
+                            backup: old_path(exe),
+                            tries: 0,
+                        },
+                    );
+                    tracing::info!(%tag, source = %source.name, path = %exe.display(), "ells 已更新");
+                    return Ok(());
+                }
+                Ok(got) => errors.push(format!(
+                    "{}：SHA256 校验不通过（期望 {}…，实到 {}…）",
+                    source.name,
+                    &want[..12],
+                    &got[..12]
+                )),
+                Err(_) if cancel.load(Ordering::Relaxed) => {
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err("已取消下载".to_string());
+                }
+                Err(e) => errors.push(format!("{}：{e}", source.name)),
+            }
+        }
+    }
+    let _ = std::fs::remove_file(&tmp);
+    Err(format!("所有更新源都没能完成下载：{}", errors.join("；")))
 }
 
-fn fetch_sum(tag: &str, asset: &str) -> Result<String, String> {
-    let url = asset_url(tag, "SHA256SUMS.txt");
-    let mut res = agent(Duration::from_secs(15))
+/// 并行取最多 4 份校验文件（前三个源 + 官方直连），用来交叉核对。
+fn fetch_sums(sources: &[Source], tag: &str, asset: &str) -> Vec<(Source, Result<String, String>)> {
+    let mut picks: Vec<Source> = sources.iter().take(3).cloned().collect();
+    if let Some(github) = sources.iter().find(|s| s.prefix.is_none())
+        && !picks.contains(github)
+    {
+        picks.push(github.clone());
+    }
+    let mut out = Vec::new();
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = picks
+            .into_iter()
+            .map(|source| {
+                scope.spawn(move || {
+                    let sum = fetch_sum_from(&source, tag, asset);
+                    (source, sum)
+                })
+            })
+            .collect();
+        for handle in handles {
+            if let Ok(pair) = handle.join() {
+                out.push(pair);
+            }
+        }
+    });
+    out
+}
+
+fn fetch_sum_from(source: &Source, tag: &str, asset: &str) -> Result<String, String> {
+    let url = source.resolve(&join_download(DOWNLOAD_BASE, tag, "SHA256SUMS.txt"));
+    let mut res = agent(Duration::from_secs(8))
         .get(&url)
         .call()
         .map_err(|e| format!("取校验文件失败：{}", net_msg(&e)))?;
@@ -725,20 +1056,101 @@ fn fetch_sum(tag: &str, asset: &str) -> Result<String, String> {
     sha_from_sums(&text, asset).ok_or_else(|| format!("校验文件里没有 {asset} 这一项"))
 }
 
+/// 选一份可信的校验和：
+/// - 官方直连取到了，就以它为准（镜像缓存坏了也骗不过它）；
+/// - 否则至少两个源给出同一个值才算交叉核对通过；
+/// - 只有一个源给值时，退回“每个源用自己那份校验和”，先保证能更新。
+fn choose_checksums(
+    fetched: &[(Source, Result<String, String>)],
+) -> (Option<String>, Vec<(Source, String)>, Vec<String>) {
+    let mut ok: Vec<(Source, String)> = Vec::new();
+    let mut errors = Vec::new();
+    for (source, res) in fetched {
+        match res {
+            Ok(sum) => ok.push((source.clone(), sum.clone())),
+            Err(e) => errors.push(format!("{}：{e}", source.name)),
+        }
+    }
+    let strict = ok
+        .iter()
+        .find(|(source, _)| source.prefix.is_none())
+        .map(|(_, sum)| sum.clone())
+        .or_else(|| {
+            ok.iter()
+                .map(|(_, sum)| sum)
+                .find(|sum| ok.iter().filter(|(_, other)| other == *sum).count() >= 2)
+                .cloned()
+        });
+    if strict.is_none() && !ok.is_empty() {
+        tracing::warn!("只有一个源提供校验和，无法交叉核对，将按源逐个校验");
+    }
+    (strict, ok, errors)
+}
+
+/// 兼容旧测试 / 诊断：取当前源列表里能拿到的那份校验和。
+#[cfg(test)]
+fn fetch_sum(tag: &str, asset: &str) -> Result<String, String> {
+    let sources = ranked_sources();
+    let fetched = fetch_sums(&sources, tag, asset);
+    let (strict, per_source, errors) = choose_checksums(&fetched);
+    strict
+        .or_else(|| per_source.first().map(|(_, sum)| sum.clone()))
+        .ok_or_else(|| format!("取不到校验文件：{}", errors.join("；")))
+}
+
+/// 内容必须像本平台的二进制，别把镜像的错误页 / 压缩包 / 别的平台版本装上去。
+fn ensure_binary(path: &Path) -> Result<(), String> {
+    let len = std::fs::metadata(path)
+        .map_err(|e| format!("读不到下载文件：{e}"))?
+        .len();
+    if len < 64 * 1024 {
+        return Err(format!("下载内容只有 {len} 字节，不像完整的可执行文件"));
+    }
+    let mut file = std::fs::File::open(path).map_err(|e| format!("打不开下载文件：{e}"))?;
+    let mut magic = [0u8; 4];
+    file.read_exact(&mut magic)
+        .map_err(|e| format!("读取下载文件头失败：{e}"))?;
+    let ok = if cfg!(windows) {
+        &magic[..2] == b"MZ"
+    } else if cfg!(target_os = "macos") {
+        matches!(
+            magic,
+            [0xfe, 0xed, 0xfa, 0xce]
+                | [0xce, 0xfa, 0xed, 0xfe]
+                | [0xfe, 0xed, 0xfa, 0xcf]
+                | [0xcf, 0xfa, 0xed, 0xfe]
+                | [0xca, 0xfe, 0xba, 0xbe]
+        )
+    } else {
+        magic == *b"\x7fELF"
+    };
+    if !ok {
+        return Err(format!(
+            "下载到的不是本平台的二进制（文件头 {:02x?}），可能是镜像的错误页",
+            magic
+        ));
+    }
+    Ok(())
+}
+
 /// 流式下载到 `tmp`，边写盘边算 SHA256，返回摘要十六进制。
 fn download(
+    source: &Source,
     tag: &str,
     asset: &str,
     tmp: &Path,
     cancel: &AtomicBool,
-    progress: &mut impl FnMut(u64, Option<u64>),
+    progress: &mut impl FnMut(u64, Option<u64>, Option<String>),
 ) -> Result<String, String> {
-    let url = asset_url(tag, asset);
+    let url = source.resolve(&join_download(DOWNLOAD_BASE, tag, asset));
     let mut res = agent(Duration::from_secs(30))
         .get(&url)
         .call()
         .map_err(|e| format!("下载失败：{}", net_msg(&e)))?;
     let total = res.body().content_length();
+    if cancel.load(Ordering::Relaxed) {
+        return Err("已取消下载".to_string());
+    }
     let mut file = std::fs::File::create(tmp)
         .map_err(|e| format!("无法在 {} 创建临时文件：{e}", tmp.display()))?;
     let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
@@ -747,6 +1159,7 @@ fn download(
     let mut done = 0u64;
     // 每个 64KB 块都回一次会让界面刷个不停，攒够 256KB 再报一次（收尾必报）
     let mut since_report = 0u64;
+    progress(0, total, Some(source.name.clone()));
     loop {
         if cancel.load(Ordering::Relaxed) {
             return Err("已取消下载".to_string());
@@ -763,12 +1176,11 @@ fn download(
         done += n as u64;
         since_report += n as u64;
         if since_report >= 256 * 1024 {
-            progress(done, total);
+            progress(done, total, Some(source.name.clone()));
             since_report = 0;
         }
     }
-    file.flush()
-        .map_err(|e| format!("写入临时文件失败：{e}"))?;
+    file.flush().map_err(|e| format!("写入临时文件失败：{e}"))?;
     drop(file);
     if total.is_some_and(|expect| expect != done) {
         return Err(format!(
@@ -776,7 +1188,7 @@ fn download(
             total.unwrap_or(done)
         ));
     }
-    progress(done, total);
+    progress(done, total, Some(source.name.clone()));
     let digest = ctx.finish();
     Ok(digest.as_ref().iter().map(|b| format!("{b:02x}")).collect())
 }
@@ -802,7 +1214,10 @@ fn install_in_place(exe: &Path, tmp: &Path) -> Result<(), String> {
     let old = old_path(exe);
     let _ = std::fs::remove_file(&old);
     std::fs::rename(exe, &old).map_err(|e| {
-        format!("无法挪开正在运行的 {}：{e}（Windows 偶发占用，稍后重试即可）", exe.display())
+        format!(
+            "无法挪开正在运行的 {}：{e}（Windows 偶发占用，稍后重试即可）",
+            exe.display()
+        )
     })?;
     if let Err(e) = std::fs::rename(tmp, exe) {
         let _ = std::fs::rename(old_path(exe), exe);
@@ -850,7 +1265,10 @@ pub fn cleanup_leftovers() {
             .metadata()
             .and_then(|m| m.modified())
             .map(|t| {
-                t.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) < cutoff
+                t.duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0)
+                    < cutoff
             })
             .unwrap_or(false);
         if stale {
@@ -880,7 +1298,10 @@ pub fn restart() -> Result<(), String> {
         use std::os::unix::process::CommandExt;
         // exec 成功则永不返回；返回即失败
         let err = cmd.exec();
-        Err(format!("新版本启动失败：{err}（请手动运行 {}）", exe.display()))
+        Err(format!(
+            "新版本启动失败：{err}（请手动运行 {}）",
+            exe.display()
+        ))
     }
     #[cfg(not(unix))]
     {
@@ -896,7 +1317,10 @@ pub fn restart() -> Result<(), String> {
                 println!("新版本已在新标签/新窗口里打开，本标签交还给 shell。");
                 Ok(())
             }
-            Err(e) => Err(format!("新版本启动失败：{e}（请手动运行 {}）", exe.display())),
+            Err(e) => Err(format!(
+                "新版本启动失败：{e}（请手动运行 {}）",
+                exe.display()
+            )),
         }
     }
 }
@@ -942,7 +1366,10 @@ mod tests {
             tag_from_uri("https://github.com/lg10/ells/releases/tag/v0.1.5").as_deref(),
             Some("v0.1.5")
         );
-        assert_eq!(tag_from_uri("https://github.com/lg10/ells").as_deref(), None);
+        assert_eq!(
+            tag_from_uri("https://github.com/lg10/ells").as_deref(),
+            None
+        );
         // 带查询/锚点、结尾斜杠也要认
         assert_eq!(
             tag_from_uri("https://ghproxy/x/releases/tag/v1.2.3?sa=1/").as_deref(),
@@ -982,20 +1409,29 @@ mod tests {
         assert_eq!(sha_from_sums(&text, "ells-linux-x86_64"), None);
         // 带路径前缀、`*` 二进制标记、单个空格分隔都要认
         assert_eq!(
-            sha_from_sums(&format!("{sha} *./ells-windows-x86_64.exe"), "ells-windows-x86_64.exe")
-                .as_deref(),
+            sha_from_sums(
+                &format!("{sha} *./ells-windows-x86_64.exe"),
+                "ells-windows-x86_64.exe"
+            )
+            .as_deref(),
             Some(sha.as_str())
         );
         assert_eq!(
-            sha_from_sums(&format!("{} ells-windows-x86_64.exe", sha.to_uppercase()), "ells-windows-x86_64.exe")
-                .as_deref(),
+            sha_from_sums(
+                &format!("{} ells-windows-x86_64.exe", sha.to_uppercase()),
+                "ells-windows-x86_64.exe"
+            )
+            .as_deref(),
             Some(sha.as_str())
         );
     }
 
     #[test]
     fn asset_table_matches_the_install_scripts() {
-        assert_eq!(asset_for("windows", "x86_64"), Some("ells-windows-x86_64.exe"));
+        assert_eq!(
+            asset_for("windows", "x86_64"),
+            Some("ells-windows-x86_64.exe")
+        );
         // mac 是 universal 包，arm/x86 同一个资产名
         assert_eq!(asset_for("macos", "aarch64"), Some("ells-macos-universal"));
         assert_eq!(asset_for("macos", "x86_64"), Some("ells-macos-universal"));
@@ -1032,7 +1468,11 @@ mod tests {
 
     #[test]
     fn old_path_sits_next_to_the_executable() {
-        let exe = Path::new(if cfg!(windows) { r"C:\bin\ells.exe" } else { "/usr/local/bin/ells" });
+        let exe = Path::new(if cfg!(windows) {
+            r"C:\bin\ells.exe"
+        } else {
+            "/usr/local/bin/ells"
+        });
         let old = old_path(exe);
         assert_eq!(old.parent(), exe.parent());
         assert!(old.to_string_lossy().ends_with(".old"));
@@ -1088,7 +1528,11 @@ mod tests {
 
         heal_launchers_in_dir(&exe);
 
-        assert_eq!(std::fs::read_to_string(&exe).unwrap(), "new binary", "自己不能被拷成零字节");
+        assert_eq!(
+            std::fs::read_to_string(&exe).unwrap(),
+            "new binary",
+            "自己不能被拷成零字节"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1105,7 +1549,10 @@ mod tests {
         heal_launchers_in_dir(&alias);
 
         assert!(
-            std::fs::symlink_metadata(&alias).unwrap().file_type().is_symlink(),
+            std::fs::symlink_metadata(&alias)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
             "软链不该被换成一份独立拷贝"
         );
         assert_eq!(std::fs::read_to_string(&main).unwrap(), "new binary");
@@ -1139,7 +1586,14 @@ mod tests {
         let backup = old_path(&exe);
         std::fs::write(&exe, b"broken new").unwrap();
         std::fs::write(&backup, b"good old").unwrap();
-        write_pending(&exe, &Pending { tag: "v0.2.4".into(), backup: backup.clone(), tries: 0 });
+        write_pending(
+            &exe,
+            &Pending {
+                tag: "v0.2.4".into(),
+                backup: backup.clone(),
+                tries: 0,
+            },
+        );
 
         // 换上新版本的第一次启动：先给它一次机会，只记次数
         assert_eq!(recover_from(&exe, "0.2.4"), Startup::Ready);
@@ -1149,7 +1603,9 @@ mod tests {
         // 第二次还是起不来：退回上一版，并把这一版记成"别再推给用户"
         assert_eq!(
             recover_from(&exe, "0.2.4"),
-            Startup::RolledBack { tag: "v0.2.4".into() }
+            Startup::RolledBack {
+                tag: "v0.2.4".into()
+            }
         );
         assert_eq!(std::fs::read_to_string(&exe).unwrap(), "good old");
         assert!(read_pending(&exe).is_none(), "退完不该留记录");
@@ -1170,11 +1626,21 @@ mod tests {
         let backup = old_path(&exe);
         std::fs::write(&exe, b"current").unwrap();
         std::fs::write(&backup, b"much older").unwrap();
-        write_pending(&exe, &Pending { tag: "v0.2.4".into(), backup: backup.clone(), tries: 3 });
+        write_pending(
+            &exe,
+            &Pending {
+                tag: "v0.2.4".into(),
+                backup: backup.clone(),
+                tries: 3,
+            },
+        );
 
         assert_eq!(recover_from(&exe, "0.3.0"), Startup::Ready);
         assert_eq!(std::fs::read_to_string(&exe).unwrap(), "current");
-        assert!(!pending_path(&exe).exists(), "陈账要当场清掉，不能留着下次误退");
+        assert!(
+            !pending_path(&exe).exists(),
+            "陈账要当场清掉，不能留着下次误退"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1185,7 +1651,14 @@ mod tests {
         let backup = old_path(&exe);
         std::fs::write(&exe, b"new").unwrap();
         std::fs::write(&backup, b"old").unwrap();
-        write_pending(&exe, &Pending { tag: "v0.2.4".into(), backup: backup.clone(), tries: 1 });
+        write_pending(
+            &exe,
+            &Pending {
+                tag: "v0.2.4".into(),
+                backup: backup.clone(),
+                tries: 1,
+            },
+        );
 
         // 版本号对不上 = 这条不是给这份二进制画的帧，备份得留着
         confirm_for(&exe, "0.9.9");
@@ -1204,7 +1677,14 @@ mod tests {
         let backup = old_path(&exe);
         std::fs::write(&exe, b"broken new").unwrap();
         std::fs::write(&backup, b"good old").unwrap();
-        write_pending(&exe, &Pending { tag: "v0.2.4".into(), backup: backup.clone(), tries: 1 });
+        write_pending(
+            &exe,
+            &Pending {
+                tag: "v0.2.4".into(),
+                backup: backup.clone(),
+                tries: 1,
+            },
+        );
 
         assert_eq!(roll_back_for(&exe, "0.2.4").as_deref(), Some("v0.2.4"));
         assert_eq!(std::fs::read_to_string(&exe).unwrap(), "good old");
@@ -1221,7 +1701,11 @@ mod tests {
         std::fs::write(&exe, b"the only copy").unwrap();
         write_pending(
             &exe,
-            &Pending { tag: "v0.2.4".into(), backup: old_path(&exe), tries: 5 },
+            &Pending {
+                tag: "v0.2.4".into(),
+                backup: old_path(&exe),
+                tries: 5,
+            },
         );
 
         assert_eq!(recover_from(&exe, "0.2.4"), Startup::Ready);
@@ -1241,7 +1725,10 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&exe).unwrap(), "new binary");
         assert!(!tmp.exists(), "临时件应被改名走，不该留下");
         // unix 上也要留这一挪：那是"新版换上却起不来"时唯一能退回的东西
-        assert_eq!(std::fs::read_to_string(old_path(&exe)).unwrap(), "old binary");
+        assert_eq!(
+            std::fs::read_to_string(old_path(&exe)).unwrap(),
+            "old binary"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1270,6 +1757,215 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn update_source_tokens_accept_github_prefixes_and_dedupe() {
+        let sources = parse_sources(
+            "github, https://gh-proxy.com/, https://gh-proxy.com; https://ghfast.top  not-a-url",
+        );
+        assert_eq!(sources.len(), 3, "{sources:?}");
+        assert_eq!(sources[0], Source::github());
+        assert_eq!(sources[1].name, "gh-proxy.com");
+        assert_eq!(sources[1].prefix.as_deref(), Some("https://gh-proxy.com"));
+        assert_eq!(sources[2].name, "ghfast.top");
+        // 只有协议没有主机的写法不能变成源
+        assert!(parse_sources("https://").is_empty());
+    }
+
+    #[test]
+    fn checksum_consensus_prefers_github_then_a_majority() {
+        let github = Source::github();
+        let a = Source {
+            name: "a".into(),
+            prefix: Some("https://a".into()),
+        };
+        let b = Source {
+            name: "b".into(),
+            prefix: Some("https://b".into()),
+        };
+        let s1 = "1".repeat(64);
+        let s2 = "2".repeat(64);
+
+        let (strict, _, errors) = choose_checksums(&[
+            (a.clone(), Ok(s1.clone())),
+            (github.clone(), Ok(s2.clone())),
+        ]);
+        assert_eq!(
+            strict.as_deref(),
+            Some(s2.as_str()),
+            "官方直连的值必须压过镜像"
+        );
+        assert!(errors.is_empty());
+
+        let (strict, _, _) =
+            choose_checksums(&[(a.clone(), Ok(s1.clone())), (b.clone(), Ok(s1.clone()))]);
+        assert_eq!(
+            strict.as_deref(),
+            Some(s1.as_str()),
+            "两个镜像一致才算交叉核对通过"
+        );
+
+        // 两个源各说各的：没有可信共识，退回逐源校验
+        let (strict, per_source, _) = choose_checksums(&[(a, Ok(s1.clone())), (b, Ok(s2.clone()))]);
+        assert!(strict.is_none());
+        assert_eq!(per_source.len(), 2);
+    }
+
+    fn fake_binary() -> Vec<u8> {
+        let mut bytes = vec![0u8; 96 * 1024];
+        if cfg!(windows) {
+            bytes[0] = b'M';
+            bytes[1] = b'Z';
+        } else if cfg!(target_os = "macos") {
+            bytes[..4].copy_from_slice(&[0xcf, 0xfa, 0xed, 0xfe]);
+        } else {
+            bytes[..4].copy_from_slice(b"\x7fELF");
+        }
+        bytes
+    }
+
+    fn digest(bytes: &[u8]) -> String {
+        let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
+        ctx.update(bytes);
+        ctx.finish()
+            .as_ref()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    /// 一个只认三类路径的假更新源：版本接口、SHA256SUMS、资产。
+    struct FakeServer {
+        port: u16,
+        stop: std::sync::Arc<AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl FakeServer {
+        fn start(asset: &str, tag: &str, sum: &str, body: Vec<u8>) -> Self {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let stop = std::sync::Arc::new(AtomicBool::new(false));
+            let stop_inner = stop.clone();
+            let tag = tag.to_string();
+            let asset = asset.to_string();
+            let sum = sum.to_string();
+            let thread = std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    if stop_inner.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let Ok(mut stream) = stream else { continue };
+                    let mut buf = [0u8; 8192];
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let path = req.split_whitespace().nth(1).unwrap_or("/");
+                    let (status, payload) = if path.contains("api.github.com") {
+                        ("200 OK", format!("{{\"tag_name\":\"{tag}\"}}").into_bytes())
+                    } else if path.ends_with("SHA256SUMS.txt") {
+                        ("200 OK", format!("{sum}  {asset}\n").into_bytes())
+                    } else if path.contains(&asset) {
+                        ("200 OK", body.clone())
+                    } else {
+                        ("404 Not Found", b"no such thing".to_vec())
+                    };
+                    // HEAD 只看头；其余请求连正文一起回
+                    let payload = if req.starts_with("HEAD ") {
+                        Vec::new()
+                    } else {
+                        payload
+                    };
+                    let head = format!(
+                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        payload.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes());
+                    let _ = stream.write_all(&payload);
+                }
+            });
+            Self {
+                port,
+                stop,
+                thread: Some(thread),
+            }
+        }
+
+        fn source(&self, name: &str) -> Source {
+            Source {
+                name: name.to_string(),
+                prefix: Some(format!("http://127.0.0.1:{}", self.port)),
+            }
+        }
+    }
+
+    impl Drop for FakeServer {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            // 叫醒卡在 accept 上的线程；连上后读到空请求就会退出循环
+            let _ = std::net::TcpStream::connect(("127.0.0.1", self.port));
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    #[test]
+    fn probing_prefers_the_highest_version_over_the_fastest() {
+        let asset = asset_name().expect("测试平台必须有资产");
+        let old = FakeServer::start(asset, "v0.2.99", &"1".repeat(64), fake_binary());
+        let new = FakeServer::start(asset, "v0.3.0", &"2".repeat(64), fake_binary());
+        let sources = vec![old.source("old"), new.source("new")];
+
+        let (probed, errors) = probe_sources(&sources);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(probed[0].tag, "v0.3.0", "镜像缓存了旧版本也不能被当成最新");
+        assert_eq!(probed[0].source.name, "new");
+    }
+
+    #[test]
+    fn binary_content_check_rejects_small_files_and_error_pages() {
+        let dir = temp_dir("magic");
+        let good = dir.join("good");
+        std::fs::write(&good, fake_binary()).unwrap();
+        ensure_binary(&good).expect("本平台二进制应通过");
+
+        let small = dir.join("small");
+        std::fs::write(&small, b"MZ").unwrap();
+        assert!(ensure_binary(&small).is_err(), "几十字节的响应不是二进制");
+
+        let page = dir.join("page");
+        std::fs::write(&page, vec![b'<'; 96 * 1024]).unwrap();
+        assert!(ensure_binary(&page).is_err(), "HTML 错误页不能当更新包");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_bad_source_is_skipped_and_the_next_one_installs() {
+        let asset = asset_name().expect("测试平台必须有资产");
+        let good = fake_binary();
+        let good_sum = digest(&good);
+        // 这个源“自洽”地返回一大页 HTML 和对应的校验和：哈希能过，但内容不像二进制
+        let bad = vec![b'<'; 96 * 1024];
+        let bad_sum = digest(&bad);
+        let bad_server = FakeServer::start(asset, "v0.2.99", &bad_sum, bad);
+        let good_server = FakeServer::start(asset, "v0.2.99", &good_sum, good.clone());
+        let sources = vec![bad_server.source("bad"), good_server.source("good")];
+
+        let dir = temp_dir("multi-source");
+        let exe = dir.join(if cfg!(windows) { "ells.exe" } else { "ells" });
+        std::fs::write(&exe, b"old binary").unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut ticks = 0usize;
+        apply_with_sources(&exe, "v0.2.99", &sources, &cancel, &mut |_, _, _| {
+            ticks += 1
+        })
+        .expect("坏源之后应换到好源并完成替换");
+
+        assert_eq!(std::fs::read(&exe).unwrap(), good, "装上去的必须是好源那份");
+        assert_eq!(std::fs::read(old_path(&exe)).unwrap(), b"old binary");
+        assert!(ticks > 0, "进度回调至少要有几拍");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 真链路冒烟（会下整个平台二进制，约 9MB）：`cargo test -p ells -- --ignored`。
     /// 目标是临时目录里的假 exe，绝不动正在运行的自己。
     #[test]
@@ -1283,11 +1979,18 @@ mod tests {
 
         let cancel = AtomicBool::new(false);
         let mut ticks = 0usize;
-        apply_to(&exe, "v0.1.5", &cancel, &mut |_, _| ticks += 1).expect("更新应完成");
+        apply_to(&exe, "v0.1.5", &cancel, &mut |_, _, _| ticks += 1).expect("更新应完成");
 
         let want = fetch_sum("v0.1.5", asset).expect("发布资产应有校验条目");
-        assert_eq!(digest_of(&exe).as_deref(), Some(want.as_str()), "换上去的不是发布的那份文件");
-        assert!(std::fs::metadata(&exe).unwrap().len() > 1 << 20, "不像一个真二进制");
+        assert_eq!(
+            digest_of(&exe).as_deref(),
+            Some(want.as_str()),
+            "换上去的不是发布的那份文件"
+        );
+        assert!(
+            std::fs::metadata(&exe).unwrap().len() > 1 << 20,
+            "不像一个真二进制"
+        );
         assert!(ticks > 1, "进度回调至少要有几拍：{ticks}");
         assert!(old_path(&exe).exists(), "旧镜像应被挪成 .old 而不是丢掉");
         let _ = std::fs::remove_dir_all(&dir);

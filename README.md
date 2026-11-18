@@ -91,13 +91,14 @@ irm https://raw.githubusercontent.com/lg10/ells/main/install.ps1 | iex
 
 Reopen your terminal afterwards, and both `ells` and the short command `s` are ready (the installer sets up PATH; on PowerShell it also registers an `s` function in your profile — cmd needs nothing extra). Both installers verify `SHA256SUMS.txt` and refuse to run on a mismatch.
 
-### Pin a version / custom dir / mirror
+### Pin a version / custom dir / update sources
 
 macOS / Linux:
 
 ```bash
 ELLS_VERSION=v0.2.8 curl -fsSL https://raw.githubusercontent.com/lg10/ells/main/install.sh | sh
 ELLS_INSTALL_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/lg10/ells/main/install.sh | sh
+ELLS_UPDATE_SOURCES="https://gh-proxy.com,https://ghfast.top" curl -fsSL https://raw.githubusercontent.com/lg10/ells/main/install.sh | sh
 ```
 
 Windows PowerShell:
@@ -105,16 +106,17 @@ Windows PowerShell:
 ```powershell
 $env:ELLS_VERSION="v0.2.8"; irm https://raw.githubusercontent.com/lg10/ells/main/install.ps1 | iex
 $env:ELLS_INSTALL_DIR="$env:USERPROFILE\bin"; irm https://raw.githubusercontent.com/lg10/ells/main/install.ps1 | iex
+$env:ELLS_UPDATE_SOURCES="https://gh-proxy.com,https://ghfast.top"; irm https://raw.githubusercontent.com/lg10/ells/main/install.ps1 | iex
 ```
 
-`ELLS_API_URL` / `ELLS_DOWNLOAD_URL` point the release lookup and download at a mirror or an intranet. If installation misbehaves, run `sh diagnose.sh` — it prints the shell, curl, architecture and proxy decisions the installer is about to make.
+`ELLS_UPDATE_SOURCES` takes a comma / semicolon / whitespace separated list of `github` (direct) or mirror prefixes such as `https://gh-proxy.com`. Leave it empty to use the built-in direct source plus several public accelerators; sources are probed in parallel, ranked by version and latency, and retried in turn when one fails, with checksums cross-checked across sources. If installation misbehaves, run `sh diagnose.sh` — it prints the shell, curl, architecture and proxy decisions the installer is about to make.
 
 ### Updating in place
 
-Once installed you rarely need the installer again. ells asks GitHub for a newer release in the background on **every start** — a single HEAD request whose redirected URL carries the version, so nothing is downloaded and no anonymous API quota is spent. When there is something newer, the host list grows a `【vX.Y.Z 可更新】` badge; click it (or press Enter on the 「自动更新」 row in settings) and the confirm dialog then does four things:
+Once installed you rarely need the installer again. ells asks about newer releases in the background on **every start** — the built-in direct source and several public accelerators are probed in parallel (release version and latency), the best one is used first, and failed sources fall through to the next. No binary is downloaded during this check and no anonymous API quota is spent. When there is something newer, the host list grows a `【vX.Y.Z 可更新】` badge; click it (or press Enter on the 「自动更新」 row in settings) and the confirm dialog then does four things:
 
 1. downloads the asset for your platform (`ells-linux-x86_64` / `ells-macos-universal` / `ells-windows-x86_64.exe`) into a temp file next to ells;
-2. hashes it with SHA256 **while streaming**, and compares against the release's `SHA256SUMS.txt` — on a mismatch, or a short body, the temp file is deleted and **nothing is replaced**;
+2. hashes it with SHA256 **while streaming** and compares against the release's `SHA256SUMS.txt`: the direct GitHub checksum wins, otherwise at least two sources must agree. On a mismatch, a short body, or content that is not a native binary (too small / an HTML error page), the temp file is deleted, the next source is tried, and **nothing is replaced**;
 3. swaps the new binary in. A running image on Windows cannot be deleted but can be renamed, so `ells.exe` becomes `ells.exe.old` and the new file takes its place; your current session keeps running, and a failed swap is renamed back;
 4. reports "the new version is in place" — the file on disk is new, the process is still old. Press Enter / 【立即重启】 to restart into it. The confirm dialog says up front how many live sessions that would drop.
 
@@ -123,7 +125,8 @@ Once installed you rarely need the installer again. ells asks GitHub for a newer
 - Prefer not to be checked: toggle 「自动更新」 off with `←` in settings (`auto_update=false` in `settings.ini`). You can still press Enter on that row to check by hand.
 - Scripting and troubleshooting: `ells --check-update` prints the result and exits — no download, no TUI, no terminal state touched.
 - The last check is cached in `~/.ells/update.cache` (a version and a timestamp, nothing about your hosts).
-- Mirrors / intranet: `ELLS_DOWNLOAD_URL` (asset base) and `ELLS_API_URL` (release lookup) — the same contract the install scripts use.
+- Update sources: `ELLS_UPDATE_SOURCES` (comma / semicolon separated `github` or mirror prefixes), or `update_sources=` in `settings.ini`; leave it empty for the built-in list. The same contract the install scripts use.
+- The old `ELLS_API_URL` / `ELLS_DOWNLOAD_URL` / `ELLS_RELEASE_URL` are deprecated and ignored.
 - Platforms with no prebuilt package (e.g. Linux aarch64) are pointed at the install scripts instead of being overwritten with something that cannot run.
 
 ### Uninstall
@@ -188,8 +191,8 @@ Headless subcommands (run `ells <subcommand> --help` for every flag):
 Environment: ELLS_LOG=1 logs to stderr; ELLS_ZMODEM_LOG=1 additionally writes
 sz/rz interception diagnostics to ~/.ells/zmodem.log; ELLS_YES=1 == -y;
 ELLS_MASTER feeds the master password to the headless subcommands (the first stdin
-line works too when you pipe); ELLS_API_URL / ELLS_DOWNLOAD_URL point update checks
-at a mirror or intranet.
+line works too when you pipe); ELLS_UPDATE_SOURCES selects update sources
+(`github` or mirror prefixes, comma / semicolon separated).
 
 Config lives in ~/.ells/: vault.bin (credentials), settings.ini, known_hosts,
 audit.log (operation log), logs/ (session transcripts), ssh_config.export

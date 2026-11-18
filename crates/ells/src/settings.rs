@@ -85,6 +85,9 @@ pub struct Settings {
     pub metrics: bool,
     /// 终端里手敲 `vi 文件` / 浏览器按 `e` 时的打开方式。
     pub edit_open: EditOpen,
+    /// 自更新源列表（逗号 / 分号 / 空白分隔）：`github` 或镜像前缀。
+    /// 空 = 内置列表（官方 + 几个公开加速镜像）。
+    pub update_sources: String,
 }
 
 impl Default for Settings {
@@ -107,6 +110,8 @@ impl Default for Settings {
             // 默认内置编辑器：不依赖本机装没装 vim，也不用离开终端；
             // 想用外部程序或远端原生 vi 在设置里切。
             edit_open: EditOpen::Builtin,
+            // 空 = update.rs 的内置源列表；用户可用环境变量或 settings.ini 覆盖
+            update_sources: String::new(),
         }
     }
 }
@@ -176,6 +181,7 @@ impl Settings {
                 "auto_update" => s.auto_update = v.trim() != "false",
                 "session_log" => s.session_log = v.trim() != "false",
                 "metrics" => s.metrics = v.trim() != "false",
+                "update_sources" => s.update_sources = v.trim().to_string(),
                 // 编辑方式：写错的值忽略，保留默认（内置编辑器）。
                 // 旧版本写的是 vi_open，继续认，升级后不用重设。
                 "edit_open" | "vi_open" => {
@@ -234,7 +240,7 @@ impl Settings {
             let _ = std::fs::create_dir_all(dir);
         }
         let mut text = format!(
-            "highlight={}\nkeepalive_secs={}\nmaster_password_enabled={}\ntheme={}\nauto_update={}\nsession_log={}\nmetrics={}\nedit_open={}\nlist_sort={}\nreconnect_attempts={}\nreconnect_initial_ms={}\nreconnect_max_ms={}\nreconnect_stable_secs={}\nreconnect_jitter={}\n",
+            "highlight={}\nkeepalive_secs={}\nmaster_password_enabled={}\ntheme={}\nauto_update={}\nsession_log={}\nmetrics={}\nupdate_sources={}\nedit_open={}\nlist_sort={}\nreconnect_attempts={}\nreconnect_initial_ms={}\nreconnect_max_ms={}\nreconnect_stable_secs={}\nreconnect_jitter={}\n",
             self.highlight,
             self.keepalive_secs,
             self.master_password_enabled,
@@ -242,6 +248,7 @@ impl Settings {
             self.auto_update,
             self.session_log,
             self.metrics,
+            self.update_sources.replace(['\n', '\r'], ","),
             self.edit_open.ini_value(),
             self.list_sort.ini_value(),
             self.reconnect.max_attempts,
