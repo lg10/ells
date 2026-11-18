@@ -8,6 +8,7 @@
 //! 红线：密码不会回显，所以正常输密码不会进日志；但屏幕上出现过的东西就会进文件，
 //! 不想记就在设置里关掉（`session_log=false`）。
 
+use ells_lang::t;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -33,13 +34,13 @@ fn now() -> String {
 }
 
 fn beijing(instant: DateTime<Utc>) -> String {
-    let offset = FixedOffset::east_opt(8 * 3600).expect("+08:00 恒有效");
+    let offset = FixedOffset::east_opt(8 * 3600).expect(t("+08:00 恒有效"));
     instant.with_timezone(&offset).to_rfc3339_opts(SecondsFormat::Secs, false)
 }
 
 /// 文件名用的时间戳：`20261009-140322`（冒号和加号在文件名里都是麻烦）。
 fn stamp() -> String {
-    let offset = FixedOffset::east_opt(8 * 3600).expect("+08:00 恒有效");
+    let offset = FixedOffset::east_opt(8 * 3600).expect(t("+08:00 恒有效"));
     Utc::now()
         .with_timezone(&offset)
         .format("%Y%m%d-%H%M%S")

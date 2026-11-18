@@ -1,5 +1,6 @@
 //! 容器视图的状态与纯投影。网络与解析在 `ells_core`，这里只管"打开着的那一屏"。
 
+use ells_lang::{t, tf};
 use chrono::{DateTime, Local, Utc};
 pub use ells_core::docker::ContainerAction;
 use ells_core::docker::{
@@ -114,20 +115,20 @@ pub fn menu_choices(state: &str) -> Vec<MenuChoice> {
 
 pub fn menu_choice_label(choice: MenuChoice) -> &'static str {
     match choice {
-        MenuChoice::Detail => "详情（含资源占用）",
+        MenuChoice::Detail => t("详情（含资源占用）"),
         MenuChoice::Act(action) => action_label(action),
     }
 }
 
 pub fn action_label(action: ContainerAction) -> &'static str {
     match action {
-        ContainerAction::Start => "启动",
-        ContainerAction::Stop => "停止",
-        ContainerAction::Restart => "重启",
-        ContainerAction::Kill => "强制停止",
-        ContainerAction::Pause => "暂停",
-        ContainerAction::Unpause => "继续",
-        ContainerAction::Remove => "删除容器",
+        ContainerAction::Start => t("启动"),
+        ContainerAction::Stop => t("停止"),
+        ContainerAction::Restart => t("重启"),
+        ContainerAction::Kill => t("强制停止"),
+        ContainerAction::Pause => t("暂停"),
+        ContainerAction::Unpause => t("继续"),
+        ContainerAction::Remove => t("删除容器"),
     }
 }
 
@@ -377,12 +378,12 @@ impl DockerView {
             return "—".to_string();
         }
         if count <= PREVIEW_PORTS {
-            return format!("{count} 条");
+            return tf!("{count} 条");
         }
         if self.expanded.contains(&container.id) {
-            format!("▾ {count} 条")
+            tf!("▾ {count} 条")
         } else {
-            format!("▸ {count} 条")
+            tf!("▸ {count} 条")
         }
     }
 
@@ -581,7 +582,7 @@ pub fn ports_summary(ports: &[PortMapping]) -> String {
         .iter()
         .map(|p| match p.public_port {
             Some(public) => format!("{public}→{}/{}", p.private_port, p.proto),
-            None => format!("{}/{}（仅暴露）", p.private_port, p.proto),
+            None => tf!("{}/{}（仅暴露）", p.private_port, p.proto),
         })
         .collect::<Vec<_>>()
         .join(", ")
@@ -590,8 +591,8 @@ pub fn ports_summary(ports: &[PortMapping]) -> String {
 /// 绑定地址的人话：通配地址意味着这台机器对外可达。
 pub fn exposure(ip: &str) -> &str {
     match ip {
-        "" => "仅暴露",
-        "0.0.0.0" | "::" => "全网可达",
+        "" => t("仅暴露"),
+        "0.0.0.0" | "::" => t("全网可达"),
         ip => ip,
     }
 }
@@ -603,18 +604,18 @@ pub fn detail_lines(detail: &ContainerDetail) -> Vec<DetailLine> {
 
 pub fn detail_lines_at(detail: &ContainerDetail, now: DateTime<Utc>) -> Vec<DetailLine> {
     let mut out = Vec::new();
-    out.push(DetailLine::Section("基本"));
+    out.push(DetailLine::Section(t("基本")));
     push_field(
         &mut out,
-        "名称",
+        t("名称"),
         if detail.name.is_empty() {
             "—".to_string()
         } else {
             detail.name.clone()
         },
     );
-    push_field(&mut out, "容器 ID", short_digest(&detail.id));
-    push_field(&mut out, "镜像", image_text(detail));
+    push_field(&mut out, t("容器 ID"), short_digest(&detail.id));
+    push_field(&mut out, t("镜像"), image_text(detail));
     let mut state = if detail.state.is_empty() {
         "—".to_string()
     } else {
@@ -625,44 +626,44 @@ pub fn detail_lines_at(detail: &ContainerDetail, now: DateTime<Utc>) -> Vec<Deta
         state.push_str(health);
     }
     if detail.oom_killed {
-        state.push_str(" · 因内存不足被杀");
+        state.push_str(t(" · 因内存不足被杀"));
     }
-    push_field(&mut out, "状态", state);
-    push_field(&mut out, "创建时间", format_time(detail.created));
-    push_field(&mut out, "启动时间", format_time(detail.started_at));
-    push_field(&mut out, "运行时长", uptime_text(detail, now));
+    push_field(&mut out, t("状态"), state);
+    push_field(&mut out, t("创建时间"), format_time(detail.created));
+    push_field(&mut out, t("启动时间"), format_time(detail.started_at));
+    push_field(&mut out, t("运行时长"), uptime_text(detail, now));
     push_field(
         &mut out,
-        "重启策略",
+        t("重启策略"),
         restart_policy_text(&detail.restart_policy, detail.restart_max_retry),
     );
-    push_field(&mut out, "重启次数", detail.restart_count.to_string());
+    push_field(&mut out, t("重启次数"), detail.restart_count.to_string());
     if !detail.is_active() {
         push_field(
             &mut out,
-            "退出码",
+            t("退出码"),
             detail
                 .exit_code
                 .map(|code| code.to_string())
                 .unwrap_or_else(|| "—".to_string()),
         );
         if detail.finished_at.is_some() {
-            push_field(&mut out, "停止时间", format_time(detail.finished_at));
+            push_field(&mut out, t("停止时间"), format_time(detail.finished_at));
         }
     }
 
-    out.push(DetailLine::Section("资源占用"));
+    out.push(DetailLine::Section(t("资源占用")));
     if let Some(stats) = &detail.stats {
         out.extend(stats_lines(stats));
     } else if let Some(error) = &detail.stats_error {
-        push_field(&mut out, "读取失败", error.clone());
+        push_field(&mut out, t("读取失败"), error.clone());
     } else if !detail.is_active() {
-        out.push(DetailLine::Item("容器未运行，没有实时资源数据".to_string()));
+        out.push(DetailLine::Item(t("容器未运行，没有实时资源数据").to_string()));
     } else {
-        out.push(DetailLine::Item("没有取到资源数据".to_string()));
+        out.push(DetailLine::Item(t("没有取到资源数据").to_string()));
     }
 
-    out.push(DetailLine::Section("网络"));
+    out.push(DetailLine::Section(t("网络")));
     if detail.networks.is_empty() {
         out.push(DetailLine::Item("—".to_string()));
     } else {
@@ -675,7 +676,7 @@ pub fn detail_lines_at(detail: &ContainerDetail, now: DateTime<Utc>) -> Vec<Deta
         }
     }
 
-    out.push(DetailLine::Section("端口"));
+    out.push(DetailLine::Section(t("端口")));
     let ports = dedupe_ports(&detail.ports);
     if ports.is_empty() {
         out.push(DetailLine::Item("—".to_string()));
@@ -685,43 +686,43 @@ pub fn detail_lines_at(detail: &ContainerDetail, now: DateTime<Utc>) -> Vec<Deta
         }
     }
 
-    out.push(DetailLine::Section("挂载"));
+    out.push(DetailLine::Section(t("挂载")));
     if detail.mounts.is_empty() {
         out.push(DetailLine::Item("—".to_string()));
     } else {
         for mount in &detail.mounts {
-            let mode = if mount.read_only { "只读" } else { "读写" };
+            let mode = if mount.read_only { t("只读") } else { t("读写") };
             let kind = if mount.kind.is_empty() {
                 mode.to_string()
             } else {
                 format!("{mode} · {}", mount.kind)
             };
-            out.push(DetailLine::Item(format!(
+            out.push(DetailLine::Item(tf!(
                 "{} → {}（{kind}）",
                 mount.source, mount.destination
             )));
         }
     }
 
-    out.push(DetailLine::Section("命令"));
+    out.push(DetailLine::Section(t("命令")));
     if let Some(entrypoint) = &detail.entrypoint {
         push_field(&mut out, "Entrypoint", entrypoint.clone());
     }
     if let Some(cmd) = &detail.cmd {
-        push_field(&mut out, "命令", cmd.clone());
+        push_field(&mut out, t("命令"), cmd.clone());
     }
     push_field(
         &mut out,
-        "用户",
+        t("用户"),
         if detail.user.is_empty() {
-            "默认（root）".to_string()
+            t("默认（root）").to_string()
         } else {
             detail.user.clone()
         },
     );
     push_field(
         &mut out,
-        "工作目录",
+        t("工作目录"),
         if detail.working_dir.is_empty() {
             "/".to_string()
         } else {
@@ -736,7 +737,7 @@ pub fn detail_copy_text(detail: &ContainerDetail) -> String {
     detail_lines(detail)
         .into_iter()
         .map(|line| match line {
-            DetailLine::Section(name) => format!("【{name}】"),
+            DetailLine::Section(name) => tf!("【{name}】"),
             DetailLine::Field { label, value } => format!("{label}\t{value}"),
             DetailLine::Item(value) => format!("\t{value}"),
         })
@@ -753,7 +754,7 @@ fn image_text(detail: &ContainerDetail) -> String {
         (true, true) => "—".to_string(),
         (true, false) => short_digest(&detail.image_id),
         (false, true) => detail.image.clone(),
-        (false, false) => format!("{}（{}）", detail.image, short_digest(&detail.image_id)),
+        (false, false) => tf!("{}（{}）", detail.image, short_digest(&detail.image_id)),
     }
 }
 
@@ -774,17 +775,17 @@ fn uptime_text(detail: &ContainerDetail, now: DateTime<Utc>) -> String {
     }
     detail
         .finished_at
-        .map(|finished| format!("已停止（{}）", format_time(Some(finished))))
+        .map(|finished| tf!("已停止（{}）", format_time(Some(finished))))
         .unwrap_or_else(|| "—".to_string())
 }
 
 fn restart_policy_text(policy: &str, max_retry: u64) -> String {
     match policy {
-        "" | "no" => "不自动重启".to_string(),
-        "always" => "总是重启".to_string(),
-        "unless-stopped" => "除非手动停止，否则重启".to_string(),
-        "on-failure" if max_retry > 0 => format!("失败时重启（最多 {max_retry} 次）"),
-        "on-failure" => "失败时重启".to_string(),
+        "" | "no" => t("不自动重启").to_string(),
+        "always" => t("总是重启").to_string(),
+        "unless-stopped" => t("除非手动停止，否则重启").to_string(),
+        "on-failure" if max_retry > 0 => tf!("失败时重启（最多 {max_retry} 次）"),
+        "on-failure" => t("失败时重启").to_string(),
         other => other.to_string(),
     }
 }
@@ -798,22 +799,22 @@ fn stats_lines(stats: &ContainerStats) -> Vec<DetailLine> {
         (Some(used), Some(limit)) => {
             let percent = stats
                 .mem_percent
-                .map(|p| format!("（{p:.1}%）"))
+                .map(|p| tf!("（{p:.1}%）"))
                 .unwrap_or_default();
             push_field(
                 &mut out,
-                "内存",
+                t("内存"),
                 format!("{} / {}{percent}", format_bytes(used), format_bytes(limit)),
             );
         }
-        (Some(used), None) => push_field(&mut out, "内存", format_bytes(used)),
+        (Some(used), None) => push_field(&mut out, t("内存"), format_bytes(used)),
         _ => {}
     }
     if stats.net_rx.is_some() || stats.net_tx.is_some() {
         push_field(
             &mut out,
-            "网络",
-            format!(
+            t("网络"),
+            tf!(
                 "接收 {} · 发送 {}",
                 opt_bytes(stats.net_rx),
                 opt_bytes(stats.net_tx)
@@ -821,13 +822,13 @@ fn stats_lines(stats: &ContainerStats) -> Vec<DetailLine> {
         );
     }
     if let Some(pids) = stats.pids {
-        push_field(&mut out, "进程", pids.to_string());
+        push_field(&mut out, t("进程"), pids.to_string());
     }
     if stats.block_read.is_some() || stats.block_write.is_some() {
         push_field(
             &mut out,
-            "磁盘 I/O",
-            format!(
+            t("磁盘 I/O"),
+            tf!(
                 "读 {} · 写 {}",
                 opt_bytes(stats.block_read),
                 opt_bytes(stats.block_write)
@@ -835,7 +836,7 @@ fn stats_lines(stats: &ContainerStats) -> Vec<DetailLine> {
         );
     }
     if out.is_empty() {
-        out.push(DetailLine::Item("没有取到可用的资源数据".to_string()));
+        out.push(DetailLine::Item(t("没有取到可用的资源数据").to_string()));
     }
     out
 }
@@ -876,13 +877,13 @@ pub fn format_duration(from: DateTime<Utc>, to: DateTime<Utc>) -> String {
     let hours = (seconds % 86_400) / 3_600;
     let minutes = (seconds % 3_600) / 60;
     if days > 0 {
-        format!("{days} 天 {hours} 小时")
+        tf!("{days} 天 {hours} 小时")
     } else if hours > 0 {
-        format!("{hours} 小时 {minutes} 分")
+        tf!("{hours} 小时 {minutes} 分")
     } else if minutes > 0 {
-        format!("{minutes} 分")
+        tf!("{minutes} 分")
     } else {
-        format!("{seconds} 秒")
+        tf!("{seconds} 秒")
     }
 }
 

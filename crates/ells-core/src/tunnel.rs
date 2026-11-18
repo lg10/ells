@@ -9,6 +9,7 @@
 //! 验证，猜错的后果是"流量安静地走错地方"，比明确拒绝更糟。所以这里返回显式的
 //! 不支持状态，让界面和 `ells tunnels` 都能看见原因。
 
+use ells_lang::{t, tf};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -271,7 +272,7 @@ fn bind_failure(hosts: &[Host], alias: &str, addr: IpAddr, port: u16, err: &std:
     } else {
         format!(
             "本地端口 {addr}:{port} 绑定失败：{} 用的是同一个口 — 先停掉其中一个，或把本地口留空交给系统分配",
-            others.join("、")
+            others.join(t("、"))
         )
     }
 }
@@ -290,7 +291,7 @@ async fn run_tunnel(
     };
 
     if host.forwards.is_empty() {
-        report(TunnelState::Failed("该主机没有配置转发规则".into()), &[]);
+        report(TunnelState::Failed(t("该主机没有配置转发规则").into()), &[]);
         return;
     }
     if let Some(unsupported) = host
@@ -323,7 +324,7 @@ async fn run_tunnel(
         }
     }
     if bound.is_empty() {
-        report(TunnelState::Failed("没有可监听的本地端口".into()), &[]);
+        report(TunnelState::Failed(t("没有可监听的本地端口").into()), &[]);
         return;
     }
     let ports: Vec<PortMap> = bound.iter().map(Bound::mapping).collect();
@@ -479,21 +480,21 @@ async fn socks5_target(stream: &mut TcpStream) -> Result<Option<(String, u16)>> 
     stream
         .read_exact(&mut greeting)
         .await
-        .context("读取 SOCKS 问候失败")?;
+        .context(t("读取 SOCKS 问候失败"))?;
     if greeting[0] != 5 {
         return Ok(None);
     }
     let mut methods = vec![0u8; usize::from(greeting[1])];
-    stream.read_exact(&mut methods).await.context("读取方法列表失败")?;
+    stream.read_exact(&mut methods).await.context(t("读取方法列表失败"))?;
     // 只支持"无认证"：客户端没提供它就不硬来，回 0xFF 让它自己决定
     if !methods.contains(&0) {
         stream.write_all(&[5, 0xFF]).await.ok();
         return Ok(None);
     }
-    stream.write_all(&[5, 0]).await.context("回 SOCKS 方法失败")?;
+    stream.write_all(&[5, 0]).await.context(t("回 SOCKS 方法失败"))?;
 
     let mut header = [0u8; 4];
-    stream.read_exact(&mut header).await.context("读取请求头失败")?;
+    stream.read_exact(&mut header).await.context(t("读取请求头失败"))?;
     if header[0] != 5 {
         return Ok(None);
     }
@@ -508,7 +509,7 @@ async fn socks5_target(stream: &mut TcpStream) -> Result<Option<(String, u16)>> 
             stream
                 .read_exact(&mut octets)
                 .await
-                .context("读取 IPv4 目的端失败")?;
+                .context(t("读取 IPv4 目的端失败"))?;
             IpAddr::V4(octets.into()).to_string()
         }
         4 => {
@@ -516,24 +517,24 @@ async fn socks5_target(stream: &mut TcpStream) -> Result<Option<(String, u16)>> 
             stream
                 .read_exact(&mut octets)
                 .await
-                .context("读取 IPv6 目的端失败")?;
+                .context(t("读取 IPv6 目的端失败"))?;
             IpAddr::V6(octets.into()).to_string()
         }
         3 => {
             let mut len = [0u8; 1];
-            stream.read_exact(&mut len).await.context("读取域名长度失败")?;
+            stream.read_exact(&mut len).await.context(t("读取域名长度失败"))?;
             let mut name = vec![0u8; usize::from(len[0])];
-            stream.read_exact(&mut name).await.context("读取域名失败")?;
-            String::from_utf8(name).map_err(|_| anyhow!("SOCKS 域名不是 UTF-8"))?
+            stream.read_exact(&mut name).await.context(t("读取域名失败"))?;
+            String::from_utf8(name).map_err(|_| anyhow!("{}", tf!("SOCKS 域名不是 UTF-8")))?
         }
         other => {
             // 8 = 地址类型不支持
             stream.write_all(&[5, 8, 0, 1, 0, 0, 0, 0, 0, 0]).await.ok();
-            return Err(anyhow!("不支持的地址类型 {other}"));
+            return Err(anyhow!("{}", tf!("不支持的地址类型 {other}")));
         }
     };
     let mut port = [0u8; 2];
-    stream.read_exact(&mut port).await.context("读取端口失败")?;
+    stream.read_exact(&mut port).await.context(t("读取端口失败"))?;
     if target.is_empty() || forward_is_unroutable(&target) {
         return Ok(None);
     }

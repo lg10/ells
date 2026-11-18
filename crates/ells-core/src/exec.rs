@@ -3,6 +3,7 @@
 //! 与交互式会话分开是因为脚本要的是"退出码 + 两段输出"，而不是一个 PTY 循环：
 //! 不开 PTY 时 stdout 与 stderr 必须分流，否则 `2>` 重定向形同虚设。
 
+use ells_lang::t;
 use anyhow::{Context, Result};
 use tokio::io::AsyncWriteExt;
 
@@ -35,11 +36,11 @@ pub async fn exec(
 ) -> Result<ExecResult> {
     let handle = connect_handle_to(host, vault, policy)
         .await
-        .context("建立连接失败")?;
+        .context(t("建立连接失败"))?;
     let channel = handle
         .channel_open_session()
         .await
-        .context("打开会话通道失败")?;
+        .context(t("打开会话通道失败"))?;
     if tty {
         channel
             .request_pty(
@@ -52,17 +53,17 @@ pub async fn exec(
                 &[],
             )
             .await
-            .context("申请伪终端(PTY)失败")?;
+            .context(t("申请伪终端(PTY)失败"))?;
     }
     if !stdin_bytes.is_empty() {
         let mut writer = channel.make_writer();
-        writer.write_all(stdin_bytes).await.context("送入标准输入失败")?;
+        writer.write_all(stdin_bytes).await.context(t("送入标准输入失败"))?;
         writer.shutdown().await.ok();
     }
     channel
         .exec(true, command)
         .await
-        .context("执行命令失败")?;
+        .context(t("执行命令失败"))?;
 
     let mut out = Vec::new();
     let mut err = Vec::new();

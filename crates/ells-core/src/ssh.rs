@@ -1,4 +1,5 @@
 use anyhow::{anyhow, bail, Context, Result};
+use ells_lang::{t, tf};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
@@ -165,16 +166,16 @@ impl RemoteSession {
         let channel = handle
             .channel_open_session()
             .await
-            .context("打开会话通道失败")?;
+            .context(t("打开会话通道失败"))?;
 
         channel
             .request_pty(true, "xterm-256color", cols as u32, rows as u32, 0, 0, &[])
             .await
-            .context("申请伪终端(PTY)失败")?;
+            .context(t("申请伪终端(PTY)失败"))?;
         channel
             .request_shell(true)
             .await
-            .context("申请 shell 失败")?;
+            .context(t("申请 shell 失败"))?;
 
         let (input_tx, mut input_rx) = mpsc::unbounded_channel::<SessionInput>();
         let (output_tx, output_rx) = mpsc::unbounded_channel::<RemoteEvent>();
@@ -375,7 +376,7 @@ impl ProbeTarget {
             return Ok(probe);
         }
         let Some(rest) = budget(deadline) else {
-            return into_result(probe, anyhow!("采集超时（SFTP 那一路没在预算里读完）"));
+            return into_result(probe, anyhow!("{}", tf!("采集超时（SFTP 那一路没在预算里读完）")));
         };
         match self.probe(crate::metrics::PROBE_COMMAND, rest, max_bytes).await {
             Ok(text) => probe.fill_gaps(&crate::metrics::Probe::parse(&text)),
@@ -383,7 +384,7 @@ impl ProbeTarget {
             Err(_) if probe.has_data() => {}
             Err(e) => return Err(e),
         }
-        into_result(probe, anyhow!("这台主机既读不到 /proc，也拿不到磁盘"))
+        into_result(probe, anyhow!("{}", tf!("这台主机既读不到 /proc，也拿不到磁盘")))
     }
 
     /// 在这条已认证的连接上跑一条一次性命令，收完标准输出返回。
@@ -433,7 +434,7 @@ impl ProbeTarget {
             };
             if let Ok(text) = self.probe(cmd, rest, max_bytes).await {
                 if text.contains("ELLS_DOCKER_FAILED") {
-                    cli_err = Some("远端没有 docker 命令，或当前用户无权访问".to_string());
+                    cli_err = Some(t("远端没有 docker 命令，或当前用户无权访问").to_string());
                 } else {
                     match crate::docker::parse_cli_json_lines(&text) {
                         Ok(list) => return Ok(list),
@@ -446,9 +447,9 @@ impl ProbeTarget {
             (Some(s), Some(c)) => format!("socket: {s}；docker ps: {c}"),
             (Some(s), None) => format!("socket: {s}"),
             (None, Some(c)) => format!("docker ps: {c}"),
-            (None, None) => "超时".to_string(),
+            (None, None) => t("超时").to_string(),
         };
-        Err(anyhow!("这台机器拿不到容器列表（{why}）"))
+        Err(anyhow!("{}", tf!("这台机器拿不到容器列表（{why}）")))
     }
 
     /// 执行一个容器生命周期动作。socket 能开通道就走 Engine API；
@@ -461,7 +462,7 @@ impl ProbeTarget {
         timeout: std::time::Duration,
     ) -> Result<()> {
         if !crate::docker::is_safe_container_id(id) {
-            bail!("容器 ID 含有不安全的字符");
+            bail!("{}", tf!("容器 ID 含有不安全的字符"));
         }
         let channel = match self
             .handle
@@ -479,7 +480,7 @@ impl ProbeTarget {
                 if text.contains("ELLS_DOCKER_OK") {
                     return Ok(());
                 }
-                bail!("远端 docker 命令执行失败（没有 docker CLI，或容器当前状态不允许该操作）");
+                bail!("{}", tf!("远端 docker 命令执行失败（没有 docker CLI，或容器当前状态不允许该操作）"));
             }
         };
         let mut stream = channel.into_stream();
@@ -506,7 +507,7 @@ impl ProbeTarget {
             Ok::<_, std::io::Error>(buf)
         })
         .await
-        .context("Docker 动作等待超时")??;
+        .context(t("Docker 动作等待超时"))??;
         let status = crate::docker::parse_http_status(&raw).map_err(|e| anyhow!(e))?;
         // 204 是成功；304 表示"已经在目标状态"（停止已停的、启动已启动的），同样算成功。
         if (200..300).contains(&status) || status == 304 {
@@ -524,9 +525,9 @@ impl ProbeTarget {
             })
             .unwrap_or_default();
         if body.is_empty() {
-            bail!("Docker 返回 HTTP {status}")
+            bail!("{}", tf!("Docker 返回 HTTP {status}"))
         } else {
-            bail!("Docker 返回 HTTP {status}：{body}")
+            bail!("{}", tf!("Docker 返回 HTTP {status}：{body}"))
         }
     }
 
@@ -539,7 +540,7 @@ impl ProbeTarget {
         max_bytes: usize,
     ) -> Result<crate::docker::ContainerDetail> {
         if !crate::docker::is_safe_container_id(id) {
-            bail!("容器 ID 含有不安全的字符");
+            bail!("{}", tf!("容器 ID 含有不安全的字符"));
         }
         let deadline = tokio::time::Instant::now() + timeout;
         let path = format!("/containers/{id}/json");
@@ -559,7 +560,7 @@ impl ProbeTarget {
                 }
             },
             None => {
-                socket_err = Some("超时".to_string());
+                socket_err = Some(t("超时").to_string());
                 None
             }
         };
@@ -568,17 +569,17 @@ impl ProbeTarget {
             None => {
                 let Some(rest) = budget(deadline) else {
                     bail!(
-                        "读不到容器详情（socket: {}；没有剩余时间）",
-                        socket_err.unwrap_or_else(|| "超时".to_string())
-                    );
+                        "{}", tf!("读不到容器详情（socket: {}；没有剩余时间）",
+                        socket_err.unwrap_or_else(|| t("超时").to_string())
+                    )   );
                 };
                 let cmd = format!("docker inspect {id} 2>/dev/null || echo ELLS_DOCKER_FAILED");
                 let text = self.probe(&cmd, rest, max_bytes).await?;
                 if text.contains("ELLS_DOCKER_FAILED") || text.trim().is_empty() {
                     bail!(
-                        "读不到容器详情（socket: {}；docker inspect: 远端没有 docker 命令或无权访问）",
-                        socket_err.unwrap_or_else(|| "不可用".to_string())
-                    );
+                        "{}", tf!("读不到容器详情（socket: {}；docker inspect: 远端没有 docker 命令或无权访问）",
+                        socket_err.unwrap_or_else(|| t("不可用").to_string())
+                    )   );
                 }
                 crate::docker::parse_inspect_json(&text).map_err(|e| anyhow!(e))?
             }
@@ -592,7 +593,7 @@ impl ProbeTarget {
                         Err(e) => detail.stats_error = Some(format!("{e:#}")),
                     }
                 }
-                None => detail.stats_error = Some("读取资源占用超时".to_string()),
+                None => detail.stats_error = Some(t("读取资源占用超时").to_string()),
             }
         }
         Ok(detail)
@@ -624,7 +625,7 @@ impl ProbeTarget {
                 );
                 let text = self.probe(&cmd, timeout, max_bytes).await?;
                 if text.contains("ELLS_DOCKER_FAILED") || text.trim().is_empty() {
-                    bail!("读不到资源占用（socket: {e:#}；docker stats 不可用）");
+                    bail!("{}", tf!("读不到资源占用（socket: {e:#}；docker stats 不可用）"));
                 }
                 crate::docker::parse_stats_cli(&text).map_err(|e| anyhow!(e))
             }
@@ -825,8 +826,8 @@ async fn handle_probe(
     let channel = handle
         .channel_open_session()
         .await
-        .context("打开采集通道失败")?;
-    channel.exec(true, command).await.context("采集命令执行失败")?;
+        .context(t("打开采集通道失败"))?;
+    channel.exec(true, command).await.context(t("采集命令执行失败"))?;
     let mut channel = channel;
     let text = tokio::time::timeout(timeout, async move {
         let mut buf: Vec<u8> = Vec::new();
@@ -841,7 +842,7 @@ async fn handle_probe(
         String::from_utf8_lossy(&buf).into_owned()
     })
     .await
-    .context("采集超时（远端可能卡在失效的挂载点上）")?;
+    .context(t("采集超时（远端可能卡在失效的挂载点上）"))?;
     Ok(text)
 }
 
@@ -876,7 +877,7 @@ async fn docker_http(
     let channel = handle
         .channel_open_direct_streamlocal("/var/run/docker.sock")
         .await
-        .context("服务器不允许直连 Docker socket")?;
+        .context(t("服务器不允许直连 Docker socket"))?;
     let mut stream = channel.into_stream();
     let body_header = if method == "GET" {
         ""
@@ -904,8 +905,8 @@ async fn docker_http(
         Ok::<_, std::io::Error>(buf)
     })
     .await
-    .context("Docker socket 读超时")?
-    .context("读取 Docker socket 失败")
+    .context(t("Docker socket 读超时"))?
+    .context(t("读取 Docker socket 失败"))
 }
 
 /// Establish an authenticated handle to `host`, tunneling through the/// configured jump host (recursively, ProxyJump style) when present.
@@ -920,7 +921,7 @@ pub(crate) fn connect_handle<'a>(
     Box::pin(async move {
         if visited.iter().any(|a| a == &host.alias) {
             let chain = visited.join(" → ");
-            return Err(anyhow!("跳板链存在循环: {chain} → {}", host.alias));
+            return Err(anyhow!("{}", tf!("跳板链存在循环: {chain} → {}", host.alias)));
         }
         visited.push(host.alias.clone());
         // 空闲保活：云上 NAT/防火墙会静默掐断长时间无流量的 SSH TCP，
@@ -991,14 +992,14 @@ pub async fn connect_sftp(
     let channel = handle
         .channel_open_session()
         .await
-        .context("打开会话通道失败")?;
+        .context(t("打开会话通道失败"))?;
     channel
         .request_subsystem(true, "sftp")
         .await
-        .context("服务器不支持 SFTP 子系统")?;
+        .context(t("服务器不支持 SFTP 子系统"))?;
     let session = russh_sftp::client::SftpSession::new(channel.into_stream())
         .await
-        .context("建立 SFTP 会话失败")?;
+        .context(t("建立 SFTP 会话失败"))?;
     Ok(Arc::new(session))
 }
 
@@ -1023,28 +1024,28 @@ async fn authenticate(handle: &mut russh::client::Handle<Handler>, host: &Host) 
             let password = host
                 .password
                 .as_deref()
-                .context("该主机没有保存密码")?;
+                .context(t("该主机没有保存密码"))?;
             let result = handle
                 .authenticate_password(&host.user, password)
                 .await
-                .map_err(|e| anyhow!("密码认证失败: {e}"))?;
-            describe(result, "密码")
+                .map_err(|e| anyhow!("{}", tf!("密码认证失败: {e}")))?;
+            describe(result, t("密码"))
         }
         Auth::PrimaryKey { path, passphrase } => {
             let expanded = expand_tilde(path);
             if expanded.ends_with(".pub") {
-                bail!("私钥路径指向的是公钥(.pub)，请选择私钥文件");
+                bail!("{}", tf!("私钥路径指向的是公钥(.pub)，请选择私钥文件"));
             }
             let raw = std::fs::read_to_string(&expanded)
                 .with_context(|| format!("无法读取私钥文件 {}", expanded))?;
             let key = if raw.contains("DEK-Info: DES-EDE3-CBC") {
                 let pass = passphrase.as_deref().ok_or_else(|| {
-                    anyhow!("该私钥为旧式 DES-EDE3-CBC 加密格式，请在「私钥口令」中填写其密码")
+                    anyhow!("{}", tf!("该私钥为旧式 DES-EDE3-CBC 加密格式，请在「私钥口令」中填写其密码"))
                 })?;
                 let der = decrypt_des3_pem(&raw, pass)
                     .with_context(|| format!("解密旧式 3DES 私钥失败（口令可能不正确）: {}", expanded))?;
                 russh::keys::decode_secret_key(&pkcs1_pem(&der), None)
-                    .map_err(|e| anyhow!("解析已解密的 PKCS#1 私钥失败: {e}"))?
+                    .map_err(|e| anyhow!("{}", tf!("解析已解密的 PKCS#1 私钥失败: {e}")))?
             } else {
                 match russh::keys::load_secret_key(&expanded, passphrase.as_deref()) {
                     Ok(k) => k,
@@ -1060,8 +1061,8 @@ async fn authenticate(handle: &mut russh::client::Handle<Handler>, host: &Host) 
             let result = handle
                 .authenticate_publickey(&host.user, key)
                 .await
-                .map_err(|e| anyhow!("密钥认证失败: {e}"))?;
-            describe(result, "密钥")
+                .map_err(|e| anyhow!("{}", tf!("密钥认证失败: {e}")))?;
+            describe(result, t("密钥"))
         }
         Auth::Agent => authenticate_agent(handle, host).await,
     }
@@ -1076,9 +1077,9 @@ async fn authenticate_agent(handle: &mut russh::client::Handle<Handler>, host: &
     let identities = client
         .request_identities()
         .await
-        .map_err(|e| anyhow!("向 ssh-agent 查询密钥失败: {e}"))?;
+        .map_err(|e| anyhow!("{}", tf!("向 ssh-agent 查询密钥失败: {e}")))?;
     if identities.is_empty() {
-        bail!("ssh-agent 里没有任何密钥（先用 ssh-add 加入密钥再试）");
+        bail!("{}", tf!("ssh-agent 里没有任何密钥（先用 ssh-add 加入密钥再试）"));
     }
     let mut last = None;
     for identity in identities {
@@ -1087,13 +1088,13 @@ async fn authenticate_agent(handle: &mut russh::client::Handle<Handler>, host: &
         let result = handle
             .authenticate_publickey_with(&host.user, public, hash, &mut client)
             .await
-            .map_err(|e| anyhow!("ssh-agent 认证失败: {e}"))?;
+            .map_err(|e| anyhow!("{}", tf!("ssh-agent 认证失败: {e}")))?;
         match result {
             russh::client::AuthResult::Success => return Ok(()),
             failure @ russh::client::AuthResult::Failure { .. } => last = Some(failure),
         }
     }
-    describe(last.expect("agent 至少提供了一把密钥"), "ssh-agent")
+    describe(last.expect(t("agent 至少提供了一把密钥")), "ssh-agent")
 }
 
 /// 按平台连接可用的 agent：Windows 先试 OpenSSH 命名管道再试 Pageant，
@@ -1105,7 +1106,7 @@ async fn connect_agent(
     use russh::keys::agent::client::AgentClient;
     let client = AgentClient::connect_env()
         .await
-        .map_err(|e| anyhow!("连不上 ssh-agent（SSH_AUTH_SOCK 未设置或已失效）: {e}"))?;
+        .map_err(|e| anyhow!("{}", tf!("连不上 ssh-agent（SSH_AUTH_SOCK 未设置或已失效）: {e}")))?;
     Ok(client.dynamic())
 }
 
@@ -1119,7 +1120,7 @@ async fn connect_agent(
     }
     let client = AgentClient::connect_pageant()
         .await
-        .map_err(|e| anyhow!("连不上 ssh-agent / Pageant（请确认 ssh-agent 服务或 Pageant 正在运行）: {e}"))?;
+        .map_err(|e| anyhow!("{}", tf!("连不上 ssh-agent / Pageant（请确认 ssh-agent 服务或 Pageant 正在运行）: {e}")))?;
     Ok(client.dynamic())
 }
 
@@ -1127,7 +1128,7 @@ async fn connect_agent(
 async fn connect_agent(
 ) -> Result<russh::keys::agent::client::AgentClient<Box<dyn russh::keys::agent::client::AgentStream + Send + Unpin>>>
 {
-    bail!("此平台不支持 ssh-agent 认证")
+    bail!("{}", tf!("此平台不支持 ssh-agent 认证"))
 }
 
 fn describe(result: russh::client::AuthResult, method: &str) -> Result<()> {
@@ -1137,13 +1138,13 @@ fn describe(result: russh::client::AuthResult, method: &str) -> Result<()> {
             remaining_methods,
             partial_success,
         } => Err(anyhow!(
-            "服务器{method}认证{}；仍可用的认证方式: {remaining_methods:?}",
+            "{}", tf!("服务器{method}认证{}；仍可用的认证方式: {remaining_methods:?}",
             if partial_success {
-                "已通过，但需要后续步骤"
+                t("已通过，但需要后续步骤")
             } else {
-                "被拒绝"
+                t("被拒绝")
             }
-        )),
+        )      )),
     }
 }
 
@@ -1169,8 +1170,8 @@ fn decrypt_des3_pem(pem: &str, passphrase: &str) -> Result<Vec<u8>> {
         .lines()
         .find_map(|l| l.split_once("DES-EDE3-CBC,"))
         .map(|(_, rest)| rest.trim().to_string())
-        .ok_or_else(|| anyhow!("缺少 DEK-Info 头"))?;
-    let iv = hex_decode(&iv_hex).ok_or_else(|| anyhow!("DEK-Info IV 非法"))?;
+        .ok_or_else(|| anyhow!("{}", tf!("缺少 DEK-Info 头")))?;
+    let iv = hex_decode(&iv_hex).ok_or_else(|| anyhow!("{}", tf!("DEK-Info IV 非法")))?;
     anyhow::ensure!(iv.len() == 8, "DEK-Info IV 长度异常");
 
     let b64: String = pem
@@ -1187,7 +1188,7 @@ fn decrypt_des3_pem(pem: &str, passphrase: &str) -> Result<Vec<u8>> {
     use base64::Engine;
     let ct = base64::engine::general_purpose::STANDARD
         .decode(b64.as_bytes())
-        .map_err(|e| anyhow!("私钥 base64 解码失败: {e}"))?;
+        .map_err(|e| anyhow!("{}", tf!("私钥 base64 解码失败: {e}")))?;
 
     // OpenSSL EVP_BytesToKey (MD5, no iteration, salt = IV first 8 bytes).
     let mut dk = Vec::with_capacity(24);
@@ -1208,7 +1209,7 @@ fn decrypt_des3_pem(pem: &str, passphrase: &str) -> Result<Vec<u8>> {
     dk.truncate(24);
 
     let cipher = cbc::Decryptor::<des::TdesEde3>::new_from_slices(&dk, &iv)
-        .map_err(|e| anyhow!("3DES 初始化失败: {e}"))?;
+        .map_err(|e| anyhow!("{}", tf!("3DES 初始化失败: {e}")))?;
     dk.zeroize();
     let n = ct.len();
     anyhow::ensure!(n > 0 && n % 8 == 0, "私钥密文长度异常");
@@ -1216,7 +1217,7 @@ fn decrypt_des3_pem(pem: &str, passphrase: &str) -> Result<Vec<u8>> {
     let mut buf = Zeroizing::new(ct);
     let len = cipher
         .decrypt_padded_mut::<Pkcs7>(&mut buf)
-        .map_err(|_| anyhow!("3DES 解密失败（口令可能不正确）"))?
+        .map_err(|_| anyhow!("{}", tf!("3DES 解密失败（口令可能不正确）")))?
         .len();
     Ok(buf[..len].to_vec())
 }

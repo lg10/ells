@@ -4,6 +4,7 @@
 //! 都有而 ells 缺的入口。这里的原则只有一条：**任何密码、私钥内容、主密码都不会
 //! 被打印出来**——`--format json` 里能出现的都只有可公开的元数据。
 
+use ells_lang::{t, tf};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -34,7 +35,7 @@ pub const EX_TIMEOUT: i32 = 124;
 /// 用法闸门：自己把中文原因打到 stderr，再把退出码带回 2。
 /// 用 `Err` 不行——`main` 会把任何错误统一成 1，脚本就分不出"差一个 --yes"和"连不上"了。
 fn usage(msg: impl Into<String>) -> Result<i32> {
-    eprintln!("ells：{}", msg.into());
+    eprintln!("{}", tf!("ells：{}", msg.into()));
     Ok(EX_USAGE)
 }
 
@@ -158,11 +159,11 @@ pub async fn dispatch(cmd: Command, dev: bool, yes: bool) -> Result<i32> {
 /// 主密码来自 `ELLS_MASTER`、管道里的第一行，或在终端上掩码输入。
 fn open_vault_head(dev: bool) -> Result<Hosts> {
     if dev {
-        return Ok(Hosts(vault::load_dev_vault().context("--dev 读 ~/.ells/hosts.dev.toml 失败")?));
+        return Ok(Hosts(vault::load_dev_vault().context(t("--dev 读 ~/.ells/hosts.dev.toml 失败"))?));
     }
     let master = read_master()?;
     let (vault, _key) =
-        vault::unlock_vault(&master).context("保险库解锁失败（主密码不对或 vault.bin 损坏）")?;
+        vault::unlock_vault(&master).context(t("保险库解锁失败（主密码不对或 vault.bin 损坏）"))?;
     Ok(Hosts(vault))
 }
 
@@ -178,14 +179,14 @@ fn read_master() -> Result<String> {
         let mut line = String::new();
         std::io::stdin()
             .read_line(&mut line)
-            .context("从标准输入读主密码失败")?;
+            .context(t("从标准输入读主密码失败"))?;
         let trimmed = line.trim_end_matches(['\r', '\n']);
         if trimmed.is_empty() {
-            bail!("标准输入里没有主密码（或改用 ELLS_MASTER 传入）");
+            bail!("{}", tf!("标准输入里没有主密码（或改用 ELLS_MASTER 传入）"));
         }
         return Ok(trimmed.to_string());
     }
-    prompt_secret("主密码：")
+    prompt_secret(t("主密码："))
 }
 
 /// 终端掩码输入：回车结束，退格可改，屏幕上只留星号。
@@ -194,7 +195,7 @@ fn prompt_secret(label: &str) -> Result<String> {
     let mut err = std::io::stderr();
     write!(err, "{label}")?;
     err.flush()?;
-    enable_raw_mode().context("开启原始模式失败")?;
+    enable_raw_mode().context(t("开启原始模式失败"))?;
     let result = read_secret(&mut out);
     let _ = disable_raw_mode();
     let _ = write!(err, "\r\n");
@@ -206,7 +207,7 @@ fn prompt_secret(label: &str) -> Result<String> {
 fn read_secret(out: &mut String) -> Result<()> {
     use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, read};
     loop {
-        let Event::Key(key) = read().context("读取按键失败")? else {
+        let Event::Key(key) = read().context(t("读取按键失败"))? else {
             continue;
         };
         // X11 会连按键释放一起报上来，不过滤等于每个字符输两遍
@@ -217,7 +218,7 @@ fn read_secret(out: &mut String) -> Result<()> {
             KeyCode::Char(c) => {
                 if key.modifiers.contains(KeyModifiers::CONTROL) {
                     if c == 'c' {
-                        bail!("已取消");
+                        bail!("{}", tf!("已取消"));
                     }
                     continue;
                 }
@@ -233,7 +234,7 @@ fn read_secret(out: &mut String) -> Result<()> {
                 }
             }
             KeyCode::Enter => return Ok(()),
-            KeyCode::Esc => bail!("已取消"),
+            KeyCode::Esc => bail!("{}", tf!("已取消")),
             _ => {}
         }
     }
@@ -251,7 +252,7 @@ fn find_host(vault: &ells_core::Vault, alias: &str) -> Result<Host> {
                 .find(|h| h.alias.to_lowercase() == lower)
                 .cloned()
         });
-    found.with_context(|| format!("找不到别名为 `{alias}` 的主机（ells list 看全部）"))
+    found.with_context(|| tf!("找不到别名为 `{alias}` 的主机（ells list 看全部）"))
 }
 
 fn list(format: &str, filter: Option<String>, dev: bool) -> Result<i32> {
@@ -295,13 +296,13 @@ fn list(format: &str, filter: Option<String>, dev: bool) -> Result<i32> {
                 .collect();
             println!(
                 "{}",
-                serde_json::to_string_pretty(&items).context("序列化 JSON 失败")?
+                serde_json::to_string_pretty(&items).context(t("序列化 JSON 失败"))?
             );
         }
         "table" => {
             println!(
                 "{:<16} {:<28} {:<12} {:<6} {}",
-                "别名", "主机", "用户", "认证", "分组/转发"
+                t("别名"), t("主机"), t("用户"), t("认证"), t("分组/转发")
             );
             for h in rows {
                 let mut extra = h.group.clone().unwrap_or_default();
@@ -325,7 +326,7 @@ fn list(format: &str, filter: Option<String>, dev: bool) -> Result<i32> {
                 );
             }
         }
-        other => return usage(format!("未知 --format `{other}`（可用：table / json）")),
+        other => return usage(tf!("未知 --format `{other}`（可用：table / json）")),
     }
     Ok(EX_OK)
 }
@@ -342,14 +343,14 @@ async fn exec_head(
     let Hosts(vault) = open_vault_head(dev)?;
     let host = find_host(&vault, alias)?;
     if command.is_empty() {
-        return usage(format!(
+        return usage(tf!(
             "ells exec 需要命令：ells exec {alias} -- <命令>（要交互式终端就直接 ells {alias}）"
         ));
     }
     let stdin_bytes = if pipe_stdin {
         if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
             // 终端输入直接灌进远端会看起来像卡死，明确拒绝比静默等得好
-            return usage("--stdin 要求标准输入是管道或文件（当前是终端）");
+            return usage(t("--stdin 要求标准输入是管道或文件（当前是终端）"));
         }
         let mut buf = Vec::new();
         std::io::stdin().read_to_end(&mut buf)?;
@@ -366,14 +367,14 @@ async fn exec_head(
         Some(secs) => match tokio::time::timeout(std::time::Duration::from_secs(secs), run).await {
             Err(_) => {
                 // 124 是 timeout(1) 的约定，脚本据此区分"跑慢了"和"跑挂了"
-                eprintln!("超过 {secs} 秒未完成，已放弃（退出码 {EX_TIMEOUT}）");
+                eprintln!("{}", tf!("超过 {secs} 秒未完成，已放弃（退出码 {EX_TIMEOUT}）"));
                 return Ok(EX_TIMEOUT);
             }
-            Ok(inner) => inner.with_context(|| format!("在 {} 上执行失败", host.alias))?,
+            Ok(inner) => inner.with_context(|| tf!("在 {} 上执行失败", host.alias))?,
         },
         None => run
             .await
-            .with_context(|| format!("在 {} 上执行失败", host.alias))?,
+            .with_context(|| tf!("在 {} 上执行失败", host.alias))?,
     };
     let mut stdout = std::io::stdout();
     stdout.write_all(&result.stdout)?;
@@ -382,7 +383,7 @@ async fn exec_head(
     let _ = audit::record(
         AuditKind::Connect,
         &host.alias,
-        &format!("无头执行 {command_line} → {}", result.status),
+        &tf!("无头执行 {command_line} → {}", result.status),
     );
     Ok(if result.status < 0 { EX_FAIL } else { result.status })
 }
@@ -400,7 +401,7 @@ async fn sftp(op: SftpOp, overwrite: bool, dev: bool, yes: bool) -> Result<i32> 
     let policy = HostKeyPolicy::headless(yes);
     let sftp = ssh::connect_sftp(&host, &vault, &policy)
         .await
-        .with_context(|| format!("无法与 {} 建立 SFTP", host.alias))?;
+        .with_context(|| tf!("无法与 {} 建立 SFTP", host.alias))?;
     // 进度事件在命令行下没人画，但通道必须有人收：收满会拖住传输
     let (tx, mut rx) = mpsc::unbounded_channel::<Progress>();
     tokio::spawn(async move { while rx.recv().await.is_some() {} });
@@ -437,7 +438,7 @@ async fn sftp(op: SftpOp, overwrite: bool, dev: bool, yes: bool) -> Result<i32> 
             };
             let target = dir.join(&filename);
             if target.exists() && !overwrite {
-                return usage(format!(
+                return usage(tf!(
                     "本地已存在 {}，加 --yes 才覆盖",
                     target.display()
                 ));
@@ -445,47 +446,47 @@ async fn sftp(op: SftpOp, overwrite: bool, dev: bool, yes: bool) -> Result<i32> 
             transfer::download(&sftp, remote.clone(), &dir, tx, &filename, &cancel)
                 .await?;
             println!("{}", target.display());
-            let _ = audit::record(AuditKind::Transfer, &host.alias, &format!("下载 {remote}"));
+            let _ = audit::record(AuditKind::Transfer, &host.alias, &tf!("下载 {remote}"));
         }
         SftpOp::Put { local, remote, .. } => {
             if !local.exists() {
-                return usage(format!("本地文件不存在：{}", local.display()));
+                return usage(tf!("本地文件不存在：{}", local.display()));
             }
             let name = local
                 .file_name()
                 .map(|s| s.to_string_lossy().into_owned())
-                .context("本地路径没有文件名")?;
+                .context(t("本地路径没有文件名"))?;
             let target = match remote {
                 Some(r) => r,
                 // 家目录是 "/" 时普通拼接会得出 "//up.txt"，远端把它当成另一个路径
                 None => transfer::remote_join(&remote_home(&sftp).await?, &name),
             };
             if transfer::remote_meta(&sftp, &target).await?.is_some() && !overwrite {
-                return usage(format!("远端已存在 {target}，加 --yes 才覆盖"));
+                return usage(tf!("远端已存在 {target}，加 --yes 才覆盖"));
             }
             transfer::upload(&sftp, &local, target.clone(), tx, &cancel).await?;
             println!("{target}");
-            let _ = audit::record(AuditKind::Transfer, &host.alias, &format!("上传 {target}"));
+            let _ = audit::record(AuditKind::Transfer, &host.alias, &tf!("上传 {target}"));
         }
         SftpOp::Rm { path, recursive, .. } => {
             let meta = transfer::remote_meta(&sftp, &path)
                 .await?
-                .with_context(|| format!("远端不存在 {path}"))?;
+                .with_context(|| tf!("远端不存在 {path}"))?;
             if meta.is_dir {
                 if !recursive {
-                    return usage(format!("{path} 是目录，删整棵树要加 --recursive"));
+                    return usage(tf!("{path} 是目录，删整棵树要加 --recursive"));
                 }
                 let n = transfer::remove_tree(&sftp, &path, &cancel).await?;
-                println!("已删除 {n} 项：{path}");
+                println!("{}", tf!("已删除 {n} 项：{path}"));
             } else {
                 transfer::remove_one(&sftp, &path, false).await?;
-                println!("已删除：{path}");
+                println!("{}", tf!("已删除：{path}"));
             }
-            let _ = audit::record(AuditKind::Transfer, &host.alias, &format!("删除 {path}"));
+            let _ = audit::record(AuditKind::Transfer, &host.alias, &tf!("删除 {path}"));
         }
         SftpOp::Chmod { mode, path, .. } => {
             let Some(bits) = transfer::parse_mode(&mode) else {
-                return usage(format!("权限要八进制，如 600 / 0644（收到的是 {mode}）"));
+                return usage(tf!("权限要八进制，如 600 / 0644（收到的是 {mode}）"));
             };
             transfer::chmod(&sftp, &path, bits).await?;
             println!("{path} → {mode}");
@@ -515,7 +516,7 @@ async fn remote_home(sftp: &SftpSession) -> Result<String> {
     Ok(sftp
         .canonicalize(".")
         .await
-        .context("问不到远端家目录")?)
+        .context(t("问不到远端家目录"))?)
 }
 
 async fn tunnel(alias: Option<&str>, all: bool, dev: bool, yes: bool) -> Result<i32> {
@@ -529,21 +530,21 @@ async fn tunnel(alias: Option<&str>, all: bool, dev: bool, yes: bool) -> Result<
             .cloned()
             .collect(),
         (None, false) => {
-            return usage("ells tunnel 需要主机别名，或加 --all 起全部有规则的机器");
+            return usage(t("ells tunnel 需要主机别名，或加 --all 起全部有规则的机器"));
         }
     };
     let targets: Vec<Host> = targets
         .into_iter()
         .filter(|h| {
             if h.forwards.is_empty() {
-                eprintln!("跳过 {}：没有转发规则", h.alias);
+                eprintln!("{}", tf!("跳过 {}：没有转发规则", h.alias));
                 return false;
             }
             true
         })
         .collect();
     if targets.is_empty() {
-        return usage("这些主机都没配转发规则（编辑主机，在「转发」栏写 -L/-D）");
+        return usage(t("这些主机都没配转发规则（编辑主机，在「转发」栏写 -L/-D）"));
     }
     let (tx, mut rx) = mpsc::unbounded_channel::<TunnelEvent>();
     let policy = HostKeyPolicy::headless(yes);
@@ -552,14 +553,14 @@ async fn tunnel(alias: Option<&str>, all: bool, dev: bool, yes: bool) -> Result<
     for host in &targets {
         // 用 display()：自动口写成 `-L 0:db:5432` 会让人以为真去连 0 端口
         println!(
-            "启动 {}：{}",
+            "{}", tf!("启动 {}：{}",
             host.alias,
             host.forwards
                 .iter()
                 .map(|f| f.display())
                 .collect::<Vec<_>>()
                 .join(" ")
-        );
+        ));
         manager.start(host, Arc::clone(&vault));
     }
     // 状态事件就是这条命令的全部输出；通道关了说明所有隧道都已终局（全部失败），
@@ -578,11 +579,11 @@ fn export(out: Option<PathBuf>, dev: bool) -> Result<i32> {
         Some(path) => {
             // 原子写：中途断电不该留下一份半截配置，那种文件粘进 ~/.ssh/config 最坑
             ells_core::write_atomic(&path, text.as_bytes())?;
-            println!("已写入 {}（不含任何密码）", path.display());
+            println!("{}", tf!("已写入 {}（不含任何密码）", path.display()));
             let _ = audit::record(
                 AuditKind::Export,
                 "ssh-config",
-                &format!("导出 {} 台 → {}", vault.hosts.len(), path.display()),
+                &tf!("导出 {} 台 → {}", vault.hosts.len(), path.display()),
             );
         }
         None => print!("{text}"),
@@ -598,12 +599,13 @@ fn completions(shell: &str) -> Result<i32> {
             "_ells_completer() {{\n  local cur=\"${{COMP_WORDS[COMP_CWORD]}}\"\n  COMPREPLY=( $(compgen -W \"list exec sftp tunnel export completions\" -- \"$cur\") )\n}}\ncomplete -F _ells_completer ells\ncomplete -F _ells_completer s\n"
         ),
         "zsh" => format!(
-            "#compdef ells s\n_ells() {{\n  local -a commands\n  commands=({CMDS})\n  _describe 'ells 子命令' commands\n}}\ncompdef _ells ells\ncompdef _ells s\n"
+            "#compdef ells s\n_ells() {{\n  local -a commands\n  commands=({CMDS})\n  _describe '{}' commands\n}}\ncompdef _ells ells\ncompdef _ells s\n",
+            t("ells 子命令")
         ),
         "fish" => format!(
             "complete -c ells -f -a \"{CMDS}\"\ncomplete -c s -f -a \"{CMDS}\"\n"
         ),
-        other => return usage(format!("未知 shell：{other}（可用：bash / zsh / fish）")),
+        other => return usage(tf!("未知 shell：{other}（可用：bash / zsh / fish）")),
     };
     print!("{text}");
     Ok(EX_OK)

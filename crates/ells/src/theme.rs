@@ -9,6 +9,7 @@
 //! 函数签名代价太高，而写入点只有"启动读设置"和"设置面板改主题"两处，且 TUI 循环本身
 //! 单线程绘制，不会和谁打架。
 
+use ells_lang::t;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use ratatui::style::Color;
@@ -91,10 +92,10 @@ impl Theme {
     /// 设置面板里显示的名字。
     pub fn label(self) -> &'static str {
         match self {
-            Theme::Dark => "深色（画死底色）",
-            Theme::Terminal => "跟随终端（不画底色）",
-            Theme::HighContrast => "高对比",
-            Theme::Light => "浅色底",
+            Theme::Dark => t("深色（画死底色）"),
+            Theme::Terminal => t("跟随终端（不画底色）"),
+            Theme::HighContrast => t("高对比"),
+            Theme::Light => t("浅色底"),
         }
     }
 

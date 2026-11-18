@@ -183,7 +183,7 @@ Headless subcommands (run `ells <subcommand> --help` for every flag):
 
   Exit codes are part of the contract: 0 OK · 1 failure (connect, auth or host-key
   refusal, or the remote command returned non-zero) · 2 usage or safety gate (a missing
-  --yes, with the reason in Chinese on stderr) · 124 --timeout hit. `ells exec` passes
+  --yes, with the reason on stderr) · 124 --timeout hit. `ells exec` passes
   the remote command's own exit code through. One red line: no password, private key
   material or master password is ever printed — `--format json` only carries public
   metadata.
@@ -192,7 +192,8 @@ Environment: ELLS_LOG=1 logs to stderr; ELLS_ZMODEM_LOG=1 additionally writes
 sz/rz interception diagnostics to ~/.ells/zmodem.log; ELLS_YES=1 == -y;
 ELLS_MASTER feeds the master password to the headless subcommands (the first stdin
 line works too when you pipe); ELLS_UPDATE_SOURCES selects update sources
-(`github` or mirror prefixes, comma / semicolon separated).
+(`github` or mirror prefixes, comma / semicolon separated); ELLS_LANG=zh|en
+overrides the UI language (the default follows the system: Simplified Chinese, else English).
 
 Config lives in ~/.ells/: vault.bin (credentials), settings.ini, known_hosts,
 audit.log (operation log), logs/ (session transcripts), ssh_config.export

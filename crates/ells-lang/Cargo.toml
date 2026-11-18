@@ -1,0 +1,9 @@
+[package]
+name = "ells-lang"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "ells_lang"
+path = "src/lib.rs"

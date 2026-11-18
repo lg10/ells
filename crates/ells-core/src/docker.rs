@@ -3,6 +3,7 @@
 //!
 //! 只做解析与投影，不碰网络——网络那条腿在 `ssh.rs` 里，方便单测。
 
+use ells_lang::t;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
@@ -174,12 +175,12 @@ pub fn parse_inspect_json(body: &str) -> Result<ContainerDetail, String> {
     let obj = match &value {
         Value::Array(items) => items
             .first()
-            .ok_or_else(|| "docker inspect 返回了空数组".to_string())?,
+            .ok_or_else(|| t("docker inspect 返回了空数组").to_string())?,
         Value::Object(_) => &value,
-        _ => return Err("docker inspect 返回的不是对象或数组".to_string()),
+        _ => return Err(t("docker inspect 返回的不是对象或数组").to_string()),
     };
     if !obj.is_object() {
-        return Err("docker inspect 返回的条目不是对象".to_string());
+        return Err(t("docker inspect 返回的条目不是对象").to_string());
     }
     Ok(detail_from_inspect(obj))
 }
@@ -365,7 +366,7 @@ pub fn parse_stats_engine(body: &str) -> Result<ContainerStats, String> {
     let v: Value =
         serde_json::from_str(body).map_err(|e| format!("docker stats 返回的不是 JSON：{e}"))?;
     if !v.is_object() {
-        return Err("docker stats 返回的不是对象".to_string());
+        return Err(t("docker stats 返回的不是对象").to_string());
     }
     let mut stats = ContainerStats::default();
     let cpu = v.get("cpu_stats");
@@ -490,7 +491,7 @@ pub fn parse_stats_cli(text: &str) -> Result<ContainerStats, String> {
         .lines()
         .map(str::trim)
         .find(|l| !l.is_empty())
-        .ok_or_else(|| "docker stats 没有输出".to_string())?;
+        .ok_or_else(|| t("docker stats 没有输出").to_string())?;
     let v: Value =
         serde_json::from_str(line).map_err(|e| format!("docker stats 第 1 行不是 JSON：{e}"))?;
     let mut stats = ContainerStats::default();
@@ -588,7 +589,7 @@ pub fn parse_http_status(raw: &[u8]) -> Result<u16, String> {
 /// Engine API `/containers/json` 的响应：一个 JSON 数组。
 pub fn parse_engine_json(body: &str) -> Result<Vec<DockerContainer>, String> {
     let value: Value = serde_json::from_str(body).map_err(|e| format!("Docker API 返回的不是 JSON：{e}"))?;
-    let items = value.as_array().ok_or_else(|| "Docker API 返回的不是容器数组".to_string())?;
+    let items = value.as_array().ok_or_else(|| t("Docker API 返回的不是容器数组").to_string())?;
     Ok(items.iter().map(container_from_engine).collect())
 }
 
@@ -704,7 +705,7 @@ pub fn parse_http_response(raw: &[u8]) -> Result<Vec<u8>, String> {
     let split = raw
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
-        .ok_or_else(|| "Docker socket 的响应缺了响应头分隔".to_string())?;
+        .ok_or_else(|| t("Docker socket 的响应缺了响应头分隔").to_string())?;
     let head = String::from_utf8_lossy(&raw[..split]);
     let body = &raw[split + 4..];
     let mut lines = head.split("\r\n");
@@ -735,7 +736,7 @@ pub fn parse_http_response(raw: &[u8]) -> Result<Vec<u8>, String> {
     }
     if let Some(len) = content_length {
         if body.len() < len {
-            return Err("Docker socket 的响应比声明的短".to_string());
+            return Err(t("Docker socket 的响应比声明的短").to_string());
         }
         return Ok(body[..len].to_vec());
     }
@@ -748,7 +749,7 @@ fn decode_chunked(mut body: &[u8]) -> Result<Vec<u8>, String> {
         let line_end = body
             .windows(2)
             .position(|w| w == b"\r\n")
-            .ok_or_else(|| "chunked 响应缺了块长度".to_string())?;
+            .ok_or_else(|| t("chunked 响应缺了块长度").to_string())?;
         let len_text = std::str::from_utf8(&body[..line_end]).unwrap_or_default();
         let len_text = len_text.split(';').next().unwrap_or("").trim();
         let len = usize::from_str_radix(len_text, 16)
@@ -758,7 +759,7 @@ fn decode_chunked(mut body: &[u8]) -> Result<Vec<u8>, String> {
             return Ok(out);
         }
         if body.len() < len {
-            return Err("chunked 响应在块中间断了".to_string());
+            return Err(t("chunked 响应在块中间断了").to_string());
         }
         out.extend_from_slice(&body[..len]);
         body = &body[len..];

@@ -1270,7 +1270,7 @@ dependencies = [
 
 [[package]]
 name = "ells"
-version = "0.2.13"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1280,6 +1280,7 @@ dependencies = [
  "dirs",
  "edtui",
  "ells-core",
+ "ells-lang",
  "ells-term",
  "ells-transfer",
  "futures",
@@ -1303,7 +1304,7 @@ dependencies = [
 
 [[package]]
 name = "ells-core"
-version = "0.2.13"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "argon2 0.5.3",
@@ -1313,6 +1314,7 @@ dependencies = [
  "chrono",
  "des 0.8.1",
  "dirs",
+ "ells-lang",
  "ells-transfer",
  "futures",
  "md-5",
@@ -1330,8 +1332,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "ells-lang"
+version = "0.3.0"
+
+[[package]]
 name = "ells-term"
-version = "0.2.13"
+version = "0.3.0"
 dependencies = [
  "crossterm",
  "vt100",
@@ -1339,9 +1345,10 @@ dependencies = [
 
 [[package]]
 name = "ells-transfer"
-version = "0.2.13"
+version = "0.3.0"
 dependencies = [
  "anyhow",
+ "ells-lang",
  "futures",
  "russh-sftp",
  "tokio",

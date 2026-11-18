@@ -7,6 +7,7 @@
 //! 打分偏好"越靠左越好、越连续越好、词首加分"，所以输入 `w` 时 `web` 排在
 //! `dev-worker` 之前，`10.0` 能直接找到 `10.0.0.5`。
 
+use ells_lang::t;
 use crate::host::Host;
 
 /// 一条匹配结果：分数越高越靠前。
@@ -130,7 +131,7 @@ pub fn rank<'a>(hosts: &'a [Host], query: &str) -> Vec<Ranked<'a>> {
 
 /// 分组标题排序：收藏组恒在最前，其余按名字。
 pub fn group_label(group: Option<&str>) -> &str {
-    group.unwrap_or("未分组")
+    group.unwrap_or(t("未分组"))
 }
 
 #[cfg(test)]

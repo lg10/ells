@@ -3,6 +3,7 @@
 //! 这里只管内容与绘制；保存后的回传仍走既有的 `EditSaved` / `EditUploaded` 链路，
 //! 远端冲突判断也复用那一套。
 
+use ells_lang::{t, tf};
 use std::path::Path;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent as CtMouseEvent, MouseEventKind};
@@ -96,10 +97,10 @@ pub struct EmbeddedEdit {
 
 impl EmbeddedEdit {
     pub fn open(remote: &str, local: &Path, name: &str) -> Result<Self, String> {
-        let bytes = std::fs::read(local).map_err(|e| format!("读取临时文件失败：{e}"))?;
+        let bytes = std::fs::read(local).map_err(|e| tf!("读取临时文件失败：{e}"))?;
         // 非 UTF-8 一旦用 lossy 转换，保存时就会把原始字节改坏；宁可拒绝。
         let text = String::from_utf8(bytes)
-            .map_err(|_| "这个文件不是 UTF-8 文本，内置编辑器不能安全保存".to_string())?;
+            .map_err(|_| t("这个文件不是 UTF-8 文本，内置编辑器不能安全保存").to_string())?;
         // 只有各行都是 CRLF 才走还原；混合行尾按 LF 处理（无法同时表达两种风格）。
         let crlf = !text.is_empty()
             && text.contains("\r\n")
@@ -346,7 +347,7 @@ pub fn draw_panel(f: &mut Frame, area: Rect, app: &mut crate::app::App) {
         return;
     };
 
-    let title = format!(
+    let title = tf!(
         " 编辑 {} · {} · {} 保存 · {} 退出 ",
         ed.name,
         ed.mode_label(),
@@ -400,13 +401,13 @@ pub fn draw_panel(f: &mut Frame, area: Rect, app: &mut crate::app::App) {
             ),
             Span::raw("  "),
             Span::styled(
-                "Enter 执行 · Esc 取消（:w · :wq · :q · :q!）",
+                t("Enter 执行 · Esc 取消（:w · :wq · :q · :q!）"),
                 Style::default().fg(theme::dim()).bg(theme::bg()),
             ),
         ])
     } else {
         let hint = status.unwrap_or_else(|| {
-            let tail = format!(
+            let tail = tf!(
                 "{} 保存 · {} 退出 · 拖选后 {} 复制 · {} 全选",
                 key_hint('s'),
                 key_hint('q'),
@@ -416,10 +417,10 @@ pub fn draw_panel(f: &mut Frame, area: Rect, app: &mut crate::app::App) {
             if ed.highlight {
                 tail
             } else {
-                format!("大文件已关高亮 · {tail}")
+                tf!("大文件已关高亮 · {tail}")
             }
         });
-        let info = format!(" {} · {} 行", ed.remote, ed.line_count());
+        let info = tf!(" {} · {} 行", ed.remote, ed.line_count());
         Line::from(vec![
             Span::styled(info, Style::default().fg(theme::dim()).bg(theme::bg())),
             Span::raw("  "),

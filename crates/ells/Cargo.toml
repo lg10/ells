@@ -16,6 +16,7 @@ clap.workspace = true
 dirs.workspace = true
 crossterm.workspace = true
 ells-core.workspace = true
+ells-lang.workspace = true
 ells-term.workspace = true
 ells-transfer.workspace = true
 futures.workspace = true

@@ -1,4 +1,5 @@
 use ells_term::vt100;
+use ells_lang::{t, tf};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -65,7 +66,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
 /// `v0.1.0 · 构建 2026-10-04 18:00` — build time is injected by build.rs.
 fn version_tag() -> String {
-    format!(
+    tf!(
         "v{} · 构建 {}",
         env!("CARGO_PKG_VERSION"),
         env!("ELLS_BUILD_TIME")
@@ -88,7 +89,7 @@ pub fn homepage_rect(area: Rect) -> Rect {
 fn draw_homepage_badge(f: &mut Frame, area: Rect) {
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "官网(ells.cn)",
+            t("官网(ells.cn)"),
             Style::default()
                 .fg(theme::on_accent())
                 .bg(theme::select_bg())
@@ -176,9 +177,9 @@ fn draw_unlock(f: &mut Frame, u: &UnlockState, estimate: std::time::Duration) {
     let area = centered(panel_w, panel_h, f.area());
     f.buffer_mut().set_style(area, Style::default().bg(theme::bg()));
     let stage_name = match u.stage {
-        UnlockStage::Open => "解锁保险库",
-        UnlockStage::CreateFirst => "设置主密码",
-        UnlockStage::CreateConfirm => "确认主密码",
+        UnlockStage::Open => t("解锁保险库"),
+        UnlockStage::CreateFirst => t("设置主密码"),
+        UnlockStage::CreateConfirm => t("确认主密码"),
     };
     // 建库的两步用暖色边框：那是"正在定规矩"，和"输入密码"该一眼分开。
     let accent = if creating { theme::warn() } else { theme::accent() };
@@ -301,9 +302,9 @@ fn draw_unlock_header(f: &mut Frame, area: Rect, stage: UnlockStage, accent: Col
         );
     }
     let tagline = match stage {
-        UnlockStage::Open => "跨平台终端 SSH 客户端 · 保险库已加密",
-        UnlockStage::CreateFirst => "跨平台终端 SSH 客户端 · 首次运行，先定主密码",
-        UnlockStage::CreateConfirm => "跨平台终端 SSH 客户端 · 再看一眼刚才那串",
+        UnlockStage::Open => t("跨平台终端 SSH 客户端 · 保险库已加密"),
+        UnlockStage::CreateFirst => t("跨平台终端 SSH 客户端 · 首次运行，先定主密码"),
+        UnlockStage::CreateConfirm => t("跨平台终端 SSH 客户端 · 再看一眼刚才那串"),
     };
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(tagline, Style::default().fg(theme::muted()))))
@@ -342,9 +343,9 @@ fn draw_unlock_creating(f: &mut Frame, area: Rect, stage: UnlockStage) {
     };
     f.render_widget(
         Paragraph::new(vec![
-            warn_line("!", "主密码忘记后无法找回，ells 不做任何找回。", theme::err()),
-            warn_line("!", "只能重置保险库重来：主机与凭据都要重填。", theme::err()),
-            warn_line("i", "主密码只加密本机保险库，不会发往任何服务器。", theme::dim()),
+            warn_line("!", t("主密码忘记后无法找回，ells 不做任何找回。"), theme::err()),
+            warn_line("!", t("只能重置保险库重来：主机与凭据都要重填。"), theme::err()),
+            warn_line("i", t("主密码只加密本机保险库，不会发往任何服务器。"), theme::dim()),
         ]),
         inset_x(rows[0], 1),
     );
@@ -362,9 +363,9 @@ fn step_spans(second: bool) -> Vec<Span<'static>> {
         .fg(theme::warn())
         .add_modifier(Modifier::BOLD);
     vec![
-        Span::styled(if second { "● 设置 " } else { "◉ 设置 " }, if second { dim } else { on }),
+        Span::styled(if second { t("● 设置 ") } else { t("◉ 设置 ") }, if second { dim } else { on }),
         Span::styled("·", dim),
-        Span::styled(if second { " ◉ 确认" } else { " ○ 确认" }, if second { on } else { dim }),
+        Span::styled(if second { t(" ◉ 确认") } else { t(" ○ 确认") }, if second { on } else { dim }),
     ]
 }
 
@@ -379,12 +380,12 @@ fn draw_unlock_input(f: &mut Frame, area: Rect, u: &UnlockState, accent: Color) 
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .title(
-            Line::from(" 主密码 ")
+            Line::from(t(" 主密码 "))
                 .left_aligned()
                 .style(Style::default().fg(accent).add_modifier(Modifier::BOLD)),
         )
         .title_bottom(
-            Line::from(if u.reveal { " 明文回显中 " } else { " Tab 切换回显 " })
+            Line::from(if u.reveal { t(" 明文回显中 ") } else { t(" Tab 切换回显 ") })
                 .right_aligned()
                 .style(Style::default().fg(if u.reveal { theme::warn() } else { theme::dim() })),
         )
@@ -443,7 +444,7 @@ fn draw_connecting(f: &mut Frame, app: &App) {
     let area = f.area();
     f.buffer_mut().set_style(area, Style::default().bg(theme::bg()));
     let host = app.slots[app.active].host.as_ref();
-    let alias = host.map(|h| h.alias.as_str()).unwrap_or("会话");
+    let alias = host.map(|h| h.alias.as_str()).unwrap_or(t("会话"));
     let target = host.map(|h| h.target()).unwrap_or_default();
     let lines = connecting_lines(alias, &target);
     let panel = centered(64, lines.len() as u16 + 2, area);
@@ -451,7 +452,7 @@ fn draw_connecting(f: &mut Frame, app: &App) {
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .title(
-            Line::from(" 正在连接 ")
+            Line::from(t(" 正在连接 "))
                 .centered()
                 .style(Style::default().fg(theme::accent()).add_modifier(Modifier::BOLD)),
         )
@@ -483,12 +484,12 @@ fn connecting_lines(alias: &str, target: &str) -> Vec<Line<'static>> {
         .alignment(Alignment::Center),
         Line::from(""),
         Line::from(Span::styled(
-            "正在建立 SSH 会话…",
+            t("正在建立 SSH 会话…"),
             Style::default().fg(theme::accent()),
         ))
         .alignment(Alignment::Center),
         Line::from(Span::styled(
-            "首次连接会先弹主机密钥确认 · Esc 查看主机列表 · q 退出",
+            t("首次连接会先弹主机密钥确认 · Esc 查看主机列表 · q 退出"),
             Style::default().fg(theme::dim()),
         ))
         .alignment(Alignment::Center),
@@ -509,14 +510,14 @@ fn unlock_progress_line(
 ) -> Line<'static> {
     let spent = since.map(|t| t.elapsed()).unwrap_or_default();
     let label = match stage {
-        UnlockStage::Open => "正在解密保险库",
-        UnlockStage::CreateFirst => "请稍候",
-        UnlockStage::CreateConfirm => "正在创建保险库",
+        UnlockStage::Open => t("正在解密保险库"),
+        UnlockStage::CreateFirst => t("请稍候"),
+        UnlockStage::CreateConfirm => t("正在创建保险库"),
     };
     let est_ms = estimate.as_millis().max(1) as f64;
     let ratio = (spent.as_secs_f64() * 1000.0 / est_ms).clamp(0.0, 0.95);
     let pulse = (spent.as_millis() as usize / crate::app::UNLOCK_TICK_MS as usize) % 3;
-    let secs = format!("已用 {:.1}s", spent.as_secs_f64());
+    let secs = tf!("已用 {:.1}s", spent.as_secs_f64());
     // 条的宽度按这一行剩下的地方算，宁可短，也不要挤出面板。
     let used = display_width(label) + display_width(&secs) + 4;
     let bar_w = width.saturating_sub(used).clamp(4, 24);
@@ -584,13 +585,13 @@ fn strength_line(pw: &str) -> Line<'static> {
         seg += 1;
     }
     let note = if n == 0 {
-        "建议 8 位以上，混大小写、数字与符号"
+        t("建议 8 位以上，混大小写、数字与符号")
     } else if seg <= 1 {
-        "偏短：再加几位，混进数字或符号"
+        t("偏短：再加几位，混进数字或符号")
     } else if seg == 2 {
-        "够用，但还可以再长一点"
+        t("够用，但还可以再长一点")
     } else {
-        "这一把够长也够杂"
+        t("这一把够长也够杂")
     };
     let tone = if seg >= 3 {
         theme::ok()
@@ -600,7 +601,7 @@ fn strength_line(pw: &str) -> Line<'static> {
         theme::dim()
     };
     Line::from(vec![
-        Span::styled("强度 ", Style::default().fg(theme::dim())),
+        Span::styled(t("强度 "), Style::default().fg(theme::dim())),
         Span::styled(
             "▰".repeat(seg) + &"▱".repeat(4 - seg),
             Style::default().fg(if seg == 0 { theme::dim() } else { tone }),
@@ -612,9 +613,9 @@ fn strength_line(pw: &str) -> Line<'static> {
 /// 键位提示行：按键本身加粗，动作跟在后面淡一档。写的每个键都真能按出来。
 fn key_hint_spans(stage: UnlockStage) -> Vec<Span<'static>> {
     let action = match stage {
-        UnlockStage::Open => "提交",
-        UnlockStage::CreateFirst => "下一步",
-        UnlockStage::CreateConfirm => "确认",
+        UnlockStage::Open => t("提交"),
+        UnlockStage::CreateFirst => t("下一步"),
+        UnlockStage::CreateConfirm => t("确认"),
     };
     let key = Style::default().fg(theme::text()).add_modifier(Modifier::BOLD);
     let gap = Style::default().fg(theme::dim());
@@ -623,10 +624,10 @@ fn key_hint_spans(stage: UnlockStage) -> Vec<Span<'static>> {
         Span::styled(format!(" {action} "), gap),
         Span::styled("·", gap),
         Span::styled(" Tab", key),
-        Span::styled(" 明文回显 ", gap),
+        Span::styled(t(" 明文回显 "), gap),
         Span::styled("·", gap),
         Span::styled(" Esc", key),
-        Span::styled(" 退出", gap),
+        Span::styled(t(" 退出"), gap),
     ]
 }
 
@@ -689,16 +690,16 @@ fn alias_spans(alias: &str, hits: &[usize]) -> Vec<Span<'static>> {
 /// 做减法；`ts == 0` 是从来没连过，和"很久以前连过"是两件事，得单独说。
 fn last_seen(now: u64, ts: u64) -> String {
     if ts == 0 {
-        return "从未".to_string();
+        return t("从未").to_string();
     }
     let mins = now.saturating_sub(ts) / 60;
     match mins {
-        0 => "刚刚".to_string(),
-        1..=59 => format!("{mins}分"),
-        60..=1439 => format!("{}小时", mins / 60),
-        1440..=2879 => "昨天".to_string(),
-        2880..=43199 => format!("{}天", mins / 1440),
-        _ => format!("{}月", mins / 43200),
+        0 => t("刚刚").to_string(),
+        1..=59 => tf!("{mins}分"),
+        60..=1439 => tf!("{}小时", mins / 60),
+        1440..=2879 => t("昨天").to_string(),
+        2880..=43199 => tf!("{}天", mins / 1440),
+        _ => tf!("{}月", mins / 43200),
     }
 }
 
@@ -764,26 +765,26 @@ fn draw_tunnels(f: &mut Frame, app: &mut App) {
     f.buffer_mut().set_style(area, Style::default().bg(theme::bg()));
     f.render_widget(Clear, area);
     let block = Block::bordered()
-        .title(" 端口转发 ")
+        .title(t(" 端口转发 "))
         .title_style(Style::default().fg(theme::accent()).add_modifier(Modifier::BOLD));
     f.render_widget(block, area);
 
     let clashes = ells_core::host::all_port_clashes(&app.vault.hosts);
     let chip = if clashes.is_empty() {
-        Line::from(Span::styled(" 端口映射（m）", Style::default().fg(theme::alt())))
+        Line::from(Span::styled(t(" 端口映射（m）"), Style::default().fg(theme::alt())))
     } else {
         // 有主机共用同一个本地口：这句必须出现在面板上，不然用户要等到启动失败才知道
         let ports = clashes
             .iter()
             .map(|(p, _)| p.to_string())
             .collect::<Vec<_>>()
-            .join("、");
+            .join(t("、"));
         Line::from(vec![
             Span::styled(
-                format!("⚠ {ports} 被多台主机共用 "),
+                tf!("⚠ {ports} 被多台主机共用 "),
                 Style::default().fg(theme::warn()),
             ),
-            Span::styled("端口映射（m）", Style::default().fg(theme::alt())),
+            Span::styled(t("端口映射（m）"), Style::default().fg(theme::alt())),
         ])
     };
     f.render_widget(Paragraph::new(chip).alignment(ratatui::layout::Alignment::Right), chip_row);
@@ -792,11 +793,11 @@ fn draw_tunnels(f: &mut Frame, app: &mut App) {
     let lines: Vec<Line> = if rows.is_empty() {
         vec![
             Line::from(Span::styled(
-                " 没有主机配置转发规则 — 列表页选中主机按 p 用表格建，或按 e 在「转发」栏写",
+                t(" 没有主机配置转发规则 — 列表页选中主机按 p 用表格建，或按 e 在「转发」栏写"),
                 Style::default().fg(theme::dim()),
             )),
             Line::from(Span::styled(
-                " 本地端口留空就交给系统分配，两台主机想要同一个口也不会互挤",
+                t(" 本地端口留空就交给系统分配，两台主机想要同一个口也不会互挤"),
                 Style::default().fg(theme::muted()),
             )),
         ]
@@ -852,7 +853,7 @@ fn draw_tunnels(f: &mut Frame, app: &mut App) {
         &mut ls,
     );
     f.render_widget(
-        Paragraph::new(" 空格/s 启停 · Enter 编辑规则表格 · m 端口映射 · x 全部停止 · t/Esc 关闭 ")
+        Paragraph::new(t(" 空格/s 启停 · Enter 编辑规则表格 · m 端口映射 · x 全部停止 · t/Esc 关闭 "))
             .style(Style::default().fg(theme::dim())),
         Rect {
             x: area.x,
@@ -866,11 +867,11 @@ fn draw_tunnels(f: &mut Frame, app: &mut App) {
 fn state_label(state: &ells_core::tunnel::TunnelState) -> &'static str {
     use ells_core::tunnel::TunnelState as S;
     match state {
-        S::Connecting => "连接中",
-        S::Up => "已就绪",
-        S::Retrying { .. } => "重连中",
-        S::Failed(_) => "失败",
-        S::Stopped => "已停止",
+        S::Connecting => t("连接中"),
+        S::Up => t("已就绪"),
+        S::Retrying { .. } => t("重连中"),
+        S::Failed(_) => t("失败"),
+        S::Stopped => t("已停止"),
     }
 }
 
@@ -910,7 +911,7 @@ fn draw_rules(f: &mut Frame, app: &mut App) {
     f.buffer_mut().set_style(area, Style::default().bg(theme::bg()));
     f.render_widget(Clear, area);
     let block = Block::bordered()
-        .title(format!(" 转发规则 · {} ", app.rules_alias))
+        .title(tf!(" 转发规则 · {} ", app.rules_alias))
         .title_style(Style::default().fg(theme::accent()).add_modifier(Modifier::BOLD));
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -920,7 +921,7 @@ fn draw_rules(f: &mut Frame, app: &mut App) {
     for (i, name) in RULE_COLS.iter().enumerate() {
         let w = RULE_W[i] + 1;
         head.push(Span::styled(
-            pad_display(name, w - 1),
+            pad_display(t(name), w - 1),
             Style::default().fg(theme::dim()).add_modifier(Modifier::BOLD),
         ));
     }
@@ -935,7 +936,7 @@ fn draw_rules(f: &mut Frame, app: &mut App) {
         let row = &app.rules_rows[*i];
         for (col, rect) in cols.iter().enumerate() {
             let raw = if col == 2 && row.listen.trim().is_empty() {
-                "自动".to_string()
+                t("自动").to_string()
             } else {
                 row.cell(col).to_string()
             };
@@ -986,10 +987,10 @@ fn draw_rules(f: &mut Frame, app: &mut App) {
         line(y, err.clone(), theme::err());
         y += 1;
     }
-    line(y, " ↑↓ 行 · ←→/Tab 格 · 第 1 列 ←/→ 换类型 · Ctrl-N 加行 · Ctrl-D 删行 · Enter 保存 · Esc 放弃 ".to_string(), theme::dim());
+    line(y, t(" ↑↓ 行 · ←→/Tab 格 · 第 1 列 ←/→ 换类型 · Ctrl-N 加行 · Ctrl-D 删行 · Enter 保存 · Esc 放弃 ").to_string(), theme::dim());
     line(
         y + 1,
-        " 本地端口留空 = 系统分配空闲口（多台主机同口时用它）· -R 存得进来但起不来 ".to_string(),
+        t(" 本地端口留空 = 系统分配空闲口（多台主机同口时用它）· -R 存得进来但起不来 ").to_string(),
         theme::muted(),
     );
 }
@@ -1006,7 +1007,7 @@ fn draw_ports(f: &mut Frame, app: &mut App) {
     f.buffer_mut().set_style(area, Style::default().bg(theme::bg()));
     f.render_widget(Clear, area);
     let block = Block::bordered()
-        .title(" 端口映射（实际监听口） ")
+        .title(t(" 端口映射（实际监听口） "))
         .title_style(Style::default().fg(theme::accent()).add_modifier(Modifier::BOLD));
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -1016,20 +1017,20 @@ fn draw_ports(f: &mut Frame, app: &mut App) {
     let lines: Vec<Line> = if aliases.is_empty() {
         vec![
             Line::from(Span::styled(
-                " 现在没有任何正在监听的本地端口",
+                t(" 现在没有任何正在监听的本地端口"),
                 Style::default().fg(theme::dim()),
             )),
             Line::from(Span::styled(
-                " 按 t 打开端口转发面板 · 空格启动一条 · Enter 用表格改规则",
+                t(" 按 t 打开端口转发面板 · 空格启动一条 · Enter 用表格改规则"),
                 Style::default().fg(theme::muted()),
             )),
         ]
     } else {
         let mut out = vec![Line::from(vec![
-            Span::styled(pad_display("主机", 15), Style::default().fg(theme::dim()).add_modifier(Modifier::BOLD)),
-            Span::styled(pad_display("规则", 30), Style::default().fg(theme::dim()).add_modifier(Modifier::BOLD)),
-            Span::styled(pad_display("实际监听", 24), Style::default().fg(theme::dim()).add_modifier(Modifier::BOLD)),
-            Span::styled("状态", Style::default().fg(theme::dim()).add_modifier(Modifier::BOLD)),
+            Span::styled(pad_display(t("主机"), 15), Style::default().fg(theme::dim()).add_modifier(Modifier::BOLD)),
+            Span::styled(pad_display(t("规则"), 30), Style::default().fg(theme::dim()).add_modifier(Modifier::BOLD)),
+            Span::styled(pad_display(t("实际监听"), 24), Style::default().fg(theme::dim()).add_modifier(Modifier::BOLD)),
+            Span::styled(t("状态"), Style::default().fg(theme::dim()).add_modifier(Modifier::BOLD)),
         ])];
         for alias in aliases {
             let state = app
@@ -1061,7 +1062,7 @@ fn draw_ports(f: &mut Frame, app: &mut App) {
     };
     f.render_widget(Paragraph::new(lines), inner);
     f.render_widget(
-        Paragraph::new(" m/Esc 关闭 · 状态列是隧道的最新状态 · 撞口时把本地端口留空 ").style(Style::default().fg(theme::dim())),
+        Paragraph::new(t(" m/Esc 关闭 · 状态列是隧道的最新状态 · 撞口时把本地端口留空 ")).style(Style::default().fg(theme::dim())),
         Rect {
             x: area.x,
             y: area.y.saturating_add(area.height),
@@ -1077,7 +1078,7 @@ fn draw_known(f: &mut Frame, app: &mut App) {
     f.buffer_mut().set_style(area, Style::default().bg(theme::bg()));
     f.render_widget(Clear, area);
     let block = Block::bordered()
-        .title(format!(" 已知主机密钥（{} 条） ", app.known_entries.len()))
+        .title(tf!(" 已知主机密钥（{} 条） ", app.known_entries.len()))
         .title_style(Style::default().fg(theme::accent()).add_modifier(Modifier::BOLD));
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -1096,7 +1097,7 @@ fn draw_known(f: &mut Frame, app: &mut App) {
             ));
             spans.push(Span::raw(e.fingerprint.clone()));
             spans.push(Span::styled(
-                if e.writable { " ells" } else { " ~/.ssh 只读" },
+                if e.writable { " ells" } else { t(" ~/.ssh 只读") },
                 Style::default().fg(theme::dim()),
             ));
             ListItem::new(Line::from(spans))
@@ -1115,7 +1116,7 @@ fn draw_known(f: &mut Frame, app: &mut App) {
     );
     let hint = match &app.known_msg {
         Some(msg) => format!(" {msg} "),
-        None => " ↑↓ 选择 · Enter/d 删除(仅 ells 的记录) · Esc 关闭 ".to_string(),
+        None => t(" ↑↓ 选择 · Enter/d 删除(仅 ells 的记录) · Esc 关闭 ").to_string(),
     };
     f.render_widget(
         Paragraph::new(hint).style(Style::default().fg(if app.known_msg.is_some() {
@@ -1138,12 +1139,12 @@ fn draw_audit(f: &mut Frame, app: &mut App) {
     f.buffer_mut().set_style(area, Style::default().bg(theme::bg()));
     f.render_widget(Clear, area);
     let block = Block::bordered()
-        .title(" 操作记录（最近） ")
+        .title(t(" 操作记录（最近） "))
         .title_style(Style::default().fg(theme::accent()).add_modifier(Modifier::BOLD));
     let inner = block.inner(area);
     f.render_widget(block, area);
     let text = if app.audit_lines.is_empty() {
-        " 还没有记录".to_string()
+        t(" 还没有记录").to_string()
     } else {
         app.audit_lines.join("\n")
     };
@@ -1154,7 +1155,7 @@ fn draw_audit(f: &mut Frame, app: &mut App) {
         inner,
     );
     f.render_widget(
-        Paragraph::new(" ↑↓ 滚动 · PgUp/PgDn 翻页 · Esc 关闭 ")
+        Paragraph::new(t(" ↑↓ 滚动 · PgUp/PgDn 翻页 · Esc 关闭 "))
             .style(Style::default().fg(theme::dim())),
         Rect {
             x: area.x,
@@ -1183,9 +1184,9 @@ fn draw_sessions(f: &mut Frame, app: &mut App) {
                 .get(app.sessions_selected)
                 .map(|e| e.name.clone())
                 .unwrap_or_default();
-            format!(" 会话记录 · {name} ")
+            tf!(" 会话记录 · {name} ")
         }
-        None => format!(" 会话记录（{} 份） ", app.sessions_rows.len()),
+        None => tf!(" 会话记录（{} 份） ", app.sessions_rows.len()),
     };
     let block = Block::bordered()
         .title(title)
@@ -1239,11 +1240,11 @@ fn draw_sessions(f: &mut Frame, app: &mut App) {
     }
 
     let hint = if app.sessions_text.is_some() {
-        " ↑↓/jk 滚动 · PgUp/PgDn(du/空格) 翻页 · Esc/Enter 返回列表 "
+        t(" ↑↓/jk 滚动 · PgUp/PgDn(du/空格) 翻页 · Esc/Enter 返回列表 ")
     } else if app.sessions_rows.is_empty() {
-        " 还没有会话记录（连上一台就会开始写） "
+        t(" 还没有会话记录（连上一台就会开始写） ")
     } else {
-        " ↑↓/jk 选择 · Enter 查看 · d 删除这一份 · Esc 关闭 "
+        t(" ↑↓/jk 选择 · Enter 查看 · d 删除这一份 · Esc 关闭 ")
     };
     f.render_widget(
         Paragraph::new(hint).style(Style::default().fg(theme::dim())),
@@ -1271,7 +1272,7 @@ fn draw_list(f: &mut Frame, app: &mut App) {
                 Style::default().fg(theme::accent()).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!(
+                tf!(
                     "主机列表 · {} 台 · {groups} 组 · {}",
                     app.vault.hosts.len(),
                     version_tag()
@@ -1299,20 +1300,20 @@ fn draw_list(f: &mut Frame, app: &mut App) {
     let live = app.slots.iter().filter(|s| s.session.is_some()).count();
     let filtering = !app.filter.trim().is_empty();
     let title = if total == 0 {
-        " 主机 ".to_string()
+        t(" 主机 ").to_string()
     } else if filtering {
-        format!(
+        tf!(
             " 主机 (共 {total} · 命中 {}/{} · 过滤 {}) ",
             visible_hosts.len(),
             total,
             app.filter.trim()
         )
     } else {
-        format!(
+        tf!(
             " 主机 (共 {total} · 排序 {}{}) ",
             app.settings.list_sort.label(),
             if live > 0 {
-                format!(" · 在线 {live}")
+                tf!(" · 在线 {live}")
             } else {
                 String::new()
             }
@@ -1327,9 +1328,9 @@ fn draw_list(f: &mut Frame, app: &mut App) {
 
     if rows.is_empty() {
         let hint = if total == 0 {
-            " 还没有主机 — 按 a 新增，或按 i 从 ~/.ssh/config 导入"
+            t(" 还没有主机 — 按 a 新增，或按 i 从 ~/.ssh/config 导入")
         } else {
-            " 没有匹配的主机 — Esc 清空过滤"
+            t(" 没有匹配的主机 — Esc 清空过滤")
         };
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
@@ -1342,7 +1343,7 @@ fn draw_list(f: &mut Frame, app: &mut App) {
         // 全折叠：一条主机都没剩下，但段头还在，别让界面看起来像库空了
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                " 全部分组已折叠 — 按 z 展开",
+                t(" 全部分组已折叠 — 按 z 展开"),
                 Style::default().fg(theme::dim()),
             ))),
             inner,
@@ -1364,7 +1365,7 @@ fn draw_list(f: &mut Frame, app: &mut App) {
                     ),
                     Span::styled(
                         if *folded {
-                            format!("({count} 台已折叠)")
+                            tf!("({count} 台已折叠)")
                         } else {
                             format!("({count})")
                         },
@@ -1417,7 +1418,7 @@ fn draw_list(f: &mut Frame, app: &mut App) {
                     }
                     if let Some(j) = &h.jump {
                         spans.push(Span::styled(
-                            format!(" 经 {j}"),
+                            tf!(" 经 {j}"),
                             Style::default().fg(theme::alt()),
                         ));
                     }
@@ -1425,7 +1426,7 @@ fn draw_list(f: &mut Frame, app: &mut App) {
                     if !h.forwards.is_empty() {
                         let (tmark, tcolor) = tunnel_mark(app, &h.alias);
                         spans.push(Span::styled(
-                            format!(" {tmark}{}条转发", h.forwards.len()),
+                            tf!(" {tmark}{}条转发", h.forwards.len()),
                             Style::default().fg(tcolor),
                         ));
                     }
@@ -1456,7 +1457,7 @@ fn draw_list(f: &mut Frame, app: &mut App) {
         );
     }
 
-    let keys = format!(
+    let keys = tf!(
         " ↑↓ 选择 · Enter 连接 · a 新增 · e 编辑 · d 删除 · i/x 导入导出 · p 转发 · m 映射 · / 过滤 · f 收藏 · Space/z 折叠 · o 排序 · t 隧道 · h 密钥 · l 记录 · {}/{}/{} 切标签 · ? 帮助 · q 退出 ",
         app.settings.keybinds.display(crate::keybinds::Action::NewTab),
         app.settings.keybinds.display(crate::keybinds::Action::NextTab),
@@ -1469,7 +1470,7 @@ fn draw_list(f: &mut Frame, app: &mut App) {
     // 键位行右端：【设置】按钮（实心青底，与会话页按钮同风格）
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "【设置】",
+            t("【设置】"),
             Style::default()
                 .fg(theme::on_accent())
                 .bg(theme::accent_bg())
@@ -1481,12 +1482,12 @@ fn draw_list(f: &mut Frame, app: &mut App) {
     if app.filtering {
         f.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled(" 过滤 ", Style::default().fg(theme::dim())),
+                Span::styled(t(" 过滤 "), Style::default().fg(theme::dim())),
                 Span::styled(
                     format!("{}▏", app.filter),
                     Style::default().fg(theme::accent()).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(" Enter 保持 · Esc 清空", Style::default().fg(theme::dim())),
+                Span::styled(t(" Enter 保持 · Esc 清空"), Style::default().fg(theme::dim())),
             ])),
             chunks[4],
         );
@@ -1498,7 +1499,7 @@ fn draw_list(f: &mut Frame, app: &mut App) {
         ),
         // 空闲时用状态行讲清标记的含义，省得用户以为 ● 是装饰
         None => {
-            let legend = format!(
+            let legend = tf!(
                 " ● 已连接（Enter 或点顶部标签切回那一格）· ○ 正在连接 · 断开用 {}（只断这一格） ",
                 app.settings.keybinds.display(crate::keybinds::Action::CloseTab)
             );
@@ -1575,7 +1576,7 @@ fn draw_delete_confirm(f: &mut Frame, confirm_index: usize, alias: &str) {
     f.buffer_mut().set_style(panel, Style::default().bg(theme::bg()));
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" 删除确认 ")
+        .title(t(" 删除确认 "))
         .title_style(Style::default().fg(theme::err()).add_modifier(Modifier::BOLD));
     f.render_widget(Clear, panel);
     f.render_widget(block, panel);
@@ -1583,21 +1584,21 @@ fn draw_delete_confirm(f: &mut Frame, confirm_index: usize, alias: &str) {
     let inner_w = panel.width.saturating_sub(2);
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            format!(" 确定删除主机 “{alias}” 吗？"),
+            tf!(" 确定删除主机 “{alias}” 吗？"),
             Style::default().fg(theme::warn()),
         ))),
         Rect { x: inner_x, y: panel.y + 1, width: inner_w, height: 1 },
     );
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            " 此操作不可恢复。",
+            t(" 此操作不可恢复。"),
             Style::default().fg(theme::dim()),
         ))),
         Rect { x: inner_x, y: panel.y + 2, width: inner_w, height: 1 },
     );
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "【 保 留 】",
+            t("【 保 留 】"),
             Style::default()
                 .fg(theme::text())
                 .bg(theme::band())
@@ -1612,7 +1613,7 @@ fn draw_delete_confirm(f: &mut Frame, confirm_index: usize, alias: &str) {
     );
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "【 删 除 】",
+            t("【 删 除 】"),
             Style::default()
                 .fg(theme::on_accent())
                 .bg(theme::err())
@@ -1627,7 +1628,7 @@ fn draw_delete_confirm(f: &mut Frame, confirm_index: usize, alias: &str) {
     );
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            " ←→/Tab 切换 · Enter 确认 · Esc 取消 · y 删 n 留",
+            t(" ←→/Tab 切换 · Enter 确认 · Esc 取消 · y 删 n 留"),
             Style::default().fg(theme::dim()),
         ))),
         Rect { x: inner_x, y: panel.y + panel.height.saturating_sub(2), width: inner_w, height: 1 },
@@ -1643,7 +1644,7 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(
         Block::default()
             .borders(Borders::ALL)
-            .title(" ells 快捷键 ")
+            .title(t(" ells 快捷键 "))
             .title_style(
                 Style::default()
                     .fg(theme::accent())
@@ -1652,10 +1653,10 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App) {
         panel,
     );
     use crate::keybinds::Action;
-    let list_body = "↑↓/jk 选择 · Enter 连接（这台已经连着就切回它那一格标签）· a 新增 · e 编辑 · d 删除（二次确认）· s 设置 · i 导入 ~/.ssh/config · x 导出 ssh_config · p 用表格编辑这台的转发规则 · m 端口映射总表 · / 过滤 · f 收藏置顶 · Space 折叠/展开当前分组 · z 一键折叠全部 · o 循环排序（默认/最近使用/别名/分组，记住上次选的）· t 端口转发 · h 已知主机密钥 · l 操作记录 · v 会话记录 · ?/F1 帮助 · q/Ctrl-C 退出；行首 ● 已连接 / ○ 正在连接，右端一列是最近使用时间，顶部标签条可以直接点".to_string();
-    let organize_body = "/ 之后直接打字即过滤（别名、主机、用户、分组、标签、备注都算），按分数排序并点亮别名里命中的字符，Enter 保留过滤词、Esc 清空；Space 折叠/展开光标所在分组，z 一键收起全部，f 给选中的主机加星。排序按 o 循环四档：默认（分组 → 组内收藏 → 组内最近使用 → 别名）· 最近使用 · 别名 · 分组（组内只按别名），选中的那档写在 settings.ini 的 list_sort=，下次启动还是它；分组/默认两档画段头「▾ 生产 (3)」，过滤时段头收起、折叠也一并失效。表单里的「分组」决定它排在哪儿、「标签」能被过滤命中。".to_string();
-    let tunnel_body = "端口转发写在主机表单的「转发」栏里，一条 SSH 连接承载这台机器的全部规则：-L 8080:127.0.0.1:5432（本地口经服务器送进去）、-D 1080（本地 SOCKS5）、裸写 8080:db:5432 也算本地转发；-R 存得进来、导出也带上，但 ells 起不来它，会明确报「暂不支持」而不是静默失效。本地端口可以留空（或写 0）＝交给系统分配，跟 ssh -L 0:db:5432 同义：两台主机都想占 8080 时留空就不互挤，实际落在哪个口按 m 看「端口映射」总表（隧道面板顶部的「端口映射」也能点）。写死的端口真撞上时，启动失败会点名是谁占着（另一台 ells 主机的哪条规则，还是外部程序），界面里编辑时也会提前在行尾标 ⚠。t 打开隧道面板看每台实况（▲ 已就绪 ◐ 连/重连中 ▼ 失败），空格或 s 启停，Enter 进表格改这台的规则（列表页按 p 也能直接开），x 全停。本地监听口在拨号前就占好，会话断开不影响隧道，它自己按 1/2/5/15/30/60 秒退避重连。".to_string();
-    let tab_body = format!(
+    let list_body = t("↑↓/jk 选择 · Enter 连接（这台已经连着就切回它那一格标签）· a 新增 · e 编辑 · d 删除（二次确认）· s 设置 · i 导入 ~/.ssh/config · x 导出 ssh_config · p 用表格编辑这台的转发规则 · m 端口映射总表 · / 过滤 · f 收藏置顶 · Space 折叠/展开当前分组 · z 一键折叠全部 · o 循环排序（默认/最近使用/别名/分组，记住上次选的）· t 端口转发 · h 已知主机密钥 · l 操作记录 · v 会话记录 · ?/F1 帮助 · q/Ctrl-C 退出；行首 ● 已连接 / ○ 正在连接，右端一列是最近使用时间，顶部标签条可以直接点").to_string();
+    let organize_body = t("/ 之后直接打字即过滤（别名、主机、用户、分组、标签、备注都算），按分数排序并点亮别名里命中的字符，Enter 保留过滤词、Esc 清空；Space 折叠/展开光标所在分组，z 一键收起全部，f 给选中的主机加星。排序按 o 循环四档：默认（分组 → 组内收藏 → 组内最近使用 → 别名）· 最近使用 · 别名 · 分组（组内只按别名），选中的那档写在 settings.ini 的 list_sort=，下次启动还是它；分组/默认两档画段头「▾ 生产 (3)」，过滤时段头收起、折叠也一并失效。表单里的「分组」决定它排在哪儿、「标签」能被过滤命中。").to_string();
+    let tunnel_body = t("端口转发写在主机表单的「转发」栏里，一条 SSH 连接承载这台机器的全部规则：-L 8080:127.0.0.1:5432（本地口经服务器送进去）、-D 1080（本地 SOCKS5）、裸写 8080:db:5432 也算本地转发；-R 存得进来、导出也带上，但 ells 起不来它，会明确报「暂不支持」而不是静默失效。本地端口可以留空（或写 0）＝交给系统分配，跟 ssh -L 0:db:5432 同义：两台主机都想占 8080 时留空就不互挤，实际落在哪个口按 m 看「端口映射」总表（隧道面板顶部的「端口映射」也能点）。写死的端口真撞上时，启动失败会点名是谁占着（另一台 ells 主机的哪条规则，还是外部程序），界面里编辑时也会提前在行尾标 ⚠。t 打开隧道面板看每台实况（▲ 已就绪 ◐ 连/重连中 ▼ 失败），空格或 s 启停，Enter 进表格改这台的规则（列表页按 p 也能直接开），x 全停。本地监听口在拨号前就占好，会话断开不影响隧道，它自己按 1/2/5/15/30/60 秒退避重连。").to_string();
+    let tab_body = tf!(
         "{} 新建标签 · {} 下一个 · {} 上一个 · 鼠标点顶部标签条切换、点末尾 + 新建 · {} 关闭当前标签（只断这一格）· {} 回主机列表（连接保持不断，再按一次回到原来的页面）· 列表页与会话页、浏览器页顶部都有标签条",
         binds.display(Action::NewTab),
         binds.display(Action::NextTab),
@@ -1663,7 +1664,7 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App) {
         binds.display(Action::CloseTab),
         binds.display(Action::HostList),
     );
-    let term_body = format!(
+    let term_body = tf!(
         "直接打字即发往远端 · {} 文件浏览器 · {} 内嵌/直通 · {} 关闭标签 · {} 整屏重绘 · {} 容器视图（Docker socket 直连，读不到就回落 docker ps；端口逐行展开 / 回车 启停重启 / 详情含资源占用 / 端口中心 / TSV 复制）· 滚轮回看 · 拖选复制（OSC 52）· {} 搜索历史输出（回看时按 / 同样可用，n/N 上下条）· {} 回主机列表 · F1 帮助",
         binds.display(Action::Browser),
         binds.display(Action::Passthrough),
@@ -1674,30 +1675,30 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App) {
         binds.display(Action::HostList),
     );
     let sections: [(&str, std::borrow::Cow<str>); 16] = [
-        ("主机列表", std::borrow::Cow::Owned(list_body)),
-        ("分组与过滤", std::borrow::Cow::Owned(organize_body)),
-        ("端口转发", std::borrow::Cow::Owned(tunnel_body)),
-        ("主机密钥与记录", std::borrow::Cow::Borrowed("h 打开已知主机密钥：ells 自己记的（~/.ells/known_hosts）可以删，删掉下次连这台会重新问一次指纹；~/.ssh/known_hosts 只显示、永不改动。l 打开操作记录：连接/断开、密钥被信任或变更、传输、隧道、保险库保存、改主密码都写进 ~/.ells/audit.log（北京时间、只追加、超过 1 MiB 自动转存，记录里不会出现任何密码或私钥）。")),
-        ("会话记录", std::borrow::Cow::Borrowed("v 打开会话记录：每连上一台机器把终端原始输出另存一份 ~/.ells/logs/<别名>-<时间>.log（原样存 ANSI，退回去用 less -R 也能看颜色；界面里查看时已去掉控制序列）。单份 8 MiB 封顶、只留最近 30 天，列表页 d 删单份。开关在「设置 → 会话记录」，关掉之后新连接不再落盘；这份文件里是你在远端敲过的命令和远端打印的一切，别人拿到本机就能读到，介意就关掉。")),
-        ("主机指标", std::borrow::Cow::Borrowed("会话页最底下那一行是远端主机的 CPU / 内存 / 磁盘：磁盘取用得最满的那个真实挂载点的容量使用率，数字直接照抄 df 的 Capacity 列（自己算会因为 ext4 预留块和 df 差几个点），旁边写上是哪个挂载点、已用/总量。三格里只放标签、条和百分比，两句补充的话一律排在整行末尾，摆得下才写 —— 挂在某一格后面会把那一格撑得比旁边的宽。采集用的就是那条已经认证好的连接：先在这条连接已有的 SFTP 会话上读 /proc/stat、/proc/meminfo、/proc/loadavg、/proc/mounts，磁盘用 statvfs@openssh.com 问本地盘（网络盘一律不问：一次卡死的 statvfs 会把整条 SFTP 会话连文件传输一起拖住）；没有 SFTP、服务器不支持那个扩展或读不到东西时才回落一条一次性 exec（df -Pk），而且只填还空着的那几格。不另开连接、不碰你正在敲的那个 PTY、也不在远端留任何进程。连上立刻跑第一轮，内存、磁盘、负载当场有数；节奏是分开的：/proc 那三样 5 秒一轮，磁盘那一格 5 秒也跟着换数，但每轮只对「当前最满那块」问一次 statvfs（挂载点表缓存在这条连接上，不然每 5 秒都要重读一遍 /proc/mounts 再逐块问）；每 60 秒才重做一次普查 —— 重读挂载点、逐块问一遍、重新决定哪块最满（问盘最贵，而挂载点集合一分钟里几乎不动）。服务器没有 statvfs 扩展时跟单轮一个请求都不发，那一格沿用上次的数，只在 60 秒的普查点补一条 df —— 绝不让 df 变成每 5 秒一次。没在看的那些标签降到 60 秒一轮，切回去当场重采一轮。CPU 必须两次快照做差才是瞬时值，所以那一格比别的晚两步 —— 基线拿到后两秒就接力，进去约两秒见到第一个数，之后跟着 5 秒一轮；没有 /proc 的机器（FreeBSD、精简容器）一直是 —，磁盘照常。采不到就画 —，绝不画 0%；连续三轮什么都拿不到就判定这台不支持，停掉轮询、把这一行还给终端。通道级失败（超时、开不了通道）不算这台采不到，只是把节奏退到 5 → 10 → 30 → 60 秒，任意一轮拿到数就自动回到 5 秒。开关在「设置 → 主机指标」。")),
-        ("导入与导出", std::borrow::Cow::Borrowed("i 从 ~/.ssh/config 导入：只新增库里没有的别名，已经存过的主机一个字都不覆盖（密码认证的那几台导入后要在「编辑」里补密码）。x 将保险库写成一段 ssh_config，落点固定在 ~/.ells/ssh_config.export：只写别名 / 主机 / 端口 / 用户 / IdentityFile / ProxyJump / 转发，密码和主密码永不进这份文件；~/.ssh/config 本体 ells 从不动笔，要用就自己把那几行粘过去。命令行走 ells export（打到标准输出）或 ells export --out 路径。")),
-        ("多标签会话", std::borrow::Cow::Owned(tab_body)),
-        ("会话终端", std::borrow::Cow::Owned(term_body)),
-        ("改键", std::borrow::Cow::Owned(format!(
+        (t("主机列表"), std::borrow::Cow::Owned(list_body)),
+        (t("分组与过滤"), std::borrow::Cow::Owned(organize_body)),
+        (t("端口转发"), std::borrow::Cow::Owned(tunnel_body)),
+        (t("主机密钥与记录"), std::borrow::Cow::Borrowed(t("h 打开已知主机密钥：ells 自己记的（~/.ells/known_hosts）可以删，删掉下次连这台会重新问一次指纹；~/.ssh/known_hosts 只显示、永不改动。l 打开操作记录：连接/断开、密钥被信任或变更、传输、隧道、保险库保存、改主密码都写进 ~/.ells/audit.log（北京时间、只追加、超过 1 MiB 自动转存，记录里不会出现任何密码或私钥）。"))),
+        (t("会话记录"), std::borrow::Cow::Borrowed(t("v 打开会话记录：每连上一台机器把终端原始输出另存一份 ~/.ells/logs/<别名>-<时间>.log（原样存 ANSI，退回去用 less -R 也能看颜色；界面里查看时已去掉控制序列）。单份 8 MiB 封顶、只留最近 30 天，列表页 d 删单份。开关在「设置 → 会话记录」，关掉之后新连接不再落盘；这份文件里是你在远端敲过的命令和远端打印的一切，别人拿到本机就能读到，介意就关掉。"))),
+        (t("主机指标"), std::borrow::Cow::Borrowed(t("会话页最底下那一行是远端主机的 CPU / 内存 / 磁盘：磁盘取用得最满的那个真实挂载点的容量使用率，数字直接照抄 df 的 Capacity 列（自己算会因为 ext4 预留块和 df 差几个点），旁边写上是哪个挂载点、已用/总量。三格里只放标签、条和百分比，两句补充的话一律排在整行末尾，摆得下才写 —— 挂在某一格后面会把那一格撑得比旁边的宽。采集用的就是那条已经认证好的连接：先在这条连接已有的 SFTP 会话上读 /proc/stat、/proc/meminfo、/proc/loadavg、/proc/mounts，磁盘用 statvfs@openssh.com 问本地盘（网络盘一律不问：一次卡死的 statvfs 会把整条 SFTP 会话连文件传输一起拖住）；没有 SFTP、服务器不支持那个扩展或读不到东西时才回落一条一次性 exec（df -Pk），而且只填还空着的那几格。不另开连接、不碰你正在敲的那个 PTY、也不在远端留任何进程。连上立刻跑第一轮，内存、磁盘、负载当场有数；节奏是分开的：/proc 那三样 5 秒一轮，磁盘那一格 5 秒也跟着换数，但每轮只对「当前最满那块」问一次 statvfs（挂载点表缓存在这条连接上，不然每 5 秒都要重读一遍 /proc/mounts 再逐块问）；每 60 秒才重做一次普查 —— 重读挂载点、逐块问一遍、重新决定哪块最满（问盘最贵，而挂载点集合一分钟里几乎不动）。服务器没有 statvfs 扩展时跟单轮一个请求都不发，那一格沿用上次的数，只在 60 秒的普查点补一条 df —— 绝不让 df 变成每 5 秒一次。没在看的那些标签降到 60 秒一轮，切回去当场重采一轮。CPU 必须两次快照做差才是瞬时值，所以那一格比别的晚两步 —— 基线拿到后两秒就接力，进去约两秒见到第一个数，之后跟着 5 秒一轮；没有 /proc 的机器（FreeBSD、精简容器）一直是 —，磁盘照常。采不到就画 —，绝不画 0%；连续三轮什么都拿不到就判定这台不支持，停掉轮询、把这一行还给终端。通道级失败（超时、开不了通道）不算这台采不到，只是把节奏退到 5 → 10 → 30 → 60 秒，任意一轮拿到数就自动回到 5 秒。开关在「设置 → 主机指标」。"))),
+        (t("导入与导出"), std::borrow::Cow::Borrowed(t("i 从 ~/.ssh/config 导入：只新增库里没有的别名，已经存过的主机一个字都不覆盖（密码认证的那几台导入后要在「编辑」里补密码）。x 将保险库写成一段 ssh_config，落点固定在 ~/.ells/ssh_config.export：只写别名 / 主机 / 端口 / 用户 / IdentityFile / ProxyJump / 转发，密码和主密码永不进这份文件；~/.ssh/config 本体 ells 从不动笔，要用就自己把那几行粘过去。命令行走 ells export（打到标准输出）或 ells export --out 路径。"))),
+        (t("多标签会话"), std::borrow::Cow::Owned(tab_body)),
+        (t("会话终端"), std::borrow::Cow::Owned(term_body)),
+        (t("改键"), std::borrow::Cow::Owned(tf!(
             "会话与标签页按键可在「设置 → 快捷键设置」里自定义（列表页按 s、会话页按顶部【设置】）：Enter 选中某项后按下新按键即可绑定，只接受 F2–F9 或带 Ctrl/Alt 的组合键（F1 留给帮助页，F10–F12 常被终端或系统吃掉），改完即时写入 ~/.ells/settings.ini；撞到已占用的键会自动互换，【恢复默认】一键还原。跨平台：mac/Linux 终端把 Ctrl-] 这类组合发成与 Ctrl-5 同一个字节，已自动归一，默认键在三个平台都能触发；本机注意点——{}",
             crate::keybinds::platform_note(),
         ))),
-        ("外观主题", std::borrow::Cow::Borrowed("设置页「界面主题」按 Enter 或 ←→ 循环四套：跟随终端（一处底色都不画，全用终端自己的主题，mac 终端/iTerm2/WezTerm/Windows Terminal 都合适，**四个平台默认都是它**）· 深色（画死黑底灰条，终端配色自己拿不准时的保底）· 高对比（去掉灰色小字，靠粗体与反显分层）· 浅色底（白底终端用深字）。切换即时预览，【保 存】才写入 settings.ini 的 theme=，【取消】还原。")),
-        ("文件浏览器", std::borrow::Cow::Borrowed("↑↓/滚轮 选择 · Enter 进入目录或下载 · u 上传文件 · U 上传整个目录 · d 下载 · e 编辑（按「vi 打开方式」用内置面板或本地程序；取回到临时文件，保存后自动回传；取回时远端被人改过会先问要不要覆盖）· m 新建目录 · n 重命名 · c 改权限（八进制 600/0644，只改权限位，不动属主和时间）· D 删除（递归，先确认）· Ctrl-C 取消全部在途传输 · r 刷新 · Backspace 上级 · Esc 返回终端。会话终端里直接敲 vi / vim / nvim 文件名也走同一套：「设置 → vi 打开方式」默认在 ells 内置面板里改（行号 + 语法高亮；打开即 INSERT 直接打字，Esc 回 NORMAL，滚轮一格三行、左键拖选、Ctrl-C 复制选区、Ctrl-A 全选、Ctrl-Z/Y 撤销重做，Ctrl-S 或 :w 保存并回传、Ctrl-Q 或 :wq/:q 退出、:q! 放弃改动（macOS：终端支持并转发 Cmd 时 ⌘S/⌘Q 同效，如 iTerm2 3.5+/kitty/Ghostty，WezTerm 需开 enable_kitty_keyboard；Terminal.app 不转发 Cmd，Cmd-Q 也可能先被终端自己的「退出」截走——这两种情况用 Ctrl）），也可切「本地程序」用系统编辑器或「原生」交回远端 vi。文件名里的 Tab 由 ells 直接向远端目录补全，补完的行仍归内置面板；只拦简单命令（选项 + 单个文件名），带管道、通配符、sudo 或动过光标/翻过历史的行照旧交给远端，状态行会写明这次为什么没接管")),
-        ("主机表单", std::borrow::Cow::Borrowed("Tab/↓ 下一个字段 · ↑ 上一个 · ←→ 切换认证方式 · Ctrl-F 选私钥 · Ctrl-J 选跳板机 · Ctrl-C 清空当前字段 · 光标在「密码/私钥口令」上按 Ctrl-R 让它显形（再按一次遮回去）· Enter 在\"私钥路径/跳板机\"上直接打开选择器，保存要点【保 存】或聚焦后回车。带 ＊ 的别名、主机、用户是必填项，提交失败时只点缺的那几项的名。「分组」只影响列表归类与排序，光标停在这一栏时下面会列出已有分组和各自台数，敲同名即归入、敲新名即新建（末尾空格不算新分组）；「标签」用逗号分隔、过滤时按 #标签 命中；「转发」写 ssh 风格的 -L/-D 规则（见【端口转发】），想一列一列对着填就在列表页按 p（或隧道面板里按 Enter）进表格编辑器，本地端口那一格留空就是交给系统分配；这三栏留空即无。编辑已有主机不会丢掉它的收藏、备注和最近连接时间；按 a 新增时会把列表里选中的那台的用户/端口/认证方式/私钥路径/跳板/分组/标签/转发带过来，但别名、主机名和密码/口令一律留空 —— 身份和凭据要自己填")),
-        ("解锁保险库", std::borrow::Cow::Borrowed("输入主密码后回车；首次使用会要求输入两遍（第 1 步定、第 2 步照抄一遍）。Tab 切换明文回显，确认自己没敲错再回车；回车后输入框下面亮起一条进度带，它按本机这一趟 argon2id 的真实耗时走（第一次没有实测值就按 1 秒估，最多先走到九成五，算完才收口），右边写清已用几秒。主密码不可找回，忘记只能删除 ~/.ells/vault.bin 重来。")),
-        ("确认弹窗", std::borrow::Cow::Borrowed("←→/Tab 切换选项 · Enter 确认 · Esc 取消。传输冲突默认停在\"改名保留双方\"；主机密钥变更默认停在\"拒绝\"。")),
-        ("命令行", std::borrow::Cow::Borrowed("ells 打开列表；ells <别名> 直连；ells --dev 读 ~/.ells/hosts.dev.toml；ells -y 首次主机密钥自动接受（密钥变更仍然拒绝）。配置在 ~/.ells/。")),
+        (t("外观主题"), std::borrow::Cow::Borrowed(t("设置页「界面主题」按 Enter 或 ←→ 循环四套：跟随终端（一处底色都不画，全用终端自己的主题，mac 终端/iTerm2/WezTerm/Windows Terminal 都合适，**四个平台默认都是它**）· 深色（画死黑底灰条，终端配色自己拿不准时的保底）· 高对比（去掉灰色小字，靠粗体与反显分层）· 浅色底（白底终端用深字）。切换即时预览，【保 存】才写入 settings.ini 的 theme=，【取消】还原。"))),
+        (t("文件浏览器"), std::borrow::Cow::Borrowed(t("↑↓/滚轮 选择 · Enter 进入目录或下载 · u 上传文件 · U 上传整个目录 · d 下载 · e 编辑（按「vi 打开方式」用内置面板或本地程序；取回到临时文件，保存后自动回传；取回时远端被人改过会先问要不要覆盖）· m 新建目录 · n 重命名 · c 改权限（八进制 600/0644，只改权限位，不动属主和时间）· D 删除（递归，先确认）· Ctrl-C 取消全部在途传输 · r 刷新 · Backspace 上级 · Esc 返回终端。会话终端里直接敲 vi / vim / nvim 文件名也走同一套：「设置 → vi 打开方式」默认在 ells 内置面板里改（行号 + 语法高亮；打开即 INSERT 直接打字，Esc 回 NORMAL，滚轮一格三行、左键拖选、Ctrl-C 复制选区、Ctrl-A 全选、Ctrl-Z/Y 撤销重做，Ctrl-S 或 :w 保存并回传、Ctrl-Q 或 :wq/:q 退出、:q! 放弃改动（macOS：终端支持并转发 Cmd 时 ⌘S/⌘Q 同效，如 iTerm2 3.5+/kitty/Ghostty，WezTerm 需开 enable_kitty_keyboard；Terminal.app 不转发 Cmd，Cmd-Q 也可能先被终端自己的「退出」截走——这两种情况用 Ctrl）），也可切「本地程序」用系统编辑器或「原生」交回远端 vi。文件名里的 Tab 由 ells 直接向远端目录补全，补完的行仍归内置面板；只拦简单命令（选项 + 单个文件名），带管道、通配符、sudo 或动过光标/翻过历史的行照旧交给远端，状态行会写明这次为什么没接管"))),
+        (t("主机表单"), std::borrow::Cow::Borrowed(t("Tab/↓ 下一个字段 · ↑ 上一个 · ←→ 切换认证方式 · Ctrl-F 选私钥 · Ctrl-J 选跳板机 · Ctrl-C 清空当前字段 · 光标在「密码/私钥口令」上按 Ctrl-R 让它显形（再按一次遮回去）· Enter 在\"私钥路径/跳板机\"上直接打开选择器，保存要点【保 存】或聚焦后回车。带 ＊ 的别名、主机、用户是必填项，提交失败时只点缺的那几项的名。「分组」只影响列表归类与排序，光标停在这一栏时下面会列出已有分组和各自台数，敲同名即归入、敲新名即新建（末尾空格不算新分组）；「标签」用逗号分隔、过滤时按 #标签 命中；「转发」写 ssh 风格的 -L/-D 规则（见【端口转发】），想一列一列对着填就在列表页按 p（或隧道面板里按 Enter）进表格编辑器，本地端口那一格留空就是交给系统分配；这三栏留空即无。编辑已有主机不会丢掉它的收藏、备注和最近连接时间；按 a 新增时会把列表里选中的那台的用户/端口/认证方式/私钥路径/跳板/分组/标签/转发带过来，但别名、主机名和密码/口令一律留空 —— 身份和凭据要自己填"))),
+        (t("解锁保险库"), std::borrow::Cow::Borrowed(t("输入主密码后回车；首次使用会要求输入两遍（第 1 步定、第 2 步照抄一遍）。Tab 切换明文回显，确认自己没敲错再回车；回车后输入框下面亮起一条进度带，它按本机这一趟 argon2id 的真实耗时走（第一次没有实测值就按 1 秒估，最多先走到九成五，算完才收口），右边写清已用几秒。主密码不可找回，忘记只能删除 ~/.ells/vault.bin 重来。"))),
+        (t("确认弹窗"), std::borrow::Cow::Borrowed(t("←→/Tab 切换选项 · Enter 确认 · Esc 取消。传输冲突默认停在\"改名保留双方\"；主机密钥变更默认停在\"拒绝\"。"))),
+        (t("命令行"), std::borrow::Cow::Borrowed(t("ells 打开列表；ells <别名> 直连；ells --dev 读 ~/.ells/hosts.dev.toml；ells -y 首次主机密钥自动接受（密钥变更仍然拒绝）。配置在 ~/.ells/。"))),
     ];
     let mut lines: Vec<Line> = Vec::new();
     for (title, body) in sections {
         lines.push(Line::from(Span::styled(
-            format!("【{title}】"),
+            tf!("【{title}】"),
             Style::default()
                 .fg(theme::warn())
                 .add_modifier(Modifier::BOLD),
@@ -1709,7 +1710,7 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App) {
         lines.push(Line::from(""));
     }
     lines.push(Line::from(Span::styled(
-        " Esc / q / ? / F1 关闭",
+        t(" Esc / q / ? / F1 关闭"),
         Style::default().fg(theme::dim()),
     )));
     f.render_widget(
@@ -1726,7 +1727,7 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App) {
     // 底部提示行盖在面板最后一行上，滚动键位要说得清
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            format!(
+            tf!(
                 " ↑↓/jk 滚动 · PgDn/空格 下一页 · Esc/q/? 关闭（第 {} 屏）",
                 app.help_scroll + 1
             ),
@@ -1763,7 +1764,7 @@ fn draw_prompt(f: &mut Frame, prompt: &Prompt) {
     );
     let inner_x = panel.x + 1;
     let inner_w = panel.width.saturating_sub(2);
-    let prefix = format!("{}：", prompt.label);
+    let prefix = tf!("{}：", prompt.label);
     // 输入超过一行宽度时保留尾部（用户在改文件名时关心的是后半段）
     let room = inner_w
         .saturating_sub(prefix.chars().count() as u16 + 2)
@@ -1788,7 +1789,7 @@ fn draw_prompt(f: &mut Frame, prompt: &Prompt) {
     let note = match &prompt.error {
         Some(err) => (format!(" {err}"), theme::warn()),
         None => {
-            let mut hint = " Enter 确认 · Esc 取消".to_string();
+            let mut hint = t(" Enter 确认 · Esc 取消").to_string();
             if let Some(extra) = prompt.hint {
                 hint.push_str(" · ");
                 hint.push_str(extra);
@@ -1875,13 +1876,13 @@ fn draw_choice(f: &mut Frame, choice: &Choice) {
                 Modifier::empty()
             });
         f.render_widget(
-            Paragraph::new(Line::from(Span::styled(format!("【 {label} 】"), style))),
+            Paragraph::new(Line::from(Span::styled(tf!("【 {label} 】"), style))),
             *rect,
         );
     }
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            " ←→/Tab 切换 · Enter 确认 · Esc 取消",
+            t(" ←→/Tab 切换 · Enter 确认 · Esc 取消"),
             Style::default().fg(theme::dim()),
         ))),
         Rect {
@@ -1934,9 +1935,9 @@ fn group_hint(app: &App) -> Option<String> {
     let counts = crate::app::group_counts(&app.vault.hosts);
     if counts.is_empty() {
         return Some(if typed.is_empty() {
-            "还没有分组：起个名字，列表页就按它分段（留空归入「未分组」）".to_string()
+            t("还没有分组：起个名字，列表页就按它分段（留空归入「未分组」）").to_string()
         } else {
-            format!("还没有分组：将新建「{typed}」（留空归入「未分组」）")
+            tf!("还没有分组：将新建「{typed}」（留空归入「未分组」）")
         });
     }
     let listed = counts
@@ -1945,11 +1946,11 @@ fn group_hint(app: &App) -> Option<String> {
         .collect::<Vec<_>>()
         .join(" · ");
     Some(if typed.is_empty() {
-        format!("已有分组 {listed} — 照敲即归入，留空则在「未分组」")
+        tf!("已有分组 {listed} — 照敲即归入，留空则在「未分组」")
     } else if counts.iter().any(|(g, _)| g == &typed) {
-        format!("已归入「{typed}」— 全部分组：{listed}")
+        tf!("已归入「{typed}」— 全部分组：{listed}")
     } else {
-        format!("将新建分组「{typed}」— 已有：{listed}")
+        tf!("将新建分组「{typed}」— 已有：{listed}")
     })
 }
 
@@ -1959,7 +1960,7 @@ fn draw_form(f: &mut Frame, app: &mut App) {
     let area = centered(64, (n as u16) + 7, f.area());
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" 主机 ")
+        .title(t(" 主机 "))
         .title_style(Style::default().fg(theme::accent()));
     let inner = block.inner(area);
     f.render_widget(Clear, area);
@@ -1999,7 +2000,7 @@ fn draw_form(f: &mut Frame, app: &mut App) {
             Line::from(vec![
                 // ＊ 标必填三项；其余行留同样两列的空白，值那一列才对得齐
                 Span::styled(
-                    if must { "＊" } else { "  " },
+                    if must { t("＊") } else { "  " },
                     Style::default()
                         .fg(if must { theme::err() } else { theme::dim() })
                         .add_modifier(Modifier::BOLD),
@@ -2051,7 +2052,7 @@ fn draw_form(f: &mut Frame, app: &mut App) {
     let footer = app.form.footer;
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "【 保 存 】",
+            t("【 保 存 】"),
             Style::default()
                 .fg(theme::on_accent())
                 .bg(theme::accent_bg())
@@ -2066,7 +2067,7 @@ fn draw_form(f: &mut Frame, app: &mut App) {
     );
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "【 取 消 】",
+            t("【 取 消 】"),
             Style::default()
                 .fg(theme::text())
                 .bg(theme::band())
@@ -2083,11 +2084,11 @@ fn draw_form(f: &mut Frame, app: &mut App) {
     f.render_widget(
         Paragraph::new(vec![
             Line::from(Span::styled(
-                " Tab/↓ 移项 · Enter 选私钥/跳板机 · ←/→ 换认证 · 口令项 Ctrl-R 显形",
+                t(" Tab/↓ 移项 · Enter 选私钥/跳板机 · ←/→ 换认证 · 口令项 Ctrl-R 显形"),
                 Style::default().fg(theme::dim()),
             )),
             Line::from(Span::styled(
-                " ＊ 为必填 · 鼠标点击定位 · 按钮 Enter/点击 保存 · 私钥口令仅加密私钥才填",
+                t(" ＊ 为必填 · 鼠标点击定位 · 按钮 Enter/点击 保存 · 私钥口令仅加密私钥才填"),
                 Style::default().fg(theme::dim()),
             )),
         ]),
@@ -2099,7 +2100,7 @@ fn draw_form(f: &mut Frame, app: &mut App) {
         let area = centered(52, h.min(f.area().height.saturating_sub(2)), f.area());
         let block = Block::default()
             .borders(Borders::ALL)
-            .title(" 选择跳板机 · ↑↓ 选择 · Enter 确认 · Esc 关闭 ")
+            .title(t(" 选择跳板机 · ↑↓ 选择 · Enter 确认 · Esc 关闭 "))
             .title_style(Style::default().fg(theme::accent()));
         let pinner = block.inner(area);
         f.render_widget(Clear, area);
@@ -2124,9 +2125,9 @@ fn draw_form(f: &mut Frame, app: &mut App) {
 /// Chinese label for an auth method value.
 fn auth_label(v: &str) -> &'static str {
     match v {
-        "key" => "密钥",
+        "key" => t("密钥"),
         "agent" => "ssh-agent",
-        _ => "密码",
+        _ => t("密码"),
     }
 }
 
@@ -2178,14 +2179,14 @@ fn draw_browser(f: &mut Frame, app: &mut App) {
 
     let path_line = Line::from(vec![
         Span::styled(
-            format!(" 远端文件 {} ", b.path),
+            tf!(" 远端文件 {} ", b.path),
             Style::default().fg(theme::accent()).add_modifier(Modifier::BOLD),
         ),
         if b.loading {
-            Span::styled("加载中…", Style::default().fg(theme::warn()))
+            Span::styled(t("加载中…"), Style::default().fg(theme::warn()))
         } else {
             Span::styled(
-                format!("{} 项", b.entries.len()),
+                tf!("{} 项", b.entries.len()),
                 Style::default().fg(theme::dim()),
             )
         },
@@ -2231,7 +2232,7 @@ fn draw_browser(f: &mut Frame, app: &mut App) {
         );
     } else {
         let keys =
-            " ↑↓/滚轮 选择 · Enter 进入/下载 · u 上传文件 · U 上传目录 · d 下载 · e 本地编辑（保存自动回传）· m 新建目录 · n 重命名 · c 改权限 · D 删除 · Ctrl-C 取消传输 · r 刷新 · Esc 返回终端 ";
+            t(" ↑↓/滚轮 选择 · Enter 进入/下载 · u 上传文件 · U 上传目录 · d 下载 · e 本地编辑（保存自动回传）· m 新建目录 · n 重命名 · c 改权限 · D 删除 · Ctrl-C 取消传输 · r 刷新 · Esc 返回终端 ");
         f.render_widget(
             Paragraph::new(keys).style(Style::default().fg(theme::dim())),
             chunks[3],
@@ -2290,13 +2291,13 @@ fn draw_session(f: &mut Frame, app: &mut App) {
         .split(f.area());
 
     let mode_tag = match s.mode {
-        TermMode::Embedded => "内嵌",
-        TermMode::Passthrough => "直通",
+        TermMode::Embedded => t("内嵌"),
+        TermMode::Passthrough => t("直通"),
     };
     // 顶部按键提示跟着用户的自定义绑定走（KeyBinds 是 Copy，避开与 s 的借用冲突）
     let binds = app.settings.keybinds;
     use crate::keybinds::Action;
-    let key_hint = format!(
+    let key_hint = tf!(
         "{} 切模式 · {} 文件 · {} 重绘 · {} 搜索 · {} 新标签 · {}/{} 切换 · {} 关闭标签 · {} 列表",
         binds.display(Action::Passthrough),
         binds.display(Action::Browser),
@@ -2350,7 +2351,7 @@ fn draw_session(f: &mut Frame, app: &mut App) {
     );
     if let Some(search) = &app.slots[idx].search {
         let line = Line::from(Span::styled(
-            format!(
+            tf!(
                 " 搜索「{}」：第 {}/{} 个命中 · n 下一个 · N 上一个 · Esc 退出",
                 search.query,
                 search.cursor + 1,
@@ -2361,13 +2362,13 @@ fn draw_session(f: &mut Frame, app: &mut App) {
         f.render_widget(Paragraph::new(line), note_row);
     } else if s.scroll > 0 {
         let line = Line::from(Span::styled(
-            format!(" 回看历史：已向上 {n} 行 · 滚轮回底部 · 任意按键回到实时", n = s.scroll),
+            tf!(" 回看历史：已向上 {n} 行 · 滚轮回底部 · 任意按键回到实时", n = s.scroll),
             Style::default().fg(theme::alt()).bg(theme::bg()),
         ));
         f.render_widget(Paragraph::new(line), note_row);
     } else if s.docker_hint() {
         let line = Line::from(Span::styled(
-            format!(
+            tf!(
                 " 检测到 docker ps 输出 · {} 打开容器视图（端口展开 / 启停重启 / 详情）",
                 binds.display(Action::Containers)
             ),
@@ -2382,7 +2383,7 @@ fn draw_session(f: &mut Frame, app: &mut App) {
         f.render_widget(Paragraph::new(line), note_row);
     } else {
         let line = Line::from(Span::styled(
-            " 点击上方按钮或输入 sz/rz 传输文件 · 滚轮回看输出 · 拖选复制",
+            t(" 点击上方按钮或输入 sz/rz 传输文件 · 滚轮回看输出 · 拖选复制"),
             Style::default().fg(theme::dim()).bg(theme::bg()),
         ));
         f.render_widget(Paragraph::new(line), note_row);
@@ -2539,12 +2540,12 @@ pub fn metric_cells(m: &crate::app::Metrics) -> Vec<MetricCell> {
             percent: m.cpu,
             detail: m
                 .load
-                .map(|l| inline(&format!("负载 {}", l.display())))
+                .map(|l| inline(&tf!("负载 {}", l.display())))
                 .unwrap_or_default(),
         },
-        MetricCell { label: "内存", percent: m.mem, detail: String::new() },
+        MetricCell { label: t("内存"), percent: m.mem, detail: String::new() },
         MetricCell {
-            label: "磁盘",
+            label: t("磁盘"),
             percent: disk.map(|d| d.percent),
             detail: inline(
                 &disk
@@ -2676,7 +2677,7 @@ fn metric_render(m: &crate::app::Metrics, width: u16) -> MetricRender {
     if !m.has_data() {
         return MetricRender {
             // 连上到第一轮回来之间一个数都没有：明说"在采"，别摆三条空槽看着像坏了
-            parts: vec![(" 远端主机指标：正在采集第一轮…".to_string(), MetricTone::Dim)],
+            parts: vec![(t(" 远端主机指标：正在采集第一轮…").to_string(), MetricTone::Dim)],
             cpu_span: None,
             mem_span: None,
             disk_span: None,
@@ -2906,11 +2907,12 @@ fn single_disk_render(m: &crate::app::Metrics, width: u16) -> MetricRender {
         }
         push(pct, tone, &mut col);
         let span = Some((start, col - start));
-        match cell.label {
-            "CPU" => cpu_span = span,
-            "内存" => mem_span = span,
-            "磁盘" => disk_span = span,
-            _ => {}
+        if cell.label == "CPU" {
+            cpu_span = span;
+        } else if cell.label == t("内存") {
+            mem_span = span;
+        } else if cell.label == t("磁盘") {
+            disk_span = span;
         }
     }
     // 整行的装饰都在这之后：三根条已经摆完，等宽的那部分是用户读的数，剩下的才是话。
@@ -3014,9 +3016,9 @@ fn draw_disk_popup(f: &mut Frame, app: &App) {
     f.buffer_mut().set_style(area, Style::default().bg(theme::bg()));
     f.render_widget(Clear, area);
     let title = if aliases > 0 {
-        format!(" 磁盘（{} 块 / {} 个挂载点） ", disks.len(), disks.len() + aliases)
+        tf!(" 磁盘（{} 块 / {} 个挂载点） ", disks.len(), disks.len() + aliases)
     } else {
-        format!(" 磁盘挂载点（{} 块） ", disks.len())
+        tf!(" 磁盘挂载点（{} 块） ", disks.len())
     };
     let block = Block::bordered()
         .title(title)
@@ -3027,25 +3029,25 @@ fn draw_disk_popup(f: &mut Frame, app: &App) {
     let lines: Vec<Line> = if disks.is_empty() {
         vec![
             Line::from(Span::styled(
-                " 这台机器还没有磁盘数据",
+                t(" 这台机器还没有磁盘数据"),
                 Style::default().fg(theme::dim()),
             )),
             Line::from(Span::styled(
-                " 服务器没有 statvfs 扩展、df 也给不出挂载点时会是这样",
+                t(" 服务器没有 statvfs 扩展、df 也给不出挂载点时会是这样"),
                 Style::default().fg(theme::muted()),
             )),
         ]
     } else {
         let mut out = vec![Line::from(vec![
             Span::styled(
-                pad_display("挂载点", 30),
+                pad_display(t("挂载点"), 30),
                 Style::default().fg(theme::dim()).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                pad_display("使用率", 8),
+                pad_display(t("使用率"), 8),
                 Style::default().fg(theme::dim()).add_modifier(Modifier::BOLD),
             ),
-            Span::styled("已用/总量", Style::default().fg(theme::dim()).add_modifier(Modifier::BOLD)),
+            Span::styled(t("已用/总量"), Style::default().fg(theme::dim()).add_modifier(Modifier::BOLD)),
         ])];
         for d in disks {
             let tone = MetricTone::of(Some(d.percent)).color();
@@ -3069,7 +3071,7 @@ fn draw_disk_popup(f: &mut Frame, app: &App) {
             ]));
             if !d.aliases.is_empty() {
                 out.push(Line::from(Span::styled(
-                    format!("  别名 {}", inline(&clip_display(&d.aliases.join(", "), 54))),
+                    tf!("  别名 {}", inline(&clip_display(&d.aliases.join(", "), 54))),
                     Style::default().fg(theme::dim()),
                 )));
             }
@@ -3078,7 +3080,7 @@ fn draw_disk_popup(f: &mut Frame, app: &App) {
     };
     f.render_widget(Paragraph::new(lines), inner);
     f.render_widget(
-        Paragraph::new(" Esc/点击外部 关闭 · 按使用率从高到低 · 数值来自 statvfs/df ")
+        Paragraph::new(t(" Esc/点击外部 关闭 · 按使用率从高到低 · 数值来自 statvfs/df "))
             .style(Style::default().fg(theme::dim())),
         Rect {
             x: area.x,
@@ -3103,7 +3105,7 @@ fn draw_proc_popup(f: &mut Frame, app: &App, popup: &ProcPopup) {
 
     f.render_widget(Paragraph::new(proc_popup_lines(popup)), inner);
     f.render_widget(
-        Paragraph::new(" Esc/点击外部 关闭 · 每 2 秒刷新 · ps 数值为进程生命周期平均 ")
+        Paragraph::new(t(" Esc/点击外部 关闭 · 每 2 秒刷新 · ps 数值为进程生命周期平均 "))
             .style(Style::default().fg(theme::dim())),
         Rect {
             x: area.x,
@@ -3119,20 +3121,20 @@ fn proc_popup_lines(popup: &ProcPopup) -> Vec<Line<'static>> {
     if let Some(err) = &popup.error {
         return vec![
             Line::from(Span::styled(
-                format!(" 查询失败：{}", inline(&clip_display(err, 50))),
+                tf!(" 查询失败：{}", inline(&clip_display(err, 50))),
                 Style::default().fg(theme::err()),
             )),
             Line::from(Span::styled(
-                " 服务器不允许 exec、或者 ps 不在 PATH 里时会是这样",
+                t(" 服务器不允许 exec、或者 ps 不在 PATH 里时会是这样"),
                 Style::default().fg(theme::muted()),
             )),
         ];
     }
     if popup.procs.is_empty() {
         let text = if popup.loading {
-            " 正在通过已认证的连接查询进程列表…"
+            t(" 正在通过已认证的连接查询进程列表…")
         } else {
-            " 这台机器没有返回进程列表（ps 可能被限制）"
+            t(" 这台机器没有返回进程列表（ps 可能被限制）")
         };
         return vec![Line::from(Span::styled(text, Style::default().fg(theme::dim())))];
     }
@@ -3142,11 +3144,11 @@ fn proc_popup_lines(popup: &ProcPopup) -> Vec<Line<'static>> {
             Style::default().fg(theme::dim()).add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            pad_display("进程", 30),
+            pad_display(t("进程"), 30),
             Style::default().fg(theme::dim()).add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            format!("{} {}", pad_display("CPU", 8), "内存"),
+            format!("{} {}", pad_display("CPU", 8), t("内存")),
             Style::default().fg(theme::dim()).add_modifier(Modifier::BOLD),
         ),
     ])];
@@ -3284,17 +3286,17 @@ fn draw_docker_popup(f: &mut Frame, v: &crate::containers::DockerView) {
     f.render_widget(Clear, panel);
 
     let title = match v.tab {
-        DockerTab::Containers => format!(
+        DockerTab::Containers => tf!(
             " 容器 · {} 个（运行 {}） · {}{} ",
             v.items.len(),
             v.running_count(),
-            if v.all { "含已停止" } else { "仅运行中" },
-            if v.loading { " · 读取中" } else { "" }
+            if v.all { t("含已停止") } else { t("仅运行中") },
+            if v.loading { t(" · 读取中") } else { "" }
         ),
-        DockerTab::Ports => format!(
+        DockerTab::Ports => tf!(
             " 端口映射 · {} 条 · 按宿主端口排序{} ",
             v.rows_len(),
-            if v.loading { " · 读取中" } else { "" }
+            if v.loading { t(" · 读取中") } else { "" }
         ),
     };
     let block = Block::bordered()
@@ -3325,7 +3327,7 @@ fn draw_docker_popup(f: &mut Frame, v: &crate::containers::DockerView) {
     if v.loading && v.items.is_empty() {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                " 正在读取容器列表…（直连 Docker socket，不通就回落 docker ps）",
+                t(" 正在读取容器列表…（直连 Docker socket，不通就回落 docker ps）"),
                 Style::default().fg(theme::accent()),
             ))),
             Rect { x: inner.x, y: inner.y + inner.height / 2, width: inner.width, height: 1 },
@@ -3334,7 +3336,7 @@ fn draw_docker_popup(f: &mut Frame, v: &crate::containers::DockerView) {
         f.render_widget(
             Paragraph::new(vec![
                 Line::from(Span::styled(
-                    " 拿不到容器列表",
+                    t(" 拿不到容器列表"),
                     Style::default().fg(theme::err()).add_modifier(Modifier::BOLD),
                 )),
                 Line::from(Span::styled(
@@ -3349,14 +3351,14 @@ fn draw_docker_popup(f: &mut Frame, v: &crate::containers::DockerView) {
             Paragraph::new(vec![
                 Line::from(Span::styled(
                     match (v.tab, v.all) {
-                        (DockerTab::Ports, _) => " 没有已发布的端口映射",
-                        (DockerTab::Containers, true) => " 没有容器",
-                        (DockerTab::Containers, false) => " 没有运行中的容器",
+                        (DockerTab::Ports, _) => t(" 没有已发布的端口映射"),
+                        (DockerTab::Containers, true) => t(" 没有容器"),
+                        (DockerTab::Containers, false) => t(" 没有运行中的容器"),
                     },
                     Style::default().fg(theme::dim()),
                 )),
                 Line::from(Span::styled(
-                    " a 切到含已停止 · r 重试 · 这台可能没装 Docker 或当前用户没有 socket 权限",
+                    t(" a 切到含已停止 · r 重试 · 这台可能没装 Docker 或当前用户没有 socket 权限"),
                     Style::default().fg(theme::muted()),
                 )),
             ]),
@@ -3373,10 +3375,10 @@ fn draw_docker_popup(f: &mut Frame, v: &crate::containers::DockerView) {
         Paragraph::new(Line::from(Span::styled(
             match v.tab {
                 DockerTab::Containers => {
-                    " ↑↓ 选择 · 回车 操作 · 空格 展开端口 · Tab/p 切页 · a 含已停止 · r 刷新 · c 复制 · Esc 关闭 "
+                    t(" ↑↓ 选择 · 回车 操作 · 空格 展开端口 · Tab/p 切页 · a 含已停止 · r 刷新 · c 复制 · Esc 关闭 ")
                 }
                 DockerTab::Ports => {
-                    " ↑↓ 选择 · 回车 操作 · Tab/p 切页 · a 含已停止 · r 刷新 · c 复制 · Esc 关闭 "
+                    t(" ↑↓ 选择 · 回车 操作 · Tab/p 切页 · a 含已停止 · r 刷新 · c 复制 · Esc 关闭 ")
                 }
             },
             Style::default().fg(theme::dim()),
@@ -3412,10 +3414,10 @@ fn draw_docker_containers(
             format!(
                 "{}{g}{}{g}{}{g}{}{g}{}",
                 pad_display("ID", id_w),
-                pad_display("名称", name_w),
-                pad_display("镜像", image_w),
-                pad_display("状态", state_w),
-                "端口"
+                pad_display(t("名称"), name_w),
+                pad_display(t("镜像"), image_w),
+                pad_display(t("状态"), state_w),
+                t("端口")
             ),
             label,
         ))),
@@ -3484,7 +3486,7 @@ fn draw_docker_containers(
             ListLine::More { hidden, .. } => {
                 lines.push(Line::from(Span::styled(
                     clip_display(
-                        &format!("     └ 还有 {hidden} 条 · 空格展开 / 点击整行"),
+                        &tf!("     └ 还有 {hidden} 条 · 空格展开 / 点击整行"),
                         w.saturating_sub(1),
                     ),
                     Style::default().fg(theme::dim()),
@@ -3515,11 +3517,11 @@ fn draw_docker_ports(
         Paragraph::new(Line::from(Span::styled(
             format!(
                 "{}{g}{}{g}{}{g}{}{g}{}",
-                pad_display("名称", name_w),
-                pad_display("宿主口", host_w),
-                pad_display("容器口", container_w),
-                pad_display("协议", proto_w),
-                "绑定地址"
+                pad_display(t("名称"), name_w),
+                pad_display(t("宿主口"), host_w),
+                pad_display(t("容器口"), container_w),
+                pad_display(t("协议"), proto_w),
+                t("绑定地址")
             ),
             label,
         ))),
@@ -3569,7 +3571,7 @@ fn draw_docker_menu(f: &mut Frame, v: &crate::containers::DockerView) {
     let mut lines: Vec<Line> = Vec::new();
     if let Some(action) = menu.confirm {
         lines.push(Line::from(Span::styled(
-            format!(" 确认{}「{}」？", action_label(action), menu.container_name),
+            tf!(" 确认{}「{}」？", action_label(action), menu.container_name),
             Style::default().fg(theme::warn()).add_modifier(Modifier::BOLD),
         )));
         if let Some(err) = &menu.error {
@@ -3579,16 +3581,16 @@ fn draw_docker_menu(f: &mut Frame, v: &crate::containers::DockerView) {
             )));
         }
         lines.push(Line::from(Span::styled(
-            " 回车 / y 执行 · Esc / n 返回",
+            t(" 回车 / y 执行 · Esc / n 返回"),
             Style::default().fg(theme::dim()),
         )));
     } else if menu.busy {
         lines.push(Line::from(Span::styled(
-            " 正在远端执行…",
+            t(" 正在远端执行…"),
             Style::default().fg(theme::accent()).add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::from(Span::styled(
-            " 完成后自动刷新列表",
+            t(" 完成后自动刷新列表"),
             Style::default().fg(theme::dim()),
         )));
     } else {
@@ -3624,7 +3626,7 @@ fn draw_docker_menu(f: &mut Frame, v: &crate::containers::DockerView) {
             )));
         }
         lines.push(Line::from(Span::styled(
-            " ↑↓ 选择 · 回车 执行 · Esc 关闭",
+            t(" ↑↓ 选择 · 回车 执行 · Esc 关闭"),
             Style::default().fg(theme::dim()),
         )));
     }
@@ -3634,7 +3636,7 @@ fn draw_docker_menu(f: &mut Frame, v: &crate::containers::DockerView) {
     f.buffer_mut().set_style(panel, Style::default().bg(theme::bg()));
     f.render_widget(Clear, panel);
     let block = Block::bordered()
-        .title(format!(" 操作 · {} ", menu.container_name))
+        .title(tf!(" 操作 · {} ", menu.container_name))
         .title_style(Style::default().fg(theme::accent()).add_modifier(Modifier::BOLD));
     let inner = block.inner(panel);
     f.render_widget(block, panel);
@@ -3651,7 +3653,7 @@ fn draw_docker_detail(f: &mut Frame, v: &crate::containers::DockerView) {
     f.buffer_mut().set_style(panel, Style::default().bg(theme::bg()));
     f.render_widget(Clear, panel);
     let block = Block::bordered()
-        .title(format!(" 容器详情 · {} ", d.container_name))
+        .title(tf!(" 容器详情 · {} ", d.container_name))
         .title_style(Style::default().fg(theme::accent()).add_modifier(Modifier::BOLD));
     let inner = block.inner(panel);
     f.render_widget(block, panel);
@@ -3674,7 +3676,7 @@ fn draw_docker_detail(f: &mut Frame, v: &crate::containers::DockerView) {
     if d.loading {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                " 正在读取容器详情与资源占用…",
+                t(" 正在读取容器详情与资源占用…"),
                 Style::default().fg(theme::accent()),
             ))),
             body,
@@ -3683,7 +3685,7 @@ fn draw_docker_detail(f: &mut Frame, v: &crate::containers::DockerView) {
         f.render_widget(
             Paragraph::new(vec![
                 Line::from(Span::styled(
-                    " 拿不到容器详情",
+                    t(" 拿不到容器详情"),
                     Style::default().fg(theme::err()).add_modifier(Modifier::BOLD),
                 )),
                 Line::from(Span::styled(
@@ -3713,9 +3715,9 @@ fn draw_docker_detail(f: &mut Frame, v: &crate::containers::DockerView) {
     }
 
     let hint = if d.data.is_some() {
-        " ↑↓/滚轮 滚动 · c 复制详情 · Esc 关闭 "
+        t(" ↑↓/滚轮 滚动 · c 复制详情 · Esc 关闭 ")
     } else {
-        " Esc 关闭 "
+        t(" Esc 关闭 ")
     };
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(hint, Style::default().fg(theme::dim())))),
@@ -3784,9 +3786,9 @@ fn draw_header_buttons(f: &mut Frame, app: &App) {
         .fg(theme::on_accent())
         .bg(theme::accent_bg())
         .add_modifier(Modifier::BOLD);
-    for (rect, label) in [(settings, "设置"), (upload, "上传"), (download, "下载"), (host_list, "列表")] {
+    for (rect, label) in [(settings, t("设置")), (upload, t("上传")), (download, t("下载")), (host_list, t("列表"))] {
         f.render_widget(
-            Paragraph::new(Line::from(Span::styled(format!("【{label}】"), btn_style))),
+            Paragraph::new(Line::from(Span::styled(tf!("【{label}】"), btn_style))),
             rect,
         );
     }
@@ -3796,7 +3798,7 @@ fn draw_header_buttons(f: &mut Frame, app: &App) {
     let done = transfers.iter().filter(|t| t.done).count();
     let failed = transfers.iter().filter(|t| t.error.is_some()).count();
     let active: Vec<_> = transfers.iter().filter(|t| !t.done && t.error.is_none()).collect();
-    let counter = format!("传输进度 ({done}/{total})");
+    let counter = tf!("传输进度 ({done}/{total})");
     if !active.is_empty() {
         let mut got: u64 = 0;
         let mut sum: Option<u64> = Some(0);
@@ -3830,7 +3832,7 @@ fn draw_header_buttons(f: &mut Frame, app: &App) {
     } else if total > 0 && failed > 0 {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                format!(" {counter} · {failed} 个失败 · 点击查看 "),
+                tf!(" {counter} · {failed} 个失败 · 点击查看 "),
                 Style::default().fg(theme::err()).bg(theme::bg()),
             ))),
             progress,
@@ -3838,7 +3840,7 @@ fn draw_header_buttons(f: &mut Frame, app: &App) {
     } else if total > 0 {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                format!(" {counter} · 点击查看 "),
+                tf!(" {counter} · 点击查看 "),
                 Style::default().fg(theme::ok()).bg(theme::bg()),
             ))),
             progress,
@@ -3954,7 +3956,7 @@ fn draw_tab_bar(
         ))),
         plus,
     );
-    let hint = format!(
+    let hint = tf!(
         " {} 新建 · {}/{} 切换 · {} 关闭标签 ",
         binds.display(crate::keybinds::Action::NewTab),
         binds.display(crate::keybinds::Action::NextTab),
@@ -4051,7 +4053,7 @@ fn draw_settings_overlay(f: &mut Frame, app: &App) {
     f.buffer_mut().set_style(panel, Style::default().bg(theme::bg()));
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" 全局设置 ")
+        .title(t(" 全局设置 "))
         .title_style(Style::default().fg(theme::accent()).add_modifier(Modifier::BOLD));
     f.render_widget(Clear, panel);
     f.render_widget(block, panel);
@@ -4068,9 +4070,9 @@ fn draw_settings_overlay(f: &mut Frame, app: &App) {
     let hl_color = if st.highlight { theme::ok() } else { theme::err() };
     f.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled(" 终端输出高亮（docker / 日志级别）：", row_base(focus == 0)),
+            Span::styled(t(" 终端输出高亮（docker / 日志级别）："), row_base(focus == 0)),
             Span::styled(
-                if st.highlight { " 开 " } else { " 关 " },
+                if st.highlight { t(" 开 ") } else { t(" 关 ") },
                 row_base(focus == 0).fg(hl_color).add_modifier(Modifier::BOLD),
             ),
         ])),
@@ -4079,27 +4081,27 @@ fn draw_settings_overlay(f: &mut Frame, app: &App) {
     // 行 1：保活间隔
     f.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled(" SSH 空闲保活间隔：", row_base(focus == 1)),
+            Span::styled(t(" SSH 空闲保活间隔："), row_base(focus == 1)),
             Span::styled(
-                format!(" {} 秒 ", st.keepalive_secs),
+                tf!(" {} 秒 ", st.keepalive_secs),
                 row_base(focus == 1)
                     .fg(theme::accent())
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled("（15/30/60/120/300）", row_base(focus == 1).fg(theme::dim())),
+            Span::styled(t("（15/30/60/120/300）"), row_base(focus == 1).fg(theme::dim())),
         ])),
         rects[1],
     );
     // 行 2：主密码保护开关
     let mp_color = if st.master_password_enabled { theme::ok() } else { theme::warn() };
     let mp_note = if st.master_password_enabled {
-        " 开 · 启动需输入主密码 "
+        t(" 开 · 启动需输入主密码 ")
     } else {
-        " 关 · 启动自动解锁（凭据存本地） "
+        t(" 关 · 启动自动解锁（凭据存本地） ")
     };
     f.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled(" 主密码保护：", row_base(focus == 2)),
+            Span::styled(t(" 主密码保护："), row_base(focus == 2)),
             Span::styled(
                 mp_note,
                 row_base(focus == 2).fg(mp_color).add_modifier(Modifier::BOLD),
@@ -4110,12 +4112,12 @@ fn draw_settings_overlay(f: &mut Frame, app: &App) {
     // 行 3：修改主密码（含输入态）
     let line3 = match app.mp_stage {
         crate::app::MpStage::Idle => Line::from(vec![
-            Span::styled(" 修改主密码：", row_base(focus == 3)),
+            Span::styled(t(" 修改主密码："), row_base(focus == 3)),
             Span::styled(
                 if app.master_secret.is_some() {
-                    " Enter/点击 开始输入 "
+                    t(" Enter/点击 开始输入 ")
                 } else {
-                    " 开发模式无主密码 "
+                    t(" 开发模式无主密码 ")
                 },
                 row_base(focus == 3).fg(theme::dim()),
             ),
@@ -4123,14 +4125,14 @@ fn draw_settings_overlay(f: &mut Frame, app: &App) {
         _ => {
             let masked: String = app.mp_buf.chars().map(|_| '•').collect();
             let prompt = if app.mp_stage == crate::app::MpStage::First {
-                " 新主密码："
+                t(" 新主密码：")
             } else {
-                " 再次输入确认："
+                t(" 再次输入确认：")
             };
             let tail = if app.mp_busy {
-                " 重新加密中…"
+                t(" 重新加密中…")
             } else {
-                " Enter 继续 · Esc 取消"
+                t(" Enter 继续 · Esc 取消")
             };
             Line::from(vec![
                 Span::styled(prompt, row_base(true)),
@@ -4143,9 +4145,9 @@ fn draw_settings_overlay(f: &mut Frame, app: &App) {
     // 行 4：快捷键设置子面板入口
     f.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled(" 快捷键设置：", row_base(focus == 4)),
+            Span::styled(t(" 快捷键设置："), row_base(focus == 4)),
             Span::styled(
-                format!(
+                tf!(
                     " {} 项可改 · Enter/点击 打开 ",
                     crate::keybinds::Action::ALL.len()
                 ),
@@ -4157,13 +4159,13 @@ fn draw_settings_overlay(f: &mut Frame, app: &App) {
     // 行 5：界面主题（改完立即预览，保存才落盘）
     f.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled(" 界面主题：", row_base(focus == 5)),
+            Span::styled(t(" 界面主题："), row_base(focus == 5)),
             Span::styled(
                 format!(" {} ", st.theme.label()),
                 row_base(focus == 5).fg(theme::accent()).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                "←→/Enter 切换",
+                t("←→/Enter 切换"),
                 row_base(focus == 5).fg(theme::dim()),
             ),
         ])),
@@ -4174,21 +4176,21 @@ fn draw_settings_overlay(f: &mut Frame, app: &App) {
         .update
         .checked_at
         .map(crate::update::age_label)
-        .unwrap_or_else(|| "从未".to_string());
+        .unwrap_or_else(|| t("从未").to_string());
     let update_note = if app.update.checking {
-        " 正在检查… ".to_string()
+        t(" 正在检查… ").to_string()
     } else if let Some(tag) = app.update.latest.as_deref() {
-        format!(" 最新 {tag} · Enter 更新 ")
+        tf!(" 最新 {tag} · Enter 更新 ")
     } else if app.update.error.is_some() {
-        " 检查失败（见下方） ".to_string()
+        t(" 检查失败（见下方） ").to_string()
     } else {
-        format!(" 已是最新 · 上次检查 {checked} ")
+        tf!(" 已是最新 · 上次检查 {checked} ")
     };
     f.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled(" 自动更新：", row_base(focus == 6)),
+            Span::styled(t(" 自动更新："), row_base(focus == 6)),
             Span::styled(
-                if st.auto_update { " 开 " } else { " 关 " },
+                if st.auto_update { t(" 开 ") } else { t(" 关 ") },
                 row_base(focus == 6)
                     .fg(if st.auto_update { theme::ok() } else { theme::dim() })
                     .add_modifier(Modifier::BOLD),
@@ -4201,13 +4203,13 @@ fn draw_settings_overlay(f: &mut Frame, app: &App) {
     let log_color = if st.session_log { theme::ok() } else { theme::dim() };
     f.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled(" 会话记录（终端输出落盘）：", row_base(focus == 7)),
+            Span::styled(t(" 会话记录（终端输出落盘）："), row_base(focus == 7)),
             Span::styled(
-                if st.session_log { " 开 " } else { " 关 " },
+                if st.session_log { t(" 开 ") } else { t(" 关 ") },
                 row_base(focus == 7).fg(log_color).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                " ~/.ells/logs · 单份 8 MiB · 留 30 天 ",
+                t(" ~/.ells/logs · 单份 8 MiB · 留 30 天 "),
                 row_base(focus == 7).fg(theme::dim()),
             ),
         ])),
@@ -4217,13 +4219,13 @@ fn draw_settings_overlay(f: &mut Frame, app: &App) {
     let mt_color = if st.metrics { theme::ok() } else { theme::dim() };
     f.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled(" 主机指标（CPU/内存/磁盘）：", row_base(focus == 8)),
+            Span::styled(t(" 主机指标（CPU/内存/磁盘）："), row_base(focus == 8)),
             Span::styled(
-                if st.metrics { " 开 " } else { " 关 " },
+                if st.metrics { t(" 开 ") } else { t(" 关 ") },
                 row_base(focus == 8).fg(mt_color).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                " 5 秒一轮 · 磁盘跟单 · 60 秒普查 · 同一条连接 ",
+                t(" 5 秒一轮 · 磁盘跟单 · 60 秒普查 · 同一条连接 "),
                 row_base(focus == 8).fg(theme::dim()),
             ),
         ])),
@@ -4233,13 +4235,13 @@ fn draw_settings_overlay(f: &mut Frame, app: &App) {
     let rc_color = if st.reconnect.max_attempts == 0 { theme::dim() } else { theme::ok() };
     f.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled(" 自动重连（会话断开后）：", row_base(focus == 9)),
+            Span::styled(t(" 自动重连（会话断开后）："), row_base(focus == 9)),
             Span::styled(
                 format!(" {} ", st.reconnect.attempts_label()),
                 row_base(focus == 9).fg(rc_color).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                " 次 · 1s 起指数退避 · 细调改 ini ",
+                t(" 次 · 1s 起指数退避 · 细调改 ini "),
                 row_base(focus == 9).fg(theme::dim()),
             ),
         ])),
@@ -4253,13 +4255,13 @@ fn draw_settings_overlay(f: &mut Frame, app: &App) {
     };
     f.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled(" vi 打开方式：", row_base(focus == 10)),
+            Span::styled(t(" vi 打开方式："), row_base(focus == 10)),
             Span::styled(
                 format!(" {} ", st.edit_open.label()),
                 row_base(focus == 10).fg(vi_color).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                "←→/Enter 切换 · 内置即终端内编辑",
+                t("←→/Enter 切换 · 内置即终端内编辑"),
                 row_base(focus == 10).fg(theme::dim()),
             ),
         ])),
@@ -4267,8 +4269,8 @@ fn draw_settings_overlay(f: &mut Frame, app: &App) {
     );
     // 行 11：操作提示（更新检查失败时这行让给它，长文案才放得下）
     let hint = match &app.update.error {
-        Some(err) => format!(" 检查更新失败：{err}"),
-        None => " ↑↓ 选择 · Enter/点击 修改 · ←→ 微调 · Esc 取消".to_string(),
+        Some(err) => tf!(" 检查更新失败：{err}"),
+        None => t(" ↑↓ 选择 · Enter/点击 修改 · ←→ 微调 · Esc 取消").to_string(),
     };
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -4282,7 +4284,7 @@ fn draw_settings_overlay(f: &mut Frame, app: &App) {
     // 行 12：保存 / 取消按钮
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "【 保 存 】",
+            t("【 保 存 】"),
             Style::default()
                 .fg(theme::on_accent())
                 .bg(theme::accent_bg())
@@ -4293,7 +4295,7 @@ fn draw_settings_overlay(f: &mut Frame, app: &App) {
     );
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "【 取 消 】",
+            t("【 取 消 】"),
             Style::default()
                 .fg(theme::text())
                 .bg(theme::band())
@@ -4311,7 +4313,7 @@ fn draw_keybinds_overlay(f: &mut Frame, app: &App) {
     f.buffer_mut().set_style(panel, Style::default().bg(theme::bg()));
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" 快捷键设置 ")
+        .title(t(" 快捷键设置 "))
         .title_style(Style::default().fg(theme::accent()).add_modifier(Modifier::BOLD));
     f.render_widget(Clear, panel);
     f.render_widget(block, panel);
@@ -4327,7 +4329,7 @@ fn draw_keybinds_overlay(f: &mut Frame, app: &App) {
         let focused = app.keybinds_focus == idx;
         let recording = app.keybinds_recording == Some(*action);
         let badge = if recording {
-            " 请按下新按键 · Esc 取消 ".to_string()
+            t(" 请按下新按键 · Esc 取消 ").to_string()
         } else {
             format!(" {} ", binds.display(*action))
         };
@@ -4347,7 +4349,7 @@ fn draw_keybinds_overlay(f: &mut Frame, app: &App) {
     // 操作提示 + 本机注意点 + 一次性结果行
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            " ↑↓ 选择 · Enter/点击 改键 · 只能绑 F2–F9 或 Ctrl/Alt 组合键",
+            t(" ↑↓ 选择 · Enter/点击 改键 · 只能绑 F2–F9 或 Ctrl/Alt 组合键"),
             Style::default().fg(theme::dim()).bg(theme::bg()),
         ))),
         Rect { x: rects[0].x, y: rects[0].y + n as u16, width: rects[0].width, height: 1 },
@@ -4361,7 +4363,7 @@ fn draw_keybinds_overlay(f: &mut Frame, app: &App) {
     );
     let msg = match &app.keybinds_msg {
         Some(text) => text.clone(),
-        None => " 改键即时生效并保存 · 与已占用的键会自动互换".to_string(),
+        None => t(" 改键即时生效并保存 · 与已占用的键会自动互换").to_string(),
     };
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -4374,7 +4376,7 @@ fn draw_keybinds_overlay(f: &mut Frame, app: &App) {
     );
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "【恢复默认】",
+            t("【恢复默认】"),
             Style::default()
                 .fg(theme::text())
                 .bg(theme::band())
@@ -4384,7 +4386,7 @@ fn draw_keybinds_overlay(f: &mut Frame, app: &App) {
     );
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "【 返 回 】",
+            t("【 返 回 】"),
             Style::default()
                 .fg(theme::on_accent())
                 .bg(theme::accent_bg())
@@ -4414,7 +4416,7 @@ fn draw_transfer_popup(f: &mut Frame, app: &App) {
     f.buffer_mut().set_style(area, Style::default().bg(theme::bg()));
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" 传输详情 · 点击或按键关闭 ")
+        .title(t(" 传输详情 · 点击或按键关闭 "))
         .title_style(Style::default().fg(theme::accent()).add_modifier(Modifier::BOLD));
     let inner = block.inner(area);
     f.render_widget(Clear, area);
@@ -4425,9 +4427,9 @@ fn draw_transfer_popup(f: &mut Frame, app: &App) {
             break;
         }
         let status = if let Some(e) = &item.error {
-            format!("失败: {e}")
+            tf!("失败: {e}")
         } else if item.done {
-            "完成".to_string()
+            t("完成").to_string()
         } else {
             match &item.progress {
                 Some(p) => format!(
@@ -4436,7 +4438,7 @@ fn draw_transfer_popup(f: &mut Frame, app: &App) {
                     p.total.map(human_size).unwrap_or_else(|| "?".into()),
                     p.bytes_per_sec / 1024.0
                 ),
-                None => "准备中…".to_string(),
+                None => t("准备中…").to_string(),
             }
         };
         let color = if item.error.is_some() {
@@ -4498,9 +4500,9 @@ fn draw_update_popup(f: &mut Frame, app: &App) {
     let buttons = update_button_rects(f.area());
     let u = &app.update;
     let (title, head, note, ratio, button) = if u.downloading {
-        let asset = crate::update::asset_name().unwrap_or("更新包");
+        let asset = crate::update::asset_name().unwrap_or(t("更新包"));
         let r = ratio_of(u.transferred, u.total);
-        let head = format!(
+        let head = tf!(
             " 已下载 {}{}（{}%）",
             human_size(u.transferred),
             u.total
@@ -4509,32 +4511,32 @@ fn draw_update_popup(f: &mut Frame, app: &App) {
             (r * 100.0) as u8
         );
         let head = match &u.source {
-            Some(src) => format!("{head} · 源 {src}"),
+            Some(src) => tf!("{head} · 源 {src}"),
             None => head,
         };
         (
-            format!(" 正在更新 · {asset} "),
+            tf!(" 正在更新 · {asset} "),
             head,
-            " 校验和会跨源核对；不通过或内容异常就自动换源，中途可取消。".to_string(),
+            t(" 校验和会跨源核对；不通过或内容异常就自动换源，中途可取消。").to_string(),
             r,
-            "【 取消下载 】",
+            t("【 取消下载 】"),
         )
     } else {
         let tag = u.applied_tag.clone().unwrap_or_default();
         let live = app.slots.iter().filter(|s| s.session.is_some()).count();
         (
-            format!(" 更新完成 · {tag} "),
-            format!(
+            tf!(" 更新完成 · {tag} "),
+            tf!(
                 " 新版本已就位，当前进程仍是 v{}",
                 crate::update::current_version()
             ),
             if live > 0 {
-                format!(" 重启会断开这 {live} 路会话；也可以先退出再运行 ells。")
+                tf!(" 重启会断开这 {live} 路会话；也可以先退出再运行 ells。")
             } else {
-                " 重启后即为新版本；也可以先退出再运行 ells。".to_string()
+                t(" 重启后即为新版本；也可以先退出再运行 ells。").to_string()
             },
             1.0,
-            "【 立即重启 】",
+            t("【 立即重启 】"),
         )
     };
     f.buffer_mut().set_style(area, Style::default().bg(theme::bg()));
@@ -4571,7 +4573,7 @@ fn draw_update_popup(f: &mut Frame, app: &App) {
     );
     if !u.downloading {
         f.render_widget(
-            Paragraph::new(Line::from(Span::styled("【 稍 后 】", style(false)))),
+            Paragraph::new(Line::from(Span::styled(t("【 稍 后 】"), style(false)))),
             buttons[1],
         );
     }
@@ -5318,6 +5320,25 @@ mod tests {
         assert!(!out.contains("hunter2"), "没按 Tab 之前不许把密码写进屏幕");
         // 提示行里写的每个键都必须在 handle_unlock_key 里真能按
         assert!(out.contains("Enter 提交 · Tab 明文回显 · Esc 退出"));
+    }
+
+    /// 英文模式把同一块面板再画一遍：文案变长后底框、按钮仍是同一套布局，
+    /// 不该出现中文残留，也不该在窄终端里画崩。
+    #[test]
+    fn the_unlock_screen_speaks_english_without_leftovers() {
+        theme::apply(theme::Theme::Dark);
+        ells_lang::with_lang(ells_lang::Lang::En, || {
+            for (cols, rows) in [(80, 24), (56, 13)] {
+                let out = render_unlock_at(
+                    &unlock_state(UnlockStage::Open, "hunter2", false),
+                    std::time::Duration::from_millis(1000),
+                    cols,
+                    rows,
+                );
+                assert!(!out.chars().any(|c| ('\u{3400}'..='\u{9fff}').contains(&c)), "还有中文：{out}");
+                assert!(out.contains("Unlock vault"), "标题没换语言：{out}");
+            }
+        });
     }
 
     /// 尺寸表只有一处（`unlock_panel_size`），测试把四格钉死：面板高度是终端尺寸的门槛值，

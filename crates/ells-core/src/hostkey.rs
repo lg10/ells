@@ -4,6 +4,7 @@
 //! 并只读地参考 `~/.ssh/known_hosts`：用户已经用 OpenSSH 信任过的机器
 //! 不会在 ells 里再问一次。`~/.ssh/known_hosts` 永不被 ells 修改。
 
+use ells_lang::{t, tf};
 use std::path::{Path, PathBuf};
 
 use russh::keys::{HashAlg, PublicKey};
@@ -123,13 +124,14 @@ impl HostKeyPolicy {
             Ask::Never => {
                 // 管道里跑、没人能回答：把原因和指纹打到 stderr，用户至少能拿它去核对
                 eprintln!(
-                    "拒绝连接 {host}:{port}：{}（{algorithm} {fingerprint}）。\
+                    "{}", tf!("拒绝连接 {host}:{port}：{}（{algorithm} {fingerprint}）。\
                      标准输入不是终端，问不了你；确认这台机器可信可加 --yes（只放行首次，密钥变更仍然拒绝）。",
                     if trust == KeyTrust::Changed {
-                        "主机密钥与记录不一致"
+                        t("主机密钥与记录不一致")
                     } else {
-                        "首次见到这台主机"
+                        t("首次见到这台主机")
                     }
+                )
                 );
                 tracing::warn!("无法确认主机密钥（没有界面也没有终端），拒绝连接");
                 return false;
@@ -194,7 +196,7 @@ async fn ask_terminal(
     .await
     .unwrap_or(false);
     if !answer {
-        eprintln!("已拒绝该主机密钥，连接中止。");
+        eprintln!("{}", tf!("已拒绝该主机密钥，连接中止。"));
     }
     answer
 }
@@ -243,7 +245,7 @@ pub fn list_entries() -> Vec<KnownEntry> {
 /// 要求 `hosts` 精确相等（而不是"包含该主机"）：`a,b` 这种共享一行有两个主机，
 /// 按包含删除会连带删掉别人不想删的那条。
 pub fn delete_entry(hosts: &str, algorithm: &str) -> anyhow::Result<()> {
-    let path = our_known_hosts().ok_or_else(|| anyhow::anyhow!("无法定位用户主目录"))?;
+    let path = our_known_hosts().ok_or_else(|| anyhow::anyhow!("{}", tf!("无法定位用户主目录")))?;
     delete_entry_at(&path, hosts, algorithm)
 }
 
@@ -358,7 +360,7 @@ fn is_algorithm_token(token: &str) -> bool {
 
 /// 追加一条记录（`~/.ells/known_hosts`，权限 0600）。
 pub fn record(host: &str, port: u16, key: &PublicKey) -> anyhow::Result<()> {
-    let path = our_known_hosts().ok_or_else(|| anyhow::anyhow!("无法定位用户主目录"))?;
+    let path = our_known_hosts().ok_or_else(|| anyhow::anyhow!("{}", tf!("无法定位用户主目录")))?;
     record_at(&path, host, port, key)
 }
 
@@ -372,7 +374,7 @@ fn record_at(path: &Path, host: &str, port: u16, key: &PublicKey) -> anyhow::Res
 
 /// 记录新密钥，并删除同一 host:port 的旧密钥行（用户确认"确实换了"）。
 pub fn replace(host: &str, port: u16, key: &PublicKey) -> anyhow::Result<()> {
-    let path = our_known_hosts().ok_or_else(|| anyhow::anyhow!("无法定位用户主目录"))?;
+    let path = our_known_hosts().ok_or_else(|| anyhow::anyhow!("{}", tf!("无法定位用户主目录")))?;
     replace_at(&path, host, port, key)
 }
 

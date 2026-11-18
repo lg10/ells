@@ -11,6 +11,7 @@
 //! - `stable_secs`：连上撑过这么久再断，就当作一次全新的断开重新从第一次算，
 //!   免得几周后偶发的一次掉线也要先等 60 秒。
 
+use ells_lang::t;
 use std::time::Duration;
 
 /// 一次都算不过头的重试次数上限：设置里"无限"也只用这个封顶。
@@ -69,8 +70,8 @@ impl ReconnectParams {
     /// 界面上"重连第 n/m 次"的 m：0 显示成"关"。
     pub fn attempts_label(&self) -> String {
         match self.max_attempts {
-            0 => "关".to_string(),
-            n if n >= MAX_ATTEMPTS_CAP => "无限".to_string(),
+            0 => t("关").to_string(),
+            n if n >= MAX_ATTEMPTS_CAP => t("无限").to_string(),
             n => n.to_string(),
         }
     }

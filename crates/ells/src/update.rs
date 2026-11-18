@@ -8,6 +8,7 @@
 //!   二进制就删临时件、换下一个源，绝不用一个坏文件替换自己。
 //! - **不占 UI 线程**：`check` / `apply` 都按 `spawn_blocking` 的形态写，进度走回调。
 
+use ells_lang::tf;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -80,7 +81,7 @@ fn asset_for(os: &str, arch: &str) -> Option<&'static str> {
 
 /// 没有预编译包时给用户的替代路径。
 pub fn unsupported_hint() -> String {
-    format!(
+    tf!(
         "{} / {} 暂无预编译包，请用安装脚本更新（见 README 的一键安装）",
         std::env::consts::OS,
         std::env::consts::ARCH
@@ -190,7 +191,7 @@ pub fn deprecated_env_notice() -> Option<String> {
         .filter(|key| std::env::var(key).is_ok_and(|v| !v.trim().is_empty()))
         .collect();
     (!old.is_empty()).then(|| {
-        format!(
+        tf!(
             "{} 已废弃且不再生效；请改用 ELLS_UPDATE_SOURCES=github,https://镜像前缀/",
             old.join(" / ")
         )
@@ -335,11 +336,11 @@ pub fn age_label(checked_at: u64) -> String {
     if secs < 60 {
         "刚刚".to_string()
     } else if secs < 3600 {
-        format!("{} 分钟前", secs / 60)
+        tf!("{} 分钟前", secs / 60)
     } else if secs < 86400 {
-        format!("{} 小时前", secs / 3600)
+        tf!("{} 小时前", secs / 3600)
     } else {
-        format!("{} 天前", secs / 86400)
+        tf!("{} 天前", secs / 86400)
     }
 }
 
@@ -361,12 +362,12 @@ fn net_msg(e: &ureq::Error) -> String {
         StatusCode(403) | StatusCode(429) => {
             "更新源拒绝了请求（访问频率受限或需要代理），稍后再试".to_string()
         }
-        StatusCode(n) => format!("更新源返回状态码 {n}"),
+        StatusCode(n) => tf!("更新源返回状态码 {n}"),
         Timeout(_) => "网络超时，请检查连通性后重试".to_string(),
         HostNotFound | ConnectionFailed => "连不上更新源，请检查网络或代理设置".to_string(),
         BadUri(_) | InvalidProxyUrl => "更新地址不合法（检查 ELLS_UPDATE_SOURCES）".to_string(),
-        Io(io) => format!("网络错误：{io}"),
-        other => format!("网络错误：{other}"),
+        Io(io) => tf!("网络错误：{io}"),
+        other => tf!("网络错误：{other}"),
     }
 }
 
@@ -393,7 +394,7 @@ fn probe_sources(sources: &[Source]) -> (Vec<Probed>, Vec<String>) {
                     let started = Instant::now();
                     match probe_source(&source) {
                         Ok(tag) => Ok((source, tag, started.elapsed())),
-                        Err(e) => Err(format!("{}：{e}", source.name)),
+                        Err(e) => Err(tf!("{}：{e}", source.name)),
                     }
                 })
             })
@@ -427,7 +428,7 @@ fn probe_source(source: &Source) -> Result<String, String> {
     match api_tag(source) {
         Ok(tag) => Ok(tag),
         Err(api_err) => {
-            head_tag(source).map_err(|head_err| format!("{api_err}；发布页也失败：{head_err}"))
+            head_tag(source).map_err(|head_err| tf!("{api_err}；发布页也失败：{head_err}"))
         }
     }
 }
@@ -454,7 +455,7 @@ fn api_tag(source: &Source) -> Result<String, String> {
         .as_reader()
         .take(1 << 20)
         .read_to_string(&mut text)
-        .map_err(|e| format!("读取版本接口响应失败：{e}"))?;
+        .map_err(|e| tf!("读取版本接口响应失败：{e}"))?;
     tag_from_api(&text).ok_or_else(|| "无法从版本接口响应里解析 tag_name".to_string())
 }
 
@@ -466,7 +467,7 @@ fn probe_best() -> Result<(String, Source), String> {
         return Err(if errors.is_empty() {
             "没有配置任何更新源".to_string()
         } else {
-            format!("所有更新源都不可用：{}", errors.join("；"))
+            tf!("所有更新源都不可用：{}", errors.join("；"))
         });
     };
     let (tag, source) = (best.tag.clone(), best.source.clone());
@@ -508,7 +509,7 @@ fn exe_path() -> Result<PathBuf, String> {
     if let Some(path) = INSTALL_TARGET.get() {
         return Ok(path.clone());
     }
-    std::env::current_exe().map_err(|e| format!("无法定位 ells 自身的可执行文件：{e}"))
+    std::env::current_exe().map_err(|e| tf!("无法定位 ells 自身的可执行文件：{e}"))
 }
 
 fn old_path(exe: &Path) -> PathBuf {
@@ -671,13 +672,13 @@ fn rollback_to_backup(exe: &Path, pending: &Pending) -> Result<(), String> {
     if cfg!(windows) {
         let _ = std::fs::remove_file(&broken);
         std::fs::rename(exe, &broken)
-            .map_err(|e| format!("挪不开正在运行的 {}：{e}", exe.display()))?;
+            .map_err(|e| tf!("挪不开正在运行的 {}：{e}", exe.display()))?;
     }
     if let Err(e) = std::fs::rename(&pending.backup, exe) {
         if cfg!(windows) {
             let _ = std::fs::rename(&broken, exe);
         }
-        return Err(format!("把上一版挪回 {} 失败：{e}", exe.display()));
+        return Err(tf!("把上一版挪回 {} 失败：{e}", exe.display()));
     }
     write_rejected(exe, &pending.tag);
     clear_pending(exe);
@@ -926,7 +927,7 @@ fn apply_with_sources(
     let fetched = fetch_sums(sources, &tag, asset);
     let (strict, per_source, mut errors) = choose_checksums(&fetched);
     if strict.is_none() && per_source.is_empty() {
-        return Err(format!("取不到任何可用的校验文件：{}", errors.join("；")));
+        return Err(tf!("取不到任何可用的校验文件：{}", errors.join("；")));
     }
 
     // 先试校验和通过交叉核对的源；其余源排在后面，仍按同一份校验和验货。
@@ -957,7 +958,7 @@ fn apply_with_sources(
                 .map(|(_, sum)| sum.clone())
         });
         let Some(want) = want else {
-            errors.push(format!("{}：没有校验和", source.name));
+            errors.push(tf!("{}：没有校验和", source.name));
             continue;
         };
         for attempt in 0..2 {
@@ -973,7 +974,7 @@ fn apply_with_sources(
             match download(source, &tag, asset, &tmp, cancel, &mut progress) {
                 Ok(got) if got.eq_ignore_ascii_case(&want) => {
                     if let Err(e) = ensure_binary(&tmp) {
-                        errors.push(format!("{}：{e}", source.name));
+                        errors.push(tf!("{}：{e}", source.name));
                         continue;
                     }
                     mark_executable(&tmp)?;
@@ -995,7 +996,7 @@ fn apply_with_sources(
                     tracing::info!(%tag, source = %source.name, path = %exe.display(), "ells 已更新");
                     return Ok(());
                 }
-                Ok(got) => errors.push(format!(
+                Ok(got) => errors.push(tf!(
                     "{}：SHA256 校验不通过（期望 {}…，实到 {}…）",
                     source.name,
                     &want[..12],
@@ -1005,12 +1006,12 @@ fn apply_with_sources(
                     let _ = std::fs::remove_file(&tmp);
                     return Err("已取消下载".to_string());
                 }
-                Err(e) => errors.push(format!("{}：{e}", source.name)),
+                Err(e) => errors.push(tf!("{}：{e}", source.name)),
             }
         }
     }
     let _ = std::fs::remove_file(&tmp);
-    Err(format!("所有更新源都没能完成下载：{}", errors.join("；")))
+    Err(tf!("所有更新源都没能完成下载：{}", errors.join("；")))
 }
 
 /// 并行取最多 4 份校验文件（前三个源 + 官方直连），用来交叉核对。
@@ -1046,14 +1047,14 @@ fn fetch_sum_from(source: &Source, tag: &str, asset: &str) -> Result<String, Str
     let mut res = agent(Duration::from_secs(8))
         .get(&url)
         .call()
-        .map_err(|e| format!("取校验文件失败：{}", net_msg(&e)))?;
+        .map_err(|e| tf!("取校验文件失败：{}", net_msg(&e)))?;
     let mut text = String::new();
     res.body_mut()
         .as_reader()
         .take(1 << 20)
         .read_to_string(&mut text)
-        .map_err(|e| format!("读取校验文件失败：{e}"))?;
-    sha_from_sums(&text, asset).ok_or_else(|| format!("校验文件里没有 {asset} 这一项"))
+        .map_err(|e| tf!("读取校验文件失败：{e}"))?;
+    sha_from_sums(&text, asset).ok_or_else(|| tf!("校验文件里没有 {asset} 这一项"))
 }
 
 /// 选一份可信的校验和：
@@ -1068,7 +1069,7 @@ fn choose_checksums(
     for (source, res) in fetched {
         match res {
             Ok(sum) => ok.push((source.clone(), sum.clone())),
-            Err(e) => errors.push(format!("{}：{e}", source.name)),
+            Err(e) => errors.push(tf!("{}：{e}", source.name)),
         }
     }
     let strict = ok
@@ -1095,21 +1096,21 @@ fn fetch_sum(tag: &str, asset: &str) -> Result<String, String> {
     let (strict, per_source, errors) = choose_checksums(&fetched);
     strict
         .or_else(|| per_source.first().map(|(_, sum)| sum.clone()))
-        .ok_or_else(|| format!("取不到校验文件：{}", errors.join("；")))
+        .ok_or_else(|| tf!("取不到校验文件：{}", errors.join("；")))
 }
 
 /// 内容必须像本平台的二进制，别把镜像的错误页 / 压缩包 / 别的平台版本装上去。
 fn ensure_binary(path: &Path) -> Result<(), String> {
     let len = std::fs::metadata(path)
-        .map_err(|e| format!("读不到下载文件：{e}"))?
+        .map_err(|e| tf!("读不到下载文件：{e}"))?
         .len();
     if len < 64 * 1024 {
-        return Err(format!("下载内容只有 {len} 字节，不像完整的可执行文件"));
+        return Err(tf!("下载内容只有 {len} 字节，不像完整的可执行文件"));
     }
-    let mut file = std::fs::File::open(path).map_err(|e| format!("打不开下载文件：{e}"))?;
+    let mut file = std::fs::File::open(path).map_err(|e| tf!("打不开下载文件：{e}"))?;
     let mut magic = [0u8; 4];
     file.read_exact(&mut magic)
-        .map_err(|e| format!("读取下载文件头失败：{e}"))?;
+        .map_err(|e| tf!("读取下载文件头失败：{e}"))?;
     let ok = if cfg!(windows) {
         &magic[..2] == b"MZ"
     } else if cfg!(target_os = "macos") {
@@ -1125,7 +1126,7 @@ fn ensure_binary(path: &Path) -> Result<(), String> {
         magic == *b"\x7fELF"
     };
     if !ok {
-        return Err(format!(
+        return Err(tf!(
             "下载到的不是本平台的二进制（文件头 {:02x?}），可能是镜像的错误页",
             magic
         ));
@@ -1146,13 +1147,13 @@ fn download(
     let mut res = agent(Duration::from_secs(30))
         .get(&url)
         .call()
-        .map_err(|e| format!("下载失败：{}", net_msg(&e)))?;
+        .map_err(|e| tf!("下载失败：{}", net_msg(&e)))?;
     let total = res.body().content_length();
     if cancel.load(Ordering::Relaxed) {
         return Err("已取消下载".to_string());
     }
     let mut file = std::fs::File::create(tmp)
-        .map_err(|e| format!("无法在 {} 创建临时文件：{e}", tmp.display()))?;
+        .map_err(|e| tf!("无法在 {} 创建临时文件：{e}", tmp.display()))?;
     let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
     let mut reader = res.body_mut().as_reader();
     let mut buf = [0u8; 64 * 1024];
@@ -1166,13 +1167,13 @@ fn download(
         }
         let n = reader
             .read(&mut buf)
-            .map_err(|e| format!("下载中断：{e}"))?;
+            .map_err(|e| tf!("下载中断：{e}"))?;
         if n == 0 {
             break;
         }
         ctx.update(&buf[..n]);
         file.write_all(&buf[..n])
-            .map_err(|e| format!("写入临时文件失败：{e}"))?;
+            .map_err(|e| tf!("写入临时文件失败：{e}"))?;
         done += n as u64;
         since_report += n as u64;
         if since_report >= 256 * 1024 {
@@ -1180,10 +1181,10 @@ fn download(
             since_report = 0;
         }
     }
-    file.flush().map_err(|e| format!("写入临时文件失败：{e}"))?;
+    file.flush().map_err(|e| tf!("写入临时文件失败：{e}"))?;
     drop(file);
     if total.is_some_and(|expect| expect != done) {
-        return Err(format!(
+        return Err(tf!(
             "下载不完整（收到 {done}/{} 字节），已放弃替换",
             total.unwrap_or(done)
         ));
@@ -1197,7 +1198,7 @@ fn download(
 fn mark_executable(path: &Path) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
-        .map_err(|e| format!("无法给下载文件加执行权限：{e}"))
+        .map_err(|e| tf!("无法给下载文件加执行权限：{e}"))
 }
 
 #[cfg(not(unix))]
@@ -1214,7 +1215,7 @@ fn install_in_place(exe: &Path, tmp: &Path) -> Result<(), String> {
     let old = old_path(exe);
     let _ = std::fs::remove_file(&old);
     std::fs::rename(exe, &old).map_err(|e| {
-        format!(
+        tf!(
             "无法挪开正在运行的 {}：{e}（Windows 偶发占用，稍后重试即可）",
             exe.display()
         )
@@ -1228,12 +1229,12 @@ fn install_in_place(exe: &Path, tmp: &Path) -> Result<(), String> {
 
 fn replace_err(exe: &Path, e: &std::io::Error) -> String {
     if e.kind() == std::io::ErrorKind::PermissionDenied || e.raw_os_error() == Some(5) {
-        format!(
+        tf!(
             "没有权限替换 {}：该目录需要管理员/root 权限，请用安装脚本（或 sudo）更新",
             exe.display()
         )
     } else {
-        format!("替换 {} 失败：{e}", exe.display())
+        tf!("替换 {} 失败：{e}", exe.display())
     }
 }
 
@@ -1298,7 +1299,7 @@ pub fn restart() -> Result<(), String> {
         use std::os::unix::process::CommandExt;
         // exec 成功则永不返回；返回即失败
         let err = cmd.exec();
-        Err(format!(
+        Err(tf!(
             "新版本启动失败：{err}（请手动运行 {}）",
             exe.display()
         ))
@@ -1317,7 +1318,7 @@ pub fn restart() -> Result<(), String> {
                 println!("新版本已在新标签/新窗口里打开，本标签交还给 shell。");
                 Ok(())
             }
-            Err(e) => Err(format!(
+            Err(e) => Err(tf!(
                 "新版本启动失败：{e}（请手动运行 {}）",
                 exe.display()
             )),

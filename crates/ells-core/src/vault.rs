@@ -1,4 +1,5 @@
 use anyhow::{anyhow, bail, Context, Result};
+use ells_lang::{t, tf};
 use argon2::{Algorithm, Argon2, Params, Version};
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
@@ -140,13 +141,13 @@ impl std::fmt::Debug for VaultKey {
 fn check_header(bytes: &[u8]) -> Result<([u8; SALT_LEN], &[u8], &[u8])> {
     let min_len = MAGIC.len() + 1 + SALT_LEN + NONCE_LEN + 16;
     if bytes.len() < min_len {
-        bail!("保险库文件不完整或已损坏");
+        bail!("{}", tf!("保险库文件不完整或已损坏"));
     }
     if &bytes[..MAGIC.len()] != MAGIC {
-        bail!("不是 ells 保险库文件");
+        bail!("{}", tf!("不是 ells 保险库文件"));
     }
     if bytes[MAGIC.len()] != FORMAT_VERSION {
-        bail!("不支持的保险库格式版本");
+        bail!("{}", tf!("不支持的保险库格式版本"));
     }
     let mut salt = [0u8; SALT_LEN];
     salt.copy_from_slice(&bytes[MAGIC.len() + 1..MAGIC.len() + 1 + SALT_LEN]);
@@ -161,16 +162,16 @@ fn decode_with_key(all: &[u8], key: &[u8; KEY_LEN]) -> Result<Vault> {
     let nonce = XNonce::from_slice(nonce_bytes);
     let plaintext = cipher
         .decrypt(nonce, ct)
-        .map_err(|_| anyhow!("主密码错误或保险库已损坏"))?;
-    let text = String::from_utf8(plaintext).context("保险库内容不是有效文本")?;
-    let vault: Vault = toml::from_str(&text).context("保险库内容格式错误")?;
+        .map_err(|_| anyhow!("{}", tf!("主密码错误或保险库已损坏")))?;
+    let text = String::from_utf8(plaintext).context(t("保险库内容不是有效文本"))?;
+    let vault: Vault = toml::from_str(&text).context(t("保险库内容格式错误"))?;
     Ok(vault)
 }
 
 /// Derive a fresh key (random salt) for a brand-new vault.
 pub fn create_vault_key(master: &str) -> Result<VaultKey> {
     if master.is_empty() {
-        bail!("主密码不能为空");
+        bail!("{}", tf!("主密码不能为空"));
     }
     let mut salt = [0u8; SALT_LEN];
     rand::rngs::OsRng.fill_bytes(&mut salt);
@@ -180,14 +181,14 @@ pub fn create_vault_key(master: &str) -> Result<VaultKey> {
 
 /// Encrypt the vault under an already-derived key (reuses the key's salt).
 pub fn store_vault_key(vault: &Vault, path: &Path, vk: &VaultKey) -> Result<()> {
-    let plaintext = toml::to_string_pretty(vault).context("序列化保险库失败")?;
+    let plaintext = toml::to_string_pretty(vault).context(t("序列化保险库失败"))?;
     let mut nonce_bytes = [0u8; NONCE_LEN];
     rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
     let cipher = XChaCha20Poly1305::new(Key::from_slice(&vk.key));
     let nonce = XNonce::from_slice(&nonce_bytes);
     let ct = cipher
         .encrypt(nonce, plaintext.as_bytes())
-        .map_err(|e| anyhow!("保险库加密失败: {e}"))?;
+        .map_err(|e| anyhow!("{}", tf!("保险库加密失败: {e}")))?;
     let mut blob = Vec::with_capacity(MAGIC.len() + 1 + SALT_LEN + NONCE_LEN + ct.len());
     blob.extend_from_slice(MAGIC);
     blob.push(FORMAT_VERSION);
@@ -226,7 +227,7 @@ pub fn unlock_vault(master: &str) -> Result<(Vault, VaultKey)> {
 pub fn create_vault(master: &str, vault: &Vault) -> Result<()> {
     let path = vault_path()?;
     if path.exists() {
-        bail!("保险库已存在于 {}", path.display());
+        bail!("{}", tf!("保险库已存在于 {}", path.display()));
     }
     let vk = create_vault_key(master)?;
     store_vault_key(vault, &path, &vk)

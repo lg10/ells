@@ -1,0 +1,30 @@
+//! 由 .tmp_missing.tsv 生成：键 = 源码原句，值 = 英文。
+
+pub static ENTRIES: &[(&str, &str)] = &[
+    (" Esc / q / ? / F1 关闭", " Esc / q / ? / F1 closes"),
+    (" ↑↓ 选择 · 回车 操作 · Tab/p 切页 · a 含已停止 · r 刷新 · c 复制 · Esc 关闭 ", " ↑↓ select · Enter act · Tab/p page · a incl. stopped · r refresh · c copy · Esc close "),
+    (" ↑↓/jk 滚动 · PgDn/空格 下一页 · Esc/q/? 关闭（第 {} 屏）", " ↑↓/jk scroll · PgDn/Space next page · Esc/q/? close (page {})"),
+    (" ● 已连接（Enter 或点顶部标签切回那一格）· ○ 正在连接 · 断开用 {}（只断这一格） ", " ● connected (Enter or click the tab to switch back) · ○ connecting · {} disconnects (this tab only) "),
+    (" 主机 (共 {} · 命中 {}/{} · 过滤 {}) ", " Hosts ({} total · {}/{} matched · filter {}) "),
+    (" 主机 (共 {} · 排序 {}{}) ", " Hosts ({} total · sorted {}{}) "),
+    (" 还没有会话记录（连上一台就会开始写） ", " No session logs yet (they start as soon as you connect) "),
+    (" 退出", " Quit"),
+    ("{} 切模式 · {} 文件 · {} 重绘 · {} 搜索 · {} 新标签 · {}/{} 切换 · {} 关闭标签 · {} 列表", "{} mode · {} files · {} redraw · {} search · {} new tab · {}/{} switch · {} close tab · {} list"),
+    ("传输进度 ({}/{})", "Transfer ({}/{})"),
+
+    ("空标签", "empty tab"),
+    ("绑定地址", "bind address"),
+    ("类型", "type"),
+    ("绑定", "bind"),
+    ("本地端口", "local port"),
+    ("主机密钥", "host key"),
+    ("深色（画死底色）", "Dark (hard-coded background)"),
+    ("跟随终端（不画底色）", "Follow terminal (no background)"),
+    ("高对比", "High contrast"),
+    ("浅色底", "Light background"),
+    ("这个文件不是 UTF-8 文本，内置编辑器不能安全保存", "This file is not UTF-8 text; the built-in editor cannot save it safely"),
+    ("端口必须是 1-65535 的数字", "Port must be a number from 1 to 65535"),
+    ("这行不需要补全", "Nothing to complete on this line"),
+    ("{}（{}:{}）", "{} ({}:{})"),
+    ("ells 子命令", "ells subcommands"),
+];

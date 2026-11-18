@@ -1,9 +1,15 @@
 [workspace]
 resolver = "2"
-members = ["crates/ells-core", "crates/ells-term", "crates/ells-transfer", "crates/ells"]
+members = [
+    "crates/ells-core",
+    "crates/ells-term",
+    "crates/ells-transfer",
+    "crates/ells-lang",
+    "crates/ells",
+]
 
 [workspace.package]
-version = "0.2.13"
+version = "0.3.0"
 edition = "2024"
 license = "MIT"
 
@@ -32,6 +38,7 @@ vt100 = "0.16"
 ells-core = { path = "crates/ells-core" }
 ells-term = { path = "crates/ells-term" }
 ells-transfer = { path = "crates/ells-transfer" }
+ells-lang = { path = "crates/ells-lang" }
 
 [profile.release]
 lto = "thin"

@@ -9,6 +9,7 @@
 //! - **防注入**：所有自由文本先压掉换行，避免一条 `note` 伪造出第二行审计记录。
 //! - **有上限**：超过 `MAX_BYTES` 就丢掉前半，日志不能无限吃掉用户磁盘。
 
+use ells_lang::t;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -74,7 +75,7 @@ pub fn audit_path() -> Option<PathBuf> {
 
 /// 记一条审计。写失败不影响主流程——调用方 `let _ = record(...)`。
 pub fn record(kind: AuditKind, subject: &str, detail: &str) -> std::io::Result<()> {
-    let path = audit_path().ok_or_else(|| std::io::Error::other("无法定位用户主目录"))?;
+    let path = audit_path().ok_or_else(|| std::io::Error::other(t("无法定位用户主目录")))?;
     record_at(&path, kind, &now(), subject, detail)
 }
 
@@ -153,7 +154,7 @@ fn now() -> String {
 }
 
 fn beijing(instant: DateTime<Utc>) -> String {
-    let offset = FixedOffset::east_opt(8 * 3600).expect("+08:00 恒有效");
+    let offset = FixedOffset::east_opt(8 * 3600).expect(t("+08:00 恒有效"));
     instant.with_timezone(&offset).to_rfc3339_opts(SecondsFormat::Secs, false)
 }
 

@@ -1,4 +1,5 @@
 use anyhow::Result;
+use ells_lang::{t, tf};
 use crossterm::event::{
     EnableBracketedPaste, EnableMouseCapture, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
     MouseButton as CtMouseButton, MouseEventKind as CtMouseEventKind,
@@ -123,10 +124,10 @@ impl ListSort {
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Grouped => "默认",
-            Self::Recent => "最近使用",
-            Self::Alias => "别名",
-            Self::Section => "分组",
+            Self::Grouped => t("默认"),
+            Self::Recent => t("最近使用"),
+            Self::Alias => t("别名"),
+            Self::Section => t("分组"),
         }
     }
 
@@ -411,7 +412,7 @@ pub(crate) fn rules_to_forwards(rows: &[RuleRow]) -> (Vec<Forward>, Vec<String>)
         let n = i + 1;
         let kind = r.kind.trim().to_ascii_uppercase();
         if !matches!(kind.as_str(), "L" | "D" | "R") {
-            bad.push(format!("第 {n} 行：类型只能是 L、D 或 R"));
+            bad.push(tf!("第 {n} 行：类型只能是 L、D 或 R"));
             continue;
         }
         let listen = match r.listen.trim() {
@@ -419,7 +420,7 @@ pub(crate) fn rules_to_forwards(rows: &[RuleRow]) -> (Vec<Forward>, Vec<String>)
             other => match other.parse::<u16>() {
                 Ok(p) => p,
                 Err(_) => {
-                    bad.push(format!("第 {n} 行：本地端口要么留空（自动分配），要么写成数字"));
+                    bad.push(tf!("第 {n} 行：本地端口要么留空（自动分配），要么写成数字"));
                     continue;
                 }
             },
@@ -431,7 +432,7 @@ pub(crate) fn rules_to_forwards(rows: &[RuleRow]) -> (Vec<Forward>, Vec<String>)
             other => match other.parse::<u16>() {
                 Ok(p) => Some(p),
                 Err(_) => {
-                    bad.push(format!("第 {n} 行：目标端口要写成数字"));
+                    bad.push(tf!("第 {n} 行：目标端口要写成数字"));
                     continue;
                 }
             },
@@ -442,13 +443,13 @@ pub(crate) fn rules_to_forwards(rows: &[RuleRow]) -> (Vec<Forward>, Vec<String>)
         }
         let mut missing: Vec<&str> = Vec::new();
         if dest_host.is_empty() {
-            missing.push("目标主机");
+            missing.push(t("目标主机"));
         }
         if dest_port.is_none() {
-            missing.push("目标端口");
+            missing.push(t("目标端口"));
         }
         if !missing.is_empty() {
-            bad.push(format!("第 {n} 行：{}不能空着", missing.join("、")));
+            bad.push(tf!("第 {n} 行：{}不能空着", missing.join(t("、"))));
             continue;
         }
         let (dest_host, dest_port) = (dest_host, dest_port.unwrap());
@@ -469,7 +470,7 @@ pub(crate) fn row_clash_text(rows: &[RuleRow], hosts: &[Host], alias: &str, idx:
     let mut names: Vec<String> = Vec::new();
     for (i, r) in rows.iter().enumerate() {
         if i != idx && r.port() == Some(port) {
-            names.push(format!("本表第 {} 行", i + 1));
+            names.push(tf!("本表第 {} 行", i + 1));
         }
     }
     for h in hosts {
@@ -480,7 +481,7 @@ pub(crate) fn row_clash_text(rows: &[RuleRow], hosts: &[Host], alias: &str, idx:
     if names.is_empty() {
         String::new()
     } else {
-        format!("⚠ 与 {} 同用 {port} — 留空本地口即可自动分配", names.join("、"))
+        tf!("⚠ 与 {} 同用 {port} — 留空本地口即可自动分配", names.join(t("、")))
     }
 }
 
@@ -774,8 +775,8 @@ pub struct ProcPopup {
 impl ProcPopup {
     pub fn title(&self) -> &'static str {
         match self.kind {
-            ells_core::ProcSort::Cpu => " CPU 占用排行 ",
-            ells_core::ProcSort::Mem => " 内存占用排行 ",
+            ells_core::ProcSort::Cpu => t(" CPU 占用排行 "),
+            ells_core::ProcSort::Mem => t(" 内存占用排行 "),
         }
     }
 }
@@ -982,7 +983,7 @@ impl Slot {
         self.session
             .as_ref()
             .map(|s| s.label.clone())
-            .unwrap_or_else(|| "空标签".to_string())
+            .unwrap_or_else(|| t("空标签").to_string())
     }
 }
 
@@ -1092,7 +1093,7 @@ impl UpdateState {
 
     /// 顶部徽标文案。绘制与命中测试共用这一份，宽度才不会两边算得不一致。
     pub fn badge(&self) -> Option<String> {
-        self.latest.as_ref().map(|tag| format!("【{tag} 可更新】"))
+        self.latest.as_ref().map(|tag| tf!("【{tag} 可更新】"))
     }
 
     /// 重新开始一轮下载：取消位必须是新的，否则下一次一点就"已取消"。
@@ -1325,7 +1326,11 @@ fn pseudo_spread() -> f64 {
 
 /// 这次失败是不是卡在主机密钥上（我们自己打的文案 + russh 的文案）。
 fn key_trouble(err: &str) -> bool {
-    err.contains("主机密钥") || err.contains("server key") || err.contains("known_hosts")
+    // 错误串按当前语言打出，中文和英文两种说法都要认
+    err.contains("主机密钥")
+        || err.contains(t("主机密钥"))
+        || err.contains("server key")
+        || err.contains("known_hosts")
 }
 
 /// 分组排序权重：有名字的组合并同类、按名字排，没分组的恒排最后。
@@ -1559,7 +1564,7 @@ impl App {
         if dev {
             let mut app = base;
             app.vault = vault::load_dev_vault().unwrap_or_default();
-            app.status = Some("开发模式：读取 ~/.ells/hosts.dev.toml".to_string());
+            app.status = Some(t("开发模式：读取 ~/.ells/hosts.dev.toml").to_string());
             app.pending_unlock_action = true;
             return app;
         }
@@ -1582,7 +1587,7 @@ impl App {
                 tokio::spawn(async move {
                     let res = tokio::task::spawn_blocking(move || vault::unlock_vault(&master))
                         .await
-                        .map_err(|e| format!("后台任务异常: {e}"))
+                        .map_err(|e| tf!("后台任务异常: {e}"))
                         .and_then(|r| r.map_err(|e| e.to_string()));
                     let _ = tx.send(AppEvent::VaultUnlocked(res));
                 });
@@ -1771,14 +1776,14 @@ impl App {
                         let _ = audit::record(
                             AuditKind::Disconnect,
                             alias,
-                            if graceful { "远端退出" } else { "连接断开" },
+                            if graceful { t("远端退出") } else { t("连接断开") },
                         );
                     }
                     if let Some(mut lg) = self.slots[self.work].log.take() {
                         lg.note(if graceful {
-                            "会话结束 · 远端退出"
+                            t("会话结束 · 远端退出")
                         } else {
-                            "会话结束 · 连接断开"
+                            t("会话结束 · 连接断开")
                         });
                     }
                     let label = if let Some(mut s) = self.slots[self.work].session.take() {
@@ -1810,7 +1815,7 @@ impl App {
                     slot.vi_pending = None;
                     slot.vi_line.clear();
                     if let Some(label) = label {
-                        slot.status = Some(format!("[{label}] 会话已结束"));
+                        slot.status = Some(tf!("[{label}] 会话已结束"));
                     }
                     if self.work == self.active {
                         // 用户正在看这一路：回到列表并（非主动断开时）提供重连
@@ -1917,7 +1922,7 @@ impl App {
                                 self.settings.save();
                                 self.unlock.input.clear();
                                 self.unlock.error =
-                                    Some("自动解锁失败，已恢复主密码保护，请输入主密码".to_string());
+                                    Some(t("自动解锁失败，已恢复主密码保护，请输入主密码").to_string());
                             } else {
                                 self.unlock.error = Some(msg);
                                 self.unlock.input.clear();
@@ -1957,11 +1962,11 @@ impl App {
                             if !self.settings.master_password_enabled {
                                 let _ = crate::settings::write_master_backup(new_master.as_str());
                             }
-                            self.status = Some("主密码已修改，下次启动用新密码".to_string());
-                            let _ = audit::record(AuditKind::MasterPassword, "vault", "主密码已修改");
+                            self.status = Some(t("主密码已修改，下次启动用新密码").to_string());
+                            let _ = audit::record(AuditKind::MasterPassword, "vault", t("主密码已修改"));
                         }
                         Err(msg) => {
-                            self.status = Some(format!("修改主密码失败：{msg}"));
+                            self.status = Some(tf!("修改主密码失败：{msg}"));
                         }
                     }
                 }
@@ -1972,7 +1977,7 @@ impl App {
                         Some(p) => self.start_upload(PathBuf::from(p), from_rz),
                         None => {
                             self.slots[self.work].status =
-                                Some("已取消上传（未选择文件）".to_string());
+                                Some(t("已取消上传（未选择文件）").to_string());
                             self.slots[self.work].upload_dest = None;
                             self.release_rz_hold();
                         }
@@ -1991,7 +1996,7 @@ impl App {
                         }
                         None => {
                             self.slots[self.work].status =
-                                Some("已取消下载（未选择保存位置）".to_string());
+                                Some(t("已取消下载（未选择保存位置）").to_string());
                         }
                     }
                     self.replay_pending_zmodem();
@@ -2002,7 +2007,7 @@ impl App {
                         Some(p) => self.start_upload(PathBuf::from(p), false),
                         None => {
                             self.slots[self.work].status =
-                                Some("已取消上传（未选择目录）".to_string());
+                                Some(t("已取消上传（未选择目录）").to_string());
                             self.slots[self.work].upload_dest = None;
                         }
                     }
@@ -2020,7 +2025,7 @@ impl App {
                         }
                         None => {
                             self.slots[self.work].status =
-                                Some("已取消下载（未选择保存目录）".to_string());
+                                Some(t("已取消下载（未选择保存目录）").to_string());
                         }
                     }
                     self.replay_pending_zmodem();
@@ -2070,7 +2075,7 @@ impl App {
                     }
                     Err(err) => {
                         self.slots[self.work].status =
-                            Some(format!("无法解析远端目录: {err}"));
+                            Some(tf!("无法解析远端目录: {err}"));
                         // 目录拿不到就别让 pending 状态过夜，否则会串到下一次 sz/rz
                         self.slots[self.work].rz_pending = false;
                         self.slots[self.work].sz_pending.clear();
@@ -2149,9 +2154,9 @@ impl App {
                                 item.done = true;
                                 item.direction.to_string()
                             } else {
-                                "传输".to_string()
+                                t("传输").to_string()
                             };
-                            slot.status = Some(format!("{dir}完成：{label}"));
+                            slot.status = Some(tf!("{dir}完成：{label}"));
                             let _ = audit::record(AuditKind::Transfer, &label, &dir);
                         }
                         Err((label, msg)) => {
@@ -2164,7 +2169,7 @@ impl App {
                                 item.done = true;
                                 item.error = Some(msg.clone());
                             }
-                            let _ = audit::record(AuditKind::Transfer, &label, &format!("失败：{msg}"));
+                            let _ = audit::record(AuditKind::Transfer, &label, &tf!("失败：{msg}"));
                             slot.status = Some(msg);
                         }
                     }
@@ -2207,9 +2212,9 @@ impl App {
                                 let save = edit_key_hint('s');
                                 let quit = edit_key_hint('q');
                                 slot.status = Some(if new_file {
-                                    format!("新建 {name} · {save} 保存并创建远端文件 · {quit} 退出")
+                                    tf!("新建 {name} · {save} 保存并创建远端文件 · {quit} 退出")
                                 } else {
-                                    format!("已取回 {name} · {save} 保存并回传 · {quit} 退出")
+                                    tf!("已取回 {name} · {save} 保存并回传 · {quit} 退出")
                                 });
                             }
                             Err(err) => {
@@ -2219,12 +2224,12 @@ impl App {
                         }
                     } else {
                         slot.status = Some(if new_file {
-                            format!(
+                            tf!(
                                 "新建 {name} · 在本地编辑器里保存后创建远端文件（临时文件 {}）",
                                 local.display()
                             )
                         } else {
-                            format!(
+                            tf!(
                                 "已取回 {name} · 在本地编辑器里保存后自动回传（临时文件 {}）",
                                 local.display()
                             )
@@ -2268,7 +2273,7 @@ impl App {
                                 local.clone(),
                                 edit.remote_mtime,
                             ));
-                            slot.status = Some(format!("正在回传 {}…", remote_name(&remote)));
+                            slot.status = Some(tf!("正在回传 {}…", remote_name(&remote)));
                         } else {
                             // 连接没了：这一笔传不出去，别让会话永远挂在"保存中"。
                             edit.awaiting_save = false;
@@ -2299,20 +2304,20 @@ impl App {
                     let tx = self.event_tx.clone();
                     let name = remote_name(&remote);
                     let when = match (remote_mtime, current_mtime) {
-                        (Some(a), Some(b)) => format!("远端 {a} → {b}（Unix 秒）"),
-                        _ => "远端修改时间已变化".to_string(),
+                        (Some(a), Some(b)) => tf!("远端 {a} → {b}（Unix 秒）"),
+                        _ => t("远端修改时间已变化").to_string(),
                     };
                     let remote_for_cb = remote.clone();
                     let local_for_cb = local.clone();
                     self.choice = Some(Choice {
-                        title: "远端文件已改动".to_string(),
+                        title: t("远端文件已改动").to_string(),
                         lines: vec![
                             remote.clone(),
-                            format!("{name} 在你编辑期间被改过：{when}。"),
-                            "继续保存会覆盖远端的新内容；取消则保留远端，你的改动仍在本地临时文件里。"
+                            tf!("{name} 在你编辑期间被改过：{when}。"),
+                            t("继续保存会覆盖远端的新内容；取消则保留远端，你的改动仍在本地临时文件里。")
                                 .to_string(),
                         ],
-                        options: vec!["覆盖远端".to_string(), "取消".to_string()],
+                        options: vec![t("覆盖远端").to_string(), t("取消").to_string()],
                         selected: 1,
                         shortcuts: &[('y', 0), ('n', 1)],
                         danger: true,
@@ -2334,7 +2339,7 @@ impl App {
                                     slot: slot_id,
                                     remote: remote_for_cb,
                                     local: local_for_cb,
-                                    res: Err("已取消写回：远端内容未被覆盖".to_string()),
+                                    res: Err(t("已取消写回：远端内容未被覆盖").to_string()),
                                 });
                             }
                         }),
@@ -2371,8 +2376,8 @@ impl App {
                     }
                     let name = remote_name(&remote);
                     slot.status = Some(match &res {
-                        Ok(_) => format!("已写回远端：{name}"),
-                        Err(err) => format!("写回未完成：{err}"),
+                        Ok(_) => tf!("已写回远端：{name}"),
+                        Err(err) => tf!("写回未完成：{err}"),
                     });
                     // 内置面板没有文件监视，也没有别的重试路径：面板已关、这笔传完
                     // （成功或失败）就把会话收尾，否则之后手敲 vi 会一直撞上"正在编辑中"。
@@ -2405,7 +2410,7 @@ impl App {
                         .map(|e| e.local.clone());
                     if let Some(local) = local {
                         slot.edit = None;
-                        slot.status = Some(format!(
+                        slot.status = Some(tf!(
                             "编辑会话已结束（30 分钟没有保存）· 临时文件保留在 {}",
                             local.display()
                         ));
@@ -2423,9 +2428,9 @@ impl App {
                         let slot_id = slot.id;
                         if let Some(sftp) = sftp {
                             slot.status = Some(if new_file {
-                                format!("正在新建 {name}（编辑用）…")
+                                tf!("正在新建 {name}（编辑用）…")
                             } else {
-                                format!("正在取回 {name}（编辑用）…")
+                                tf!("正在取回 {name}（编辑用）…")
                             });
                             let tx = self.event_tx.clone();
                             spawn_local_edit(
@@ -2438,7 +2443,7 @@ impl App {
                                 new_file,
                             );
                         } else {
-                            slot.status = Some("连接已断开，无法取回文件".to_string());
+                            slot.status = Some(t("连接已断开，无法取回文件").to_string());
                         }
                     }
                 }
@@ -2450,7 +2455,7 @@ impl App {
                         if let Some(sess) = &mut slot.session {
                             sess.send_raw(b"\r");
                         }
-                        slot.status = Some(format!("内置编辑器没接管：{reason} · 已交给远端 vi"));
+                        slot.status = Some(tf!("内置编辑器没接管：{reason} · 已交给远端 vi"));
                     }
                 }
                 AppEvent::ViCompleted { seq, append, reason, .. } => {
@@ -2471,7 +2476,7 @@ impl App {
                                 if let Some(sess) = &mut slot.session {
                                     sess.send_raw(b"\t");
                                 }
-                                slot.status = Some(format!("{reason} · 这次交给远端补全"));
+                                slot.status = Some(tf!("{reason} · 这次交给远端补全"));
                             }
                         }
                     }
@@ -2774,7 +2779,7 @@ impl App {
                 let cwd = slot.remote_cwd.clone();
                 let slot_id = slot.id;
                 slot.vi_pending = Some(seq);
-                slot.status = Some("正在补全…".to_string());
+                slot.status = Some(t("正在补全…").to_string());
                 let tx = self.event_tx.clone();
                 tokio::spawn(async move {
                     let res = tokio::time::timeout(
@@ -2785,7 +2790,7 @@ impl App {
                     let (append, reason) = match res {
                         Ok(Ok(text)) => (Some(text), String::new()),
                         Ok(Err(err)) => (None, err),
-                        Err(_) => (None, "补全超时".to_string()),
+                        Err(_) => (None, t("补全超时").to_string()),
                     };
                     let _ = tx.send(AppEvent::ViCompleted { slot: slot_id, seq, append, reason });
                 });
@@ -2816,28 +2821,28 @@ impl App {
         let Some(target) = target else {
             // 回车被放行、但这行看着像 vi 命令：告诉用户是补全/光标动过，不是设置没生效。
             if let Some(name) = slot.vi_line.take_skipped() {
-                slot.status = Some(format!(
+                slot.status = Some(tf!(
                     "这行动过光标（↑↓ 历史等）或被补全过，内置编辑器不接管；{name} 交给远端 vi"
                 ));
             }
             return false;
         };
         if let Some(edit) = &slot.edit {
-            slot.status = Some(format!(
+            slot.status = Some(tf!(
                 "{} 正在编辑中，vi 命令已交给远端",
                 remote_name(&edit.remote)
             ));
             return false;
         }
         let Some(sftp) = slot.sftp.clone() else {
-            slot.status = Some(format!("这条连接没有 SFTP，{target} 交给远端 vi"));
+            slot.status = Some(tf!("这条连接没有 SFTP，{target} 交给远端 vi"));
             return false;
         };
         let seq = VI_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
         let cwd = slot.remote_cwd.clone();
         let slot_id = slot.id;
         slot.vi_pending = Some(seq);
-        slot.status = Some(format!("正在确认 {target}…"));
+        slot.status = Some(tf!("正在确认 {target}…"));
         let tx = self.event_tx.clone();
         tokio::spawn(async move {
             // 确认阶段卡住时（服务器不回声、通道失效）要能退回原生，不能一直吞按键。
@@ -2858,7 +2863,7 @@ impl App {
                 Err(_) => AppEvent::ViTargetFailed {
                     slot: slot_id,
                     seq,
-                    reason: "确认超时".to_string(),
+                    reason: t("确认超时").to_string(),
                 },
             };
             let _ = tx.send(ev);
@@ -2885,11 +2890,11 @@ impl App {
         let buffer = self.slots[self.work].search.as_ref().map(|s| s.query.clone()).unwrap_or_default();
         let tx = self.event_tx.clone();
         self.prompt = Some(Prompt {
-            title: "搜索历史输出".to_string(),
-            label: "关键词",
+            title: t("搜索历史输出").to_string(),
+            label: t("关键词"),
             buffer,
             error: None,
-            hint: Some("回车跳到首个命中 · n/N 下一条/上一条 · Esc 退出"),
+            hint: Some(t("回车跳到首个命中 · n/N 下一条/上一条 · Esc 退出")),
             allow_empty: true,
             on_done: Box::new(move |value| {
                 let _ = tx.send(AppEvent::Search { slot: slot_id, value });
@@ -2913,7 +2918,7 @@ impl App {
             .collect();
         if hits.is_empty() {
             slot.search = None;
-            slot.status = Some(format!("历史输出里没有「{query}」（共 {} 行）", lines.len()));
+            slot.status = Some(tf!("历史输出里没有「{query}」（共 {} 行）", lines.len()));
             return;
         }
         // 从当前视图往下找第一个命中，到底了再回头（与 less 的 / 一致）
@@ -3052,7 +3057,7 @@ impl App {
         if !self.remote_holds_screen() {
             return false;
         }
-        self.status = Some(format!(
+        self.status = Some(tf!(
             "直通模式下远端独占屏幕 · 先按 {} 回内嵌",
             self.settings.keybinds.display(Action::Passthrough)
         ));
@@ -3122,7 +3127,7 @@ impl App {
                     .as_ref()
                     .map(|h| h.alias.clone())
                     .unwrap_or_default();
-                self.status = Some(format!("「{alias}」正在连接…"));
+                self.status = Some(tf!("「{alias}」正在连接…"));
             }
             return;
         }
@@ -3134,7 +3139,7 @@ impl App {
         self.transfer_popup = false;
         let live = self.slots.iter().filter(|s| s.session.is_some()).count();
         self.status = if live > 0 {
-            Some(format!(
+            Some(tf!(
                 "{live} 路会话仍在后台运行 · 点击标签或选中该机按 Enter 切回去 · {} 新建标签",
                 self.settings.keybinds.display(Action::NewTab)
             ))
@@ -3156,9 +3161,9 @@ impl App {
                 let dialing = self.slots[idx].session.is_none();
                 self.focus_tab(idx);
                 self.status = Some(if dialing {
-                    format!("标签 {}「{}」正在连接…", idx + 1, host.alias)
+                    tf!("标签 {}「{}」正在连接…", idx + 1, host.alias)
                 } else {
-                    format!("已切到标签 {}「{}」", idx + 1, host.alias)
+                    tf!("已切到标签 {}「{}」", idx + 1, host.alias)
                 });
             }
             None => self.start_connect(host, None),
@@ -3211,7 +3216,7 @@ impl App {
             s.close();
         }
         if let Some(mut lg) = self.slots[self.active].log.take() {
-            lg.note("会话结束 · 关闭标签");
+            lg.note(t("会话结束 · 关闭标签"));
         }
         self.slots.remove(self.active);
         if self.slots.is_empty() {
@@ -3240,7 +3245,7 @@ impl App {
         let id = self.slots[self.active].id;
         if busy && self.close_tab_confirm != Some(id) {
             self.close_tab_confirm = Some(id);
-            self.status = Some(format!(
+            self.status = Some(tf!(
                 "该标签还在传输，再按一次 {} 确认断开",
                 self.settings.keybinds.display(Action::CloseTab)
             ));
@@ -3250,7 +3255,7 @@ impl App {
         if self.slots.len() > 1 {
             self.close_tab();
         } else {
-            self.detach_session("已返回列表");
+            self.detach_session(t("已返回列表"));
         }
     }
 
@@ -3438,7 +3443,7 @@ impl App {
             if self.update.downloading {
                 if hit(main_r, column, row) {
                     self.update.request_cancel();
-                    self.status = Some("正在取消下载…".to_string());
+                    self.status = Some(t("正在取消下载…").to_string());
                 }
             } else if hit(main_r, column, row) {
                 self.quit_for_restart();
@@ -3909,7 +3914,7 @@ impl App {
         }
         term::copy_osc52(&text);
         let n = text.chars().count();
-        self.slots[self.work].status = Some(format!("已复制 {n} 个字符（OSC 52 剪贴板）"));
+        self.slots[self.work].status = Some(tf!("已复制 {n} 个字符（OSC 52 剪贴板）"));
     }
 
     /// 滚轮：会话=回看历史；浏览器=移动选择（列表窗口跟随滚动）。
@@ -3998,7 +4003,7 @@ impl App {
     /// 顶部「上传」按钮 = rz 功能：解析远端当前目录后弹系统文件选择框。
     fn trigger_upload(&mut self) {
         if self.slots[self.work].sftp.is_none() {
-            self.slots[self.work].status = Some("该服务器不支持 SFTP 文件传输".to_string());
+            self.slots[self.work].status = Some(t("该服务器不支持 SFTP 文件传输").to_string());
             return;
         }
         if self.slots[self.work].remote_cwd.is_empty() {
@@ -4013,7 +4018,7 @@ impl App {
     /// 顶部「下载」按钮 = sz 功能：打开远端文件浏览器选择下载目标。
     fn trigger_download(&mut self) {
         if self.slots[self.work].sftp.is_none() {
-            self.slots[self.work].status = Some("该服务器不支持 SFTP 文件传输".to_string());
+            self.slots[self.work].status = Some(t("该服务器不支持 SFTP 文件传输").to_string());
             return;
         }
         self.slots[self.work].sz_pick_mode = true;
@@ -4137,7 +4142,7 @@ impl App {
                 Ok::<_, anyhow::Error>((vk, new_master))
             })
             .await
-            .map_err(|e| format!("后台任务异常: {e}"))
+            .map_err(|e| tf!("后台任务异常: {e}"))
             .and_then(|r| r.map_err(|e| e.to_string()));
             let _ = tx.send(AppEvent::MasterRotated(res));
         });
@@ -4145,7 +4150,7 @@ impl App {
 
     fn toggle_master_setting(&mut self) {
         if self.master_secret.is_none() {
-            self.status = Some("开发模式（--dev）没有主密码，无法开关保护".to_string());
+            self.status = Some(t("开发模式（--dev）没有主密码，无法开关保护").to_string());
             return;
         }
         self.settings.master_password_enabled = !self.settings.master_password_enabled;
@@ -4154,7 +4159,7 @@ impl App {
 
     fn begin_master_change(&mut self) {
         if self.master_secret.is_none() {
-            self.status = Some("开发模式（--dev）没有主密码".to_string());
+            self.status = Some(t("开发模式（--dev）没有主密码").to_string());
             return;
         }
         self.mp_stage = MpStage::First;
@@ -4219,7 +4224,7 @@ impl App {
         tokio::spawn(async move {
             let res = tokio::task::spawn_blocking(update::check)
                 .await
-                .map_err(|e| format!("后台任务异常: {e}"))
+                .map_err(|e| tf!("后台任务异常: {e}"))
                 .and_then(|r| r);
             let _ = tx.send(AppEvent::UpdateChecked(res));
         });
@@ -4234,7 +4239,7 @@ impl App {
                 let fresh = self.update.latest.as_deref() != Some(tag.as_str());
                 self.update.latest = Some(tag.clone());
                 if fresh {
-                    self.status = Some(format!("发现新版本 {tag}，点顶部徽标即可更新"));
+                    self.status = Some(tf!("发现新版本 {tag}，点顶部徽标即可更新"));
                 }
             }
             Ok(None) => self.update.latest = None,
@@ -4258,22 +4263,22 @@ impl App {
         };
         if self.choice.is_some() {
             // 一次只弹一个模态框：已有弹窗时把这次意愿留在徽标上，不叠加
-            self.status = Some("请先处理当前弹窗，再点顶部徽标更新".to_string());
+            self.status = Some(t("请先处理当前弹窗，再点顶部徽标更新").to_string());
             return;
         }
-        let asset = update::asset_name().unwrap_or("对应平台的安装包");
+        let asset = update::asset_name().unwrap_or(t("对应平台的安装包"));
         let mut lines = vec![
-            format!("当前 v{} · 最新 {tag}", update::current_version()),
-            format!("将下载 {asset} 并替换 ells 自身（SHA256 校验不过不会替换）。"),
+            tf!("当前 v{} · 最新 {tag}", update::current_version()),
+            tf!("将下载 {asset} 并替换 ells 自身（SHA256 校验不过不会替换）。"),
         ];
         if self.slots.iter().any(|s| s.session.is_some() || s.connecting) {
-            lines.push("注意：有会话正在连接或已连着，重启后才能用新版本。".to_string());
+            lines.push(t("注意：有会话正在连接或已连着，重启后才能用新版本。").to_string());
         }
         let tx = self.event_tx.clone();
         self.choice = Some(Choice {
-            title: format!("更新到 {tag}"),
+            title: tf!("更新到 {tag}"),
             lines,
-            options: vec!["稍 后".to_string(), "更 新".to_string()],
+            options: vec![t("稍 后").to_string(), t("更 新").to_string()],
             selected: 1,
             shortcuts: &[('n', 0), ('y', 1)],
             danger: false,
@@ -4315,7 +4320,7 @@ impl App {
                 )
             })
             .await
-            .map_err(|e| format!("后台任务异常: {e}"))
+            .map_err(|e| tf!("后台任务异常: {e}"))
             .and_then(|r| r);
             let _ = tx.send(AppEvent::UpdateDone(res));
         });
@@ -4332,13 +4337,13 @@ impl App {
             Err(msg) => {
                 // 取消和失败分得开：用户自己按的取消不该写成"更新失败"
                 if self.update.cancel.load(Ordering::Relaxed) {
-                    self.status = Some(format!(
+                    self.status = Some(tf!(
                         "已取消下载，仍是 v{}",
                         update::current_version()
                     ));
                 } else {
                     self.update.error = Some(msg.clone());
-                    self.status = Some(format!("更新失败：{msg}"));
+                    self.status = Some(tf!("更新失败：{msg}"));
                 }
             }
         }
@@ -4349,7 +4354,7 @@ impl App {
         if self.update.downloading {
             if matches!(key.code, KeyCode::Esc | KeyCode::Char('c')) {
                 self.update.request_cancel();
-                self.status = Some("正在取消下载…".to_string());
+                self.status = Some(t("正在取消下载…").to_string());
             }
             return;
         }
@@ -4362,7 +4367,7 @@ impl App {
     /// 关掉"已替换待重启"弹窗：新版本已经在盘上，只是这个进程还是旧的。
     fn dismiss_update(&mut self) {
         self.update.applied = false;
-        self.status = Some(format!(
+        self.status = Some(tf!(
             "已更新到新版本，重启 ells 后生效（当前仍是 v{}）",
             update::current_version()
         ));
@@ -4403,7 +4408,7 @@ impl App {
             // 录制态吞掉所有按键：Esc/Backspace 取消，其余尝试绑定
             if matches!(key.code, KeyCode::Esc | KeyCode::Backspace) {
                 self.keybinds_recording = None;
-                self.keybinds_msg = Some(format!("已取消修改「{}」", action.label()));
+                self.keybinds_msg = Some(tf!("已取消修改「{}」", action.label()));
                 return;
             }
             self.apply_binding(action, key);
@@ -4422,7 +4427,7 @@ impl App {
                     let action = Action::ALL[idx];
                     self.keybinds_recording = Some(action);
                     self.keybinds_msg =
-                        Some(format!("「{}」= {}", action.label(), self.settings.keybinds.display(action)));
+                        Some(tf!("「{}」= {}", action.label(), self.settings.keybinds.display(action)));
                 }
                 i if i == Action::ALL.len() => self.reset_keybinds(),
                 _ => self.close_keybinds(),
@@ -4436,7 +4441,7 @@ impl App {
     fn apply_binding(&mut self, action: Action, key: &KeyEvent) {
         self.keybinds_recording = None;
         let Some(chord) = Chord::from_event(key) else {
-            self.keybinds_msg = Some("请按功能键（F2–F9）或 Ctrl/Alt 组合键".to_string());
+            self.keybinds_msg = Some(t("请按功能键（F2–F9）或 Ctrl/Alt 组合键").to_string());
             return;
         };
         if let Some(reason) = chord.rejection() {
@@ -4446,21 +4451,21 @@ impl App {
         let swapped = self.settings.keybinds.bind(action, chord);
         self.settings.save();
         self.keybinds_msg = Some(match swapped {
-            Some(other) => format!(
+            Some(other) => tf!(
                 "「{}」= {}，与「{}」自动互换为 {}",
                 action.label(),
                 chord.display(),
                 other.label(),
                 self.settings.keybinds.display(other)
             ),
-            None => format!("「{}」= {}，已保存", action.label(), chord.display()),
+            None => tf!("「{}」= {}，已保存", action.label(), chord.display()),
         });
     }
 
     fn reset_keybinds(&mut self) {
         self.settings.keybinds.reset();
         self.settings.save();
-        self.keybinds_msg = Some("已恢复默认快捷键并保存".to_string());
+        self.keybinds_msg = Some(t("已恢复默认快捷键并保存").to_string());
     }
 
     fn save_settings(&mut self) {
@@ -4468,7 +4473,7 @@ impl App {
         let _ = audit::record(
             AuditKind::Settings,
             "settings",
-            &format!(
+            &tf!(
                 "主题={} 保活={}s 高亮={} 自动更新={} 会话记录={} 主机指标={} 自动重连={}次 vi打开={}",
                 self.settings.theme.ini_value(),
                 self.settings.keepalive_secs,
@@ -4489,7 +4494,7 @@ impl App {
             crate::settings::clear_master_backup();
         } else if let Some(master) = &self.master_secret {
             if let Err(err) = crate::settings::write_master_backup(master.as_str()) {
-                self.status = Some(format!("设置已保存，但免密凭据写入失败: {err}"));
+                self.status = Some(tf!("设置已保存，但免密凭据写入失败: {err}"));
                 self.settings_open = false;
                 self.keybinds_open = false;
                 self.reset_master_edit();
@@ -4501,7 +4506,7 @@ impl App {
         self.keybinds_recording = None;
         self.keybinds_msg = None;
         self.reset_master_edit();
-        self.status = Some("设置已保存（保活间隔对下次连接生效）".to_string());
+        self.status = Some(t("设置已保存（保活间隔对下次连接生效）").to_string());
     }
 
     fn cancel_settings(&mut self) {
@@ -4536,7 +4541,7 @@ impl App {
         };
         let slot = &mut self.slots[self.work];
         if let Some(mut lg) = slot.log.take() {
-            lg.note(&format!("会话结束 · {status}"));
+            lg.note(&tf!("会话结束 · {status}"));
         }
         // 主动断开：采集的那条链一起停掉，别让在途回包写进已经没有了的那一行
         slot.metrics.cancel();
@@ -4569,7 +4574,7 @@ impl App {
 
     fn open_browser(&mut self) {
         let Some(sftp) = self.slots[self.work].sftp.clone() else {
-            self.slots[self.work].status = Some("该服务器不支持 SFTP 文件传输".to_string());
+            self.slots[self.work].status = Some(t("该服务器不支持 SFTP 文件传输").to_string());
             return;
         };
         self.slots[self.work].browser.reset();
@@ -4581,7 +4586,7 @@ impl App {
             let res = sftp
                 .canonicalize(".")
                 .await
-                .map_err(|e| format!("无法解析远端目录: {e}"));
+                .map_err(|e| tf!("无法解析远端目录: {e}"));
             let _ = tx.send(AppEvent::SftpHome { slot, res });
         });
     }
@@ -4614,7 +4619,7 @@ impl App {
         tokio::spawn(async move {
             let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
             let path = tokio::task::spawn_blocking(move || {
-                crate::dialog::pick_file("选择要上传的文件", home, Vec::new())
+                crate::dialog::pick_file(t("选择要上传的文件"), home, Vec::new())
             })
             .await
             .ok()
@@ -4635,7 +4640,7 @@ impl App {
         tokio::spawn(async move {
             let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
             let path = tokio::task::spawn_blocking(move || {
-                crate::dialog::pick_directory("选择要上传的目录", home)
+                crate::dialog::pick_directory(t("选择要上传的目录"), home)
             })
             .await
             .ok()
@@ -4649,14 +4654,14 @@ impl App {
     fn start_upload(&mut self, local: PathBuf, from_rz: bool) {
         let rz = from_rz && self.slots[self.work].rz_hold;
         let Some(sftp) = self.slots[self.work].sftp.clone() else {
-            self.slots[self.work].status = Some("上传失败：该连接没有 SFTP 通道".to_string());
+            self.slots[self.work].status = Some(t("上传失败：该连接没有 SFTP 通道").to_string());
             if rz {
                 self.release_rz_hold();
             }
             return;
         };
         let Some(name) = local.file_name().map(|s| s.to_string_lossy().into_owned()) else {
-            self.slots[self.work].status = Some("无法解析所选文件名".to_string());
+            self.slots[self.work].status = Some(t("无法解析所选文件名").to_string());
             if rz {
                 self.release_rz_hold();
             }
@@ -4664,7 +4669,7 @@ impl App {
         };
         let dest = self.slots[self.work].upload_dest.take().unwrap_or_default();
         if dest.is_empty() {
-            self.slots[self.work].status = Some("上传失败：还不知道要传到哪个远端目录".to_string());
+            self.slots[self.work].status = Some(t("上传失败：还不知道要传到哪个远端目录").to_string());
             if rz {
                 self.release_rz_hold();
             }
@@ -4694,20 +4699,20 @@ impl App {
     fn begin_local_edit(&mut self, entry: FileEntry) {
         if self.slots[self.work].sz_pick_mode {
             self.slots[self.work].status =
-                Some("当前是在挑下载目标：按 Enter 另存为".to_string());
+                Some(t("当前是在挑下载目标：按 Enter 另存为").to_string());
             return;
         }
         let Some(sftp) = self.slots[self.work].sftp.clone() else {
-            self.slots[self.work].status = Some("该服务器不支持 SFTP 文件传输".to_string());
+            self.slots[self.work].status = Some(t("该服务器不支持 SFTP 文件传输").to_string());
             return;
         };
         if entry.is_dir {
             self.slots[self.work].status =
-                Some("目录不能直接编辑：进入目录后选中文件再按 e".to_string());
+                Some(t("目录不能直接编辑：进入目录后选中文件再按 e").to_string());
             return;
         }
         if let Some(edit) = &self.slots[self.work].edit {
-            self.slots[self.work].status = Some(format!(
+            self.slots[self.work].status = Some(tf!(
                 "{} 正在编辑中，保存后会自动回传",
                 remote_name(&edit.remote)
             ));
@@ -4715,7 +4720,7 @@ impl App {
         }
         let tx = self.event_tx.clone();
         let slot = self.slot_id();
-        self.slots[self.work].status = Some(format!("正在取回 {}（编辑用）…", entry.name));
+        self.slots[self.work].status = Some(tf!("正在取回 {}（编辑用）…", entry.name));
         spawn_local_edit(
             tx,
             slot,
@@ -4756,7 +4761,7 @@ impl App {
                 }
                 Some(crate::editor::ExAction::Unknown) => {
                     self.slots[self.work].status =
-                        Some("只认 :w / :wq / :q / :q!".to_string());
+                        Some(t("只认 :w / :wq / :q / :q!").to_string());
                 }
                 _ => {}
             }
@@ -4817,9 +4822,9 @@ impl App {
             .as_mut()
             .is_some_and(|ed| ed.copy_selection());
         self.slots[idx].status = Some(if copied {
-            "已复制选区到系统剪贴板".to_string()
+            t("已复制选区到系统剪贴板").to_string()
         } else {
-            format!("没有选中内容：拖选文本或按 {} 全选", edit_key_hint('a'))
+            tf!("没有选中内容：拖选文本或按 {} 全选", edit_key_hint('a'))
         });
     }
 
@@ -4844,7 +4849,7 @@ impl App {
         }
         match write {
             Ok(()) => {
-                self.slots[idx].status = Some(format!("正在回传 {}…", remote_name(&remote)));
+                self.slots[idx].status = Some(tf!("正在回传 {}…", remote_name(&remote)));
                 // 事件还没被处理：这段时间关面板不能把 slot.edit 丢掉（`:wq` 就是连着的）。
                 if let Some(edit) = self.slots[idx].edit.as_mut() {
                     edit.awaiting_save = true;
@@ -4857,7 +4862,7 @@ impl App {
                 });
             }
             Err(err) => {
-                self.slots[idx].status = Some(format!("保存到临时文件失败：{err}"));
+                self.slots[idx].status = Some(tf!("保存到临时文件失败：{err}"));
             }
         }
     }
@@ -4870,7 +4875,7 @@ impl App {
         let dirty = ed.dirty();
         if dirty && !ed.confirm_close {
             ed.confirm_close = true;
-            self.slots[idx].status = Some(format!(
+            self.slots[idx].status = Some(tf!(
                 "有未保存的改动：再按 {}（或 :q!）放弃并退出，或 {} / :w 保存",
                 edit_key_hint('q'),
                 edit_key_hint('s')
@@ -4890,11 +4895,11 @@ impl App {
             self.slots[idx].edit = None;
         }
         self.slots[idx].status = Some(if uploading {
-            format!("已关闭 {name}：最后一笔改动仍在回传")
+            tf!("已关闭 {name}：最后一笔改动仍在回传")
         } else if dirty {
-            format!("已关闭 {name}：改动未保存，远端未被修改")
+            tf!("已关闭 {name}：改动未保存，远端未被修改")
         } else {
-            format!("已关闭 {name}")
+            tf!("已关闭 {name}")
         });
     }
 
@@ -4941,7 +4946,7 @@ impl App {
         confirm_overwrite: bool,
     ) {
         let Some(sftp) = self.slots[self.work].sftp.clone() else {
-            self.slots[self.work].status = Some("该服务器不支持 SFTP 文件传输".to_string());
+            self.slots[self.work].status = Some(t("该服务器不支持 SFTP 文件传输").to_string());
             return;
         };
         let label = entry.name.clone();
@@ -4985,7 +4990,7 @@ impl App {
     /// 类型未知时（sz 只给了路径）先在后台查一次远端元数据。
     fn open_pick_target(&mut self, entry: FileEntry) {
         let Some(sftp) = self.slots[self.work].sftp.clone() else {
-            self.slots[self.work].status = Some("该服务器不支持 SFTP 文件传输".to_string());
+            self.slots[self.work].status = Some(t("该服务器不支持 SFTP 文件传输").to_string());
             return;
         };
         self.dialog_open = true;
@@ -5004,9 +5009,9 @@ impl App {
             let name = entry.name.clone();
             let path = tokio::task::spawn_blocking(move || {
                 if is_dir {
-                    crate::dialog::pick_directory("选择保存目录", dir)
+                    crate::dialog::pick_directory(t("选择保存目录"), dir)
                 } else {
-                    crate::dialog::save_file("保存下载文件", dir, &name)
+                    crate::dialog::save_file(t("保存下载文件"), dir, &name)
                 }
             })
             .await
@@ -5042,7 +5047,7 @@ impl App {
             .count();
         if active == 0 {
             self.slots[self.work].status =
-                Some("没有进行中的传输（Ctrl-C 用于取消传输）".to_string());
+                Some(t("没有进行中的传输（Ctrl-C 用于取消传输）").to_string());
             return;
         }
         // 覆盖确认弹窗挂在那里时先替用户答"取消"，否则任务会一直等
@@ -5050,7 +5055,7 @@ impl App {
             self.answer_choice(None);
         }
         self.slots[self.work].cancel.cancel();
-        self.slots[self.work].status = Some(format!(
+        self.slots[self.work].status = Some(tf!(
             "已请求取消 {active} 个传输（已下载的部分文件不会自动删除）"
         ));
     }
@@ -5058,15 +5063,15 @@ impl App {
     /// m：在当前远端目录下新建子目录。
     fn prompt_mkdir(&mut self) {
         let Some(sftp) = self.slots[self.work].sftp.clone() else {
-            self.slots[self.work].status = Some("该服务器不支持 SFTP 文件传输".to_string());
+            self.slots[self.work].status = Some(t("该服务器不支持 SFTP 文件传输").to_string());
             return;
         };
         let dir = self.slots[self.work].browser.path.clone();
         let tx = self.event_tx.clone();
         let slot = self.slot_id();
         self.prompt = Some(Prompt {
-            title: "新建目录".to_string(),
-            label: "目录名",
+            title: t("新建目录").to_string(),
+            label: t("目录名"),
             buffer: String::new(),
             error: None,
             hint: None,
@@ -5077,7 +5082,7 @@ impl App {
                 tokio::spawn(async move {
                     let res = ells_transfer::mkdir(&sftp, &path)
                         .await
-                        .map(|_| format!("已创建目录 {path}"))
+                        .map(|_| tf!("已创建目录 {path}"))
                         .map_err(|e| format!("{e:#}"));
                     let _ = tx.send(AppEvent::SftpOp { slot, res });
                 });
@@ -5088,19 +5093,19 @@ impl App {
     /// n：重命名选中项（仍在原目录内，改名 = 移到同目录的新名字）。
     fn prompt_rename(&mut self) {
         let Some(sftp) = self.slots[self.work].sftp.clone() else {
-            self.slots[self.work].status = Some("该服务器不支持 SFTP 文件传输".to_string());
+            self.slots[self.work].status = Some(t("该服务器不支持 SFTP 文件传输").to_string());
             return;
         };
         let Some(entry) = self.slots[self.work].browser.entries.get(self.slots[self.work].browser.selected).cloned() else {
-            self.slots[self.work].status = Some("请先选中要重命名的项".to_string());
+            self.slots[self.work].status = Some(t("请先选中要重命名的项").to_string());
             return;
         };
         let parent = ells_transfer::remote_parent(&entry.path);
         let tx = self.event_tx.clone();
         let slot = self.slot_id();
         self.prompt = Some(Prompt {
-            title: format!("重命名 {}", entry.name),
-            label: "新名字",
+            title: tf!("重命名 {}", entry.name),
+            label: t("新名字"),
             buffer: entry.name.clone(),
             error: None,
             hint: None,
@@ -5111,7 +5116,7 @@ impl App {
                 if to == entry.path {
                     let _ = tx.send(AppEvent::SftpOp {
                         slot,
-                        res: Ok("名字没变，未做改动".to_string()),
+                        res: Ok(t("名字没变，未做改动").to_string()),
                     });
                     return;
                 }
@@ -5119,7 +5124,7 @@ impl App {
                 tokio::spawn(async move {
                     let res = ells_transfer::rename(&sftp, &from, &to)
                         .await
-                        .map(|_| format!("已重命名 {from} → {to}"))
+                        .map(|_| tf!("已重命名 {from} → {to}"))
                         .map_err(|e| format!("{e:#}"));
                     let _ = tx.send(AppEvent::SftpOp { slot, res });
                 });
@@ -5130,7 +5135,7 @@ impl App {
     /// c：改选中项的权限（八进制，如 600 / 0644）。只送权限位，不动属主和时间。
     fn prompt_chmod(&mut self) {
         let Some(sftp) = self.slots[self.work].sftp.clone() else {
-            self.slots[self.work].status = Some("该服务器不支持 SFTP 文件传输".to_string());
+            self.slots[self.work].status = Some(t("该服务器不支持 SFTP 文件传输").to_string());
             return;
         };
         let Some(entry) = self
@@ -5140,7 +5145,7 @@ impl App {
             .get(self.slots[self.work].browser.selected)
             .cloned()
         else {
-            self.slots[self.work].status = Some("请先选中要改权限的项".to_string());
+            self.slots[self.work].status = Some(t("请先选中要改权限的项").to_string());
             return;
         };
         let alias = self
@@ -5152,8 +5157,8 @@ impl App {
         let tx = self.event_tx.clone();
         let slot = self.slot_id();
         self.prompt = Some(Prompt {
-            title: format!("改权限 {}", entry.name),
-            label: "八进制(如 600)",
+            title: tf!("改权限 {}", entry.name),
+            label: t("八进制(如 600)"),
             buffer: String::new(),
             error: None,
             hint: None,
@@ -5163,7 +5168,7 @@ impl App {
                 let Some(bits) = ells_transfer::parse_mode(&mode) else {
                     let _ = tx.send(AppEvent::SftpOp {
                         slot,
-                        res: Err(format!("权限要八进制，如 600 / 0644（写的是 {mode}）")),
+                        res: Err(tf!("权限要八进制，如 600 / 0644（写的是 {mode}）")),
                     });
                     return;
                 };
@@ -5172,7 +5177,7 @@ impl App {
                 tokio::spawn(async move {
                     let res = ells_transfer::chmod(&sftp, &path, bits)
                         .await
-                        .map(|_| format!("已把 {path} 改成 {shown}"))
+                        .map(|_| tf!("已把 {path} 改成 {shown}"))
                         .map_err(|e| format!("{e:#}"));
                     if res.is_ok() {
                         let _ = audit::record(
@@ -5190,29 +5195,29 @@ impl App {
     /// D：删除选中项。目录会递归删除且不可恢复，因此永远先问一次。
     fn ask_delete_entry(&mut self) {
         let Some(sftp) = self.slots[self.work].sftp.clone() else {
-            self.slots[self.work].status = Some("该服务器不支持 SFTP 文件传输".to_string());
+            self.slots[self.work].status = Some(t("该服务器不支持 SFTP 文件传输").to_string());
             return;
         };
         let Some(entry) = self.slots[self.work].browser.entries.get(self.slots[self.work].browser.selected).cloned() else {
-            self.slots[self.work].status = Some("请先选中要删除的项".to_string());
+            self.slots[self.work].status = Some(t("请先选中要删除的项").to_string());
             return;
         };
         let tx = self.event_tx.clone();
         let slot = self.slot_id();
         let cancel = self.fresh_cancel();
         self.choice = Some(Choice {
-            title: "删除确认".to_string(),
+            title: t("删除确认").to_string(),
             lines: vec![
-                format!("名称：{}", entry.name),
-                format!("路径：{}", entry.path),
+                tf!("名称：{}", entry.name),
+                tf!("路径：{}", entry.path),
                 if entry.is_dir {
-                    "目录会被递归删除，里面的所有内容一起消失。".to_string()
+                    t("目录会被递归删除，里面的所有内容一起消失。").to_string()
                 } else {
-                    "文件会被删除。".to_string()
+                    t("文件会被删除。").to_string()
                 },
-                "此操作不可恢复。".to_string(),
+                t("此操作不可恢复。").to_string(),
             ],
-            options: vec!["取 消".to_string(), "删 除".to_string()],
+            options: vec![t("取 消").to_string(), t("删 除").to_string()],
             selected: 0,
             shortcuts: &[('n', 0), ('y', 1)],
             danger: true,
@@ -5225,7 +5230,7 @@ impl App {
                 tokio::spawn(async move {
                     let res = ells_transfer::remove_tree(&sftp, &path, &cancel2)
                         .await
-                        .map(|n| format!("已删除 {path}（{n} 项）"))
+                        .map(|n| tf!("已删除 {path}（{n} 项）"))
                         .map_err(|e| format!("{e:#}"));
                     let _ = tx.send(AppEvent::SftpOp { slot, res });
                 });
@@ -5263,9 +5268,9 @@ impl App {
                 _ => "zmodem",
             };
             self.slots[self.work].status = Some(if background {
-                format!("已拦截 {name}：切回该标签后继续")
+                tf!("已拦截 {name}：切回该标签后继续")
             } else {
-                format!("已拦截 {name}：请先完成当前弹窗，完成后会自动继续")
+                tf!("已拦截 {name}：请先完成当前弹窗，完成后会自动继续")
             });
             self.slots[self.work].pending_zmodem = Some(ev);
             return;
@@ -5273,21 +5278,21 @@ impl App {
         match ev {
             Z::Missing { sz } => {
                 let cmd = if sz { "sz" } else { "rz" };
-                self.slots[self.work].status = Some(format!(
+                self.slots[self.work].status = Some(tf!(
                     "远端没有 {cmd}：ells 的 sz/rz 转换需要服务器安装 lrzsz（apt/yum install lrzsz）"
                 ));
             }
             Z::Send { files } => {
                 self.clear_zmodem_soon();
                 if self.slots[self.work].sftp.is_none() {
-                    self.slots[self.work].status = Some("已拦截 sz，但该连接没有 SFTP 通道".to_string());
+                    self.slots[self.work].status = Some(t("已拦截 sz，但该连接没有 SFTP 通道").to_string());
                     return;
                 }
                 // 新的 sz 意图取代可能残留的 rz 等待，避免 SftpCwd 回来时先弹上传框
                 self.slots[self.work].rz_pending = false;
                 if files.is_empty() {
                     self.slots[self.work].status =
-                        Some("已拦截 sz：请在文件浏览器中选择要下载的文件".to_string());
+                        Some(t("已拦截 sz：请在文件浏览器中选择要下载的文件").to_string());
                     self.slots[self.work].sz_pick_mode = true;
                     self.open_browser();
                     return;
@@ -5295,7 +5300,7 @@ impl App {
                 if files.len() == 1 {
                     // 单文件 sz：直接弹系统「另存为」
                     self.slots[self.work].status =
-                        Some("已拦截 sz：请在弹出窗口选择保存位置".to_string());
+                        Some(t("已拦截 sz：请在弹出窗口选择保存位置").to_string());
                     let f = files[0].clone();
                     if self.slots[self.work].remote_cwd.is_empty() {
                         self.slots[self.work].sz_saveas_pending = true;
@@ -5308,7 +5313,7 @@ impl App {
                     return;
                 }
                 self.slots[self.work].status =
-                    Some(format!("已拦截 sz：{} 个文件改走 SFTP 下载", files.len()));
+                    Some(tf!("已拦截 sz：{} 个文件改走 SFTP 下载", files.len()));
                 if self.slots[self.work].remote_cwd.is_empty() {
                     self.slots[self.work].sz_pending = files;
                     self.refresh_remote_cwd();
@@ -5331,14 +5336,14 @@ impl App {
                     self.clear_zmodem_soon();
                 }
                 if self.slots[self.work].sftp.is_none() {
-                    self.slots[self.work].status = Some("已拦截 rz，但该连接没有 SFTP 通道".to_string());
+                    self.slots[self.work].status = Some(t("已拦截 rz，但该连接没有 SFTP 通道").to_string());
                     self.release_rz_hold();
                     return;
                 }
                 self.slots[self.work].sz_pending.clear();
                 self.slots[self.work].sz_saveas_pending = false;
                 self.slots[self.work].status =
-                    Some("已拦截 rz：请在弹出窗口选择要上传的本地文件".to_string());
+                    Some(t("已拦截 rz：请在弹出窗口选择要上传的本地文件").to_string());
                 if self.slots[self.work].remote_cwd.is_empty() {
                     self.slots[self.work].rz_pending = true;
                     self.refresh_remote_cwd();
@@ -5350,7 +5355,7 @@ impl App {
             Z::Unknown => {
                 self.clear_zmodem_soon();
                 self.slots[self.work].status =
-                    Some("检测到 ZMODEM 握手但无法判定方向，已中止远端传输".to_string());
+                    Some(t("检测到 ZMODEM 握手但无法判定方向，已中止远端传输").to_string());
             }
         }
     }
@@ -5579,14 +5584,14 @@ impl App {
                 tokio::spawn(async move {
                     let res = tokio::task::spawn_blocking(move || vault::unlock_vault(&input))
                         .await
-                        .map_err(|e| format!("后台任务异常: {e}"))
+                        .map_err(|e| tf!("后台任务异常: {e}"))
                         .and_then(|r| r.map_err(|e| e.to_string()));
                     let _ = tx.send(AppEvent::VaultUnlocked(res));
                 });
             }
             UnlockStage::CreateFirst => {
                 if input.is_empty() {
-                    self.unlock.error = Some("主密码不能为空".to_string());
+                    self.unlock.error = Some(t("主密码不能为空").to_string());
                     return;
                 }
                 self.unlock.pending_master = Some(input);
@@ -5604,19 +5609,19 @@ impl App {
                     tokio::spawn(async move {
                         let res = tokio::task::spawn_blocking(move || {
                             if vault::vault_exists() {
-                                return Err(anyhow::anyhow!("保险库已存在，请勿重复创建"));
+                                return Err(anyhow::anyhow!(t("保险库已存在，请勿重复创建")));
                             }
                             let vk = vault::create_vault_key(&input)?;
                             vault::store_vault_key(&Vault::default(), &vault::vault_path()?, &vk)?;
                             Ok(vk)
                         })
                         .await
-                        .map_err(|e| format!("后台任务异常: {e}"))
+                        .map_err(|e| tf!("后台任务异常: {e}"))
                         .and_then(|r| r.map_err(|e| e.to_string()));
                         let _ = tx.send(AppEvent::VaultCreated(res));
                     });
                 } else {
-                    self.unlock.error = Some("两次输入的主密码不一致".to_string());
+                    self.unlock.error = Some(t("两次输入的主密码不一致").to_string());
                     self.unlock.stage = UnlockStage::CreateFirst;
                     self.unlock.input.clear();
                 }
@@ -5628,7 +5633,7 @@ impl App {
     fn import_ssh_config(&mut self) {
         let all = ells_core::sshconfig::load_user_config();
         if all.is_empty() {
-            self.status = Some("~/.ssh/config 里没有可导入的主机".to_string());
+            self.status = Some(t("~/.ssh/config 里没有可导入的主机").to_string());
             return;
         }
         let fresh: Vec<Host> = all
@@ -5636,25 +5641,25 @@ impl App {
             .filter(|h| !self.vault.hosts.iter().any(|e| e.alias == h.alias))
             .collect();
         if fresh.is_empty() {
-            self.status = Some("~/.ssh/config 里的主机都已经在了".to_string());
+            self.status = Some(t("~/.ssh/config 里的主机都已经在了").to_string());
             return;
         }
         let mut lines: Vec<String> = fresh
             .iter()
             .take(8)
-            .map(|h| format!("{} → {}（{}）", h.alias, h.target(), h.auth_label()))
+            .map(|h| tf!("{} → {}（{}）", h.alias, h.target(), h.auth_label()))
             .collect();
         if fresh.len() > 8 {
-            lines.push(format!("…共 {} 台", fresh.len()));
+            lines.push(tf!("…共 {} 台", fresh.len()));
         }
         lines.push(String::new());
-        lines.push("密码认证的机器导入后需在「编辑」里补密码。".to_string());
+        lines.push(t("密码认证的机器导入后需在「编辑」里补密码。").to_string());
         let tx = self.event_tx.clone();
         let count = fresh.len();
         self.choice = Some(Choice {
-            title: "导入 ~/.ssh/config".to_string(),
+            title: t("导入 ~/.ssh/config").to_string(),
             lines,
-            options: vec!["取 消".to_string(), format!("导 入 {count} 台")],
+            options: vec![t("取 消").to_string(), tf!("导 入 {count} 台")],
             selected: 1,
             shortcuts: &[('n', 0), ('y', 1)],
             danger: false,
@@ -5669,26 +5674,26 @@ impl App {
     /// x：反向操作——把保险库写成一段 ssh_config。写盘在 `export_ssh_config`。
     fn ask_export_ssh_config(&mut self) {
         if self.vault.hosts.is_empty() {
-            self.status = Some("保险库里还没有可导出的主机".to_string());
+            self.status = Some(t("保险库里还没有可导出的主机").to_string());
             return;
         }
         let Some(path) = ells_core::sshconfig::export_path() else {
-            self.status = Some("无法定位用户主目录".to_string());
+            self.status = Some(t("无法定位用户主目录").to_string());
             return;
         };
         let count = self.vault.hosts.len();
         let tx = self.event_tx.clone();
         self.choice = Some(Choice {
-            title: "导出 ssh_config".to_string(),
+            title: t("导出 ssh_config").to_string(),
             lines: vec![
-                format!("把保险库里的 {count} 台主机写成一段 ssh_config："),
+                tf!("把保险库里的 {count} 台主机写成一段 ssh_config："),
                 path.display().to_string(),
                 String::new(),
-                "只写别名 / 主机 / 端口 / 用户 / 私钥路径 / 转发，密码一条都不写。".to_string(),
-                "写的是 ells 目录下的导出件，~/.ssh/config 本体一个字都不动。".to_string(),
-                "已有同名文件会被覆盖。".to_string(),
+                t("只写别名 / 主机 / 端口 / 用户 / 私钥路径 / 转发，密码一条都不写。").to_string(),
+                t("写的是 ells 目录下的导出件，~/.ssh/config 本体一个字都不动。").to_string(),
+                t("已有同名文件会被覆盖。").to_string(),
             ],
-            options: vec!["取 消".to_string(), "导 出".to_string()],
+            options: vec![t("取 消").to_string(), t("导 出").to_string()],
             selected: 0,
             shortcuts: &[('n', 0), ('y', 1)],
             danger: false,
@@ -5703,24 +5708,24 @@ impl App {
     /// 真正落盘：原子写，失败只影响这份可重生成的导出件，不碰保险库。
     fn export_ssh_config(&mut self) {
         let Some(path) = ells_core::sshconfig::export_path() else {
-            self.status = Some("无法定位用户主目录".to_string());
+            self.status = Some(t("无法定位用户主目录").to_string());
             return;
         };
         let text = ells_core::sshconfig::to_config_text(&self.vault.hosts);
         let count = self.vault.hosts.len();
         match ells_core::write_atomic(&path, text.as_bytes()) {
             Ok(()) => {
-                self.status = Some(format!(
+                self.status = Some(tf!(
                     "已导出 {count} 台 → {}（不含任何密码）",
                     path.display()
                 ));
                 let _ = audit::record(
                     AuditKind::Export,
                     "ssh-config",
-                    &format!("导出 {count} 台 → {}", path.display()),
+                    &tf!("导出 {count} 台 → {}", path.display()),
                 );
             }
-            Err(err) => self.status = Some(format!("导出失败：{err}")),
+            Err(err) => self.status = Some(tf!("导出失败：{err}")),
         }
     }
 
@@ -5743,21 +5748,21 @@ impl App {
         }
         if imported > 0 {
             self.save_vault();
-            let _ = audit::record(AuditKind::Import, "ssh-config", &format!("导入 {imported} 台"));
+            let _ = audit::record(AuditKind::Import, "ssh-config", &tf!("导入 {imported} 台"));
         }
         self.status = match key_errors.is_empty() {
-            true => Some(format!(
+            true => Some(tf!(
                 "已导入 {imported} 台主机{}",
                 if backed_up > 0 {
-                    format!("（{backed_up} 把私钥已备份到 ~/.ells/keys）")
+                    tf!("（{backed_up} 把私钥已备份到 ~/.ells/keys）")
                 } else {
                     String::new()
                 }
             )),
-            false => Some(format!(
+            false => Some(tf!(
                 "已导入 {imported} 台；{} 台私钥备份失败：{}",
                 key_errors.len(),
-                key_errors.join("；")
+                key_errors.join(t("；"))
             )),
         };
     }
@@ -5781,7 +5786,7 @@ impl App {
             if busy > 0 && !self.quit_confirm {
                 self.quit_confirm = true;
                 self.status =
-                    Some(format!("还有 {busy} 个标签在传输中，再按一次 q 仍然退出"));
+                    Some(tf!("还有 {busy} 个标签在传输中，再按一次 q 仍然退出"));
                 return;
             }
             self.done = true;
@@ -5830,7 +5835,7 @@ impl App {
                 if let Some(alias) = self.selected_host().map(|h| h.alias.clone()) {
                     self.open_rules_for(alias);
                 } else {
-                    self.status = Some("先选中一台主机，再按 p 编辑它的端口转发".into());
+                    self.status = Some(t("先选中一台主机，再按 p 编辑它的端口转发").into());
                 }
             }
             KeyCode::Char('m') => self.open_ports(),
@@ -5913,24 +5918,24 @@ impl App {
     fn toggle_fold(&mut self) {
         if !self.headers_shown() {
             self.status = Some(
-                "当前排序不分段，折叠无效（按 o 换到「默认」或「分组」）".to_string(),
+                t("当前排序不分段，折叠无效（按 o 换到「默认」或「分组」）").to_string(),
             );
             return;
         }
         if self.visible().is_empty() && !self.list.folded.is_empty() {
             // 全折起来的时候没有光标可用，Space 就是"把他们都放出来"
             self.list.folded.clear();
-            self.status = Some("所有分组都被折叠了，已全部展开".to_string());
+            self.status = Some(t("所有分组都被折叠了，已全部展开").to_string());
             return;
         }
         let Some(host) = self.selected_host() else { return };
         let g = group_of(&host);
         if self.list.folded.iter().any(|f| f == &g) {
             self.list.folded.retain(|f| f != &g);
-            self.status = Some(format!("已展开 {g}"));
+            self.status = Some(tf!("已展开 {g}"));
         } else {
             self.list.folded.push(g.clone());
-            self.status = Some(format!("已折叠 {g}（Space 展开，z 展开全部）"));
+            self.status = Some(tf!("已折叠 {g}（Space 展开，z 展开全部）"));
         }
         self.clamp_selection();
     }
@@ -5938,15 +5943,15 @@ impl App {
     /// z：一次收起/放出所有分组。全折叠时列表只剩段头，正好用来看"我有几组"。
     fn toggle_fold_all(&mut self) {
         if !self.headers_shown() {
-            self.status = Some("当前排序不分段，按 o 换到「默认」或「分组」".to_string());
+            self.status = Some(t("当前排序不分段，按 o 换到「默认」或「分组」").to_string());
             return;
         }
         if !self.list.folded.is_empty() {
             self.list.folded.clear();
-            self.status = Some("已展开全部分组".to_string());
+            self.status = Some(t("已展开全部分组").to_string());
         } else {
             self.list.folded = foldable_groups(&self.vault.hosts);
-            self.status = Some("已折叠全部分组（z 展开）".to_string());
+            self.status = Some(t("已折叠全部分组（z 展开）").to_string());
         }
         self.clamp_selection();
     }
@@ -5956,7 +5961,7 @@ impl App {
         self.settings.list_sort = self.settings.list_sort.next();
         self.settings.save();
         self.list.selected = 0;
-        self.status = Some(format!(
+        self.status = Some(tf!(
             "列表排序：{}（按 o 切换）",
             self.settings.list_sort.label()
         ));
@@ -6000,9 +6005,9 @@ impl App {
         }
         self.save_vault();
         self.status = Some(if now {
-            format!("已取消收藏 {alias}")
+            tf!("已取消收藏 {alias}")
         } else {
-            format!("已收藏 {alias}（列表置顶）")
+            tf!("已收藏 {alias}（列表置顶）")
         });
     }
 
@@ -6014,15 +6019,15 @@ impl App {
             self.tunnel_state.insert(alias.clone(), TunnelState::Stopped);
             // 监听口随隧道一起没了，映射表不能再显示旧端口
             self.tunnel_ports.remove(&alias);
-            let _ = audit::record(AuditKind::Tunnel, &alias, "手动停止");
-            self.status = Some(format!("已停止 {alias} 的隧道"));
+            let _ = audit::record(AuditKind::Tunnel, &alias, t("手动停止"));
+            self.status = Some(tf!("已停止 {alias} 的隧道"));
             return;
         }
         let Some(host) = self.vault.hosts.iter().find(|h| h.alias == alias).cloned() else {
             return;
         };
         if host.forwards.is_empty() {
-            self.status = Some(format!("{alias} 没有转发规则，按 Enter 建一条"));
+            self.status = Some(tf!("{alias} 没有转发规则，按 Enter 建一条"));
             return;
         }
         self.start_tunnel_for(&host);
@@ -6034,9 +6039,9 @@ impl App {
         for alias in &running {
             self.tunnel_state.insert(alias.clone(), TunnelState::Stopped);
             self.tunnel_ports.remove(alias);
-            let _ = audit::record(AuditKind::Tunnel, alias, "全部停止");
+            let _ = audit::record(AuditKind::Tunnel, alias, t("全部停止"));
         }
-        self.status = Some(format!("已停止 {} 条隧道", running.len()));
+        self.status = Some(tf!("已停止 {} 条隧道", running.len()));
     }
 
     /// 进这台主机的规则表格。没有规则的主机也进得来（列表页 p），否则"添加"没有入口。
@@ -6187,12 +6192,12 @@ impl App {
     fn save_rules(&mut self) {
         let (forwards, errors) = rules_to_forwards(&self.rules_rows);
         if !errors.is_empty() {
-            self.rules_error = Some(errors.join("；"));
+            self.rules_error = Some(errors.join(t("；")));
             return;
         }
         let alias = self.rules_alias.clone();
         let Some(found) = self.vault.hosts.iter().find(|h| h.alias == alias).cloned() else {
-            self.rules_error = Some(format!("{alias} 已不在保险库里"));
+            self.rules_error = Some(tf!("{alias} 已不在保险库里"));
             return;
         };
         let running = self.tunnels.is_running(&alias);
@@ -6202,22 +6207,22 @@ impl App {
         let empty = host.forwards.is_empty();
         self.vault.upsert(host.clone());
         self.save_vault();
-        let _ = audit::record(AuditKind::VaultSaved, &alias, "转发规则已更新");
+        let _ = audit::record(AuditKind::VaultSaved, &alias, t("转发规则已更新"));
         self.rules_open = false;
         self.status = Some(if running && changed && !empty {
             self.tunnels.stop_one(&alias);
             self.tunnel_ports.remove(&alias);
             self.start_tunnel_for(&host);
-            format!("{alias}：规则已保存，隧道按新规则重启")
+            tf!("{alias}：规则已保存，隧道按新规则重启")
         } else if running && empty {
             self.tunnels.stop_one(&alias);
             self.tunnel_state.insert(alias.clone(), TunnelState::Stopped);
             self.tunnel_ports.remove(&alias);
-            format!("{alias}：规则已清空，隧道随之停止")
+            tf!("{alias}：规则已清空，隧道随之停止")
         } else if running {
-            format!("{alias}：规则没变，隧道继续跑")
+            tf!("{alias}：规则没变，隧道继续跑")
         } else {
-            format!("{alias}：已保存 {} 条规则（按 t 打开面板、空格启停）", host.forwards.len())
+            tf!("{alias}：已保存 {} 条规则（按 t 打开面板、空格启停）", host.forwards.len())
         });
     }
 
@@ -6249,7 +6254,7 @@ impl App {
             .as_ref()
             .and_then(|s| s.session.probe_target())
         else {
-            self.slots[self.work].status = Some("容器视图需要一条活着的连接".to_string());
+            self.slots[self.work].status = Some(t("容器视图需要一条活着的连接").to_string());
             return;
         };
         let all = self.slots[self.work].docker.all;
@@ -6341,7 +6346,7 @@ impl App {
             }
         }
         if copied {
-            self.slots[self.work].status = Some("已复制选中行（TSV，可直接粘进表格）".to_string());
+            self.slots[self.work].status = Some(t("已复制选中行（TSV，可直接粘进表格）").to_string());
         }
         if reload {
             self.open_docker();
@@ -6449,14 +6454,14 @@ impl App {
             }
         }
         if copied {
-            self.slots[self.work].status = Some("已复制容器详情".to_string());
+            self.slots[self.work].status = Some(t("已复制容器详情").to_string());
         }
     }
 
     /// 菜单里选了【详情】：inspect + 一次性资源占用，同一个弹窗展示。
     fn open_docker_detail(&mut self) {
         let Some(target) = self.docker_target() else {
-            self.slots[self.work].status = Some("容器详情需要一条活着的连接".to_string());
+            self.slots[self.work].status = Some(t("容器详情需要一条活着的连接").to_string());
             return;
         };
         let (id, name) = {
@@ -6480,7 +6485,7 @@ impl App {
         let Some(target) = self.docker_target() else {
             if let Some(menu) = self.slots[self.work].docker.menu.as_mut() {
                 menu.busy = false;
-                menu.error = Some("连接已断开，没法执行操作".to_string());
+                menu.error = Some(t("连接已断开，没法执行操作").to_string());
             }
             return;
         };
@@ -6529,7 +6534,7 @@ impl App {
         match res {
             Ok(()) => {
                 self.slots[idx].docker.menu = None;
-                self.slots[idx].status = Some(format!("已{}「{}」", action_label(action), name));
+                self.slots[idx].status = Some(tf!("已{}「{}」", action_label(action), name));
                 if idx == self.work {
                     self.open_docker();
                 }
@@ -6592,7 +6597,7 @@ impl App {
     fn delete_known_entry(&mut self) {
         let Some(entry) = self.known_entries.get(self.known_selected).cloned() else { return };
         if !entry.writable {
-            self.known_msg = Some("来自 ~/.ssh/known_hosts，ells 不修改它".to_string());
+            self.known_msg = Some(t("来自 ~/.ssh/known_hosts，ells 不修改它").to_string());
             return;
         }
         match hostkey::delete_entry(&entry.hosts, &entry.algorithm) {
@@ -6600,16 +6605,16 @@ impl App {
                 let _ = audit::record(
                     AuditKind::HostKeyTrusted,
                     &entry.hosts,
-                    &format!("删除记录 {}", entry.algorithm),
+                    &tf!("删除记录 {}", entry.algorithm),
                 );
                 self.known_entries = hostkey::list_entries();
                 self.known_selected = self
                     .known_selected
                     .min(self.known_entries.len().saturating_sub(1));
                 self.known_msg = None;
-                self.status = Some(format!("已删除 {} 的 {} 记录", entry.hosts, entry.algorithm));
+                self.status = Some(tf!("已删除 {} 的 {} 记录", entry.hosts, entry.algorithm));
             }
-            Err(err) => self.known_msg = Some(format!("删除失败：{err}")),
+            Err(err) => self.known_msg = Some(tf!("删除失败：{err}")),
         }
     }
 
@@ -6667,12 +6672,12 @@ impl App {
     /// 读入选中那一份的正文（去掉控制序列，界面里看着干净）。
     fn open_session_preview(&mut self) {
         let Some(row) = self.sessions_rows.get(self.sessions_selected) else {
-            self.status = Some("没有可看的会话记录".to_string());
+            self.status = Some(t("没有可看的会话记录").to_string());
             return;
         };
         let path = row.path.clone();
         self.sessions_text = sessionlog::read_plain(&path).or_else(|| {
-            self.status = Some(format!("读不了 {}（文件可能已被清理）", row.name));
+            self.status = Some(tf!("读不了 {}（文件可能已被清理）", row.name));
             None
         });
         self.sessions_scroll = 0;
@@ -6730,14 +6735,14 @@ impl App {
         };
         match std::fs::remove_file(&row.path) {
             Ok(()) => {
-                let _ = audit::record(AuditKind::Settings, "logs", &format!("删除会话记录 {}", row.name));
+                let _ = audit::record(AuditKind::Settings, "logs", &tf!("删除会话记录 {}", row.name));
                 self.sessions_rows = sessionlog::list(50);
                 self.sessions_selected = self
                     .sessions_selected
                     .min(self.sessions_rows.len().saturating_sub(1));
-                self.status = Some(format!("已删除 {}", row.name));
+                self.status = Some(tf!("已删除 {}", row.name));
             }
-            Err(err) => self.status = Some(format!("删除失败：{err}")),
+            Err(err) => self.status = Some(tf!("删除失败：{err}")),
         }
     }
 
@@ -6792,8 +6797,8 @@ impl App {
         if let Some(alias) = self.delete_confirm.take() {
             self.vault.remove(&alias);
             self.save_vault();
-            let _ = audit::record(AuditKind::VaultSaved, &alias, "主机已删除");
-            self.status = Some(format!("已删除 {alias}"));
+            let _ = audit::record(AuditKind::VaultSaved, &alias, t("主机已删除"));
+            self.status = Some(tf!("已删除 {alias}"));
             self.list.selected = self
                 .list
                 .selected
@@ -6803,30 +6808,30 @@ impl App {
 
     fn open_homepage(&mut self) {
         open_url(ui::HOMEPAGE_URL);
-        self.status = Some("已在浏览器中打开官网 ells.cn".to_string());
+        self.status = Some(t("已在浏览器中打开官网 ells.cn").to_string());
     }
 
     /// 终端标签名随页面联动：ells-功能页名；会话页显示 ells-主机别名。
     fn sync_term_title(&mut self) {
         let title = match self.screen {
-            ScreenKind::Unlock => "ells-解锁保险库".to_string(),
-            ScreenKind::List => "ells-主机列表".to_string(),
-            ScreenKind::Connecting => "ells-正在连接".to_string(),
+            ScreenKind::Unlock => t("ells-解锁保险库").to_string(),
+            ScreenKind::List => t("ells-主机列表").to_string(),
+            ScreenKind::Connecting => t("ells-正在连接").to_string(),
             ScreenKind::Form => {
                 if self.form.editing_alias.is_some() {
-                    "ells-编辑主机".to_string()
+                    t("ells-编辑主机").to_string()
                 } else {
-                    "ells-新增主机".to_string()
+                    t("ells-新增主机").to_string()
                 }
             }
             ScreenKind::Session => match &self.slots[self.active].session {
                 // label 形如 `别名 · user@host:port`，标签页只需要别名
                 Some(s) => {
-                    format!("ells-{}", s.label.split(" · ").next().unwrap_or("会话"))
+                    format!("ells-{}", s.label.split(" · ").next().unwrap_or(t("会话")))
                 }
-                None => "ells-会话".to_string(),
+                None => t("ells-会话").to_string(),
             },
-            ScreenKind::Browser => "ells-远程文件".to_string(),
+            ScreenKind::Browser => t("ells-远程文件").to_string(),
         };
         if self.term_title.as_deref() != Some(title.as_str()) {
             term::set_term_title(&title);
@@ -6848,14 +6853,14 @@ impl App {
             // 谁发起这一路都一样：先把还在等表的定时器作废
             slot.reconnect_seq += 1;
             slot.view = ScreenKind::List;
-            slot.status = Some(format!("正在连接 {}…", host.alias));
+            slot.status = Some(tf!("正在连接 {}…", host.alias));
         }
         self.active = idx;
         self.work = idx;
         self.screen = ScreenKind::List;
         self.settings_open = false;
         self.transfer_popup = false;
-        self.status = Some(format!("正在连接 {}…", host.alias));
+        self.status = Some(tf!("正在连接 {}…", host.alias));
         // 带了转发规则的主机：连接时就顺手把隧道拉起来，不等用户去面板按 Enter。
         // 隧道用自己的连接，会话挂了它也不挂（见 TunnelManager）。
         if !host.forwards.is_empty() && !self.tunnels.is_running(&host.alias) {
@@ -6873,8 +6878,8 @@ impl App {
         let vault = Arc::new(self.vault.clone());
         self.tunnels.start(host, vault);
         self.tunnel_state.insert(alias.clone(), TunnelState::Connecting);
-        let _ = audit::record(AuditKind::Tunnel, &alias, "启动");
-        self.status = Some(format!(
+        let _ = audit::record(AuditKind::Tunnel, &alias, t("启动"));
+        self.status = Some(tf!(
             "正在启动 {alias} 的隧道（{} 条规则）",
             host.forwards.len()
         ));
@@ -6898,7 +6903,7 @@ impl App {
                 // 直连的首屏就是这张连接页：主机列表只在连接失败后才需要出现
                 self.screen = ScreenKind::Connecting;
             }
-            None => self.status = Some(format!("找不到别名为 `{alias}` 的主机")),
+            None => self.status = Some(tf!("找不到别名为 `{alias}` 的主机")),
         }
     }
 
@@ -6924,12 +6929,12 @@ impl App {
         let tx = self.event_tx.clone();
         let slot = self.slot_id();
         self.choice = Some(Choice {
-            title: "连接已断开".to_string(),
+            title: t("连接已断开").to_string(),
             lines: vec![
-                format!("主机：{}", host.target()),
+                tf!("主机：{}", host.target()),
                 reason.unwrap_or_else(|| "可能是网络中断、服务器重启或空闲超时。".to_string()),
             ],
-            options: vec!["重 连".to_string(), "返 回 列 表".to_string()],
+            options: vec![t("重 连").to_string(), t("返 回 列 表").to_string()],
             selected: 0,
             shortcuts: &[('r', 0), ('l', 1)],
             danger: false,
@@ -6963,7 +6968,7 @@ impl App {
         if start > params.max_attempts {
             self.offer_reconnect(
                 host,
-                Some(format!(
+                Some(tf!(
                     "已自动重连 {} 次都没接上，先停下来问一下。",
                     params.max_attempts
                 )),
@@ -6987,7 +6992,7 @@ impl App {
         let id = slot.id;
         let secs = wait.as_millis().div_ceil(1000).max(1);
         let head = reason.unwrap_or_else(|| "连接已断开".to_string());
-        let text = format!(
+        let text = tf!(
             "{head} · {secs} 秒后自动重连（第 {attempt}/{} 次）· 按 Ctrl-] 停止",
             params.max_attempts
         );
@@ -6998,7 +7003,7 @@ impl App {
         let _ = audit::record(
             AuditKind::Connect,
             &host.alias,
-            &format!("自动重连排队 第 {attempt}/{} 次", params.max_attempts),
+            &tf!("自动重连排队 第 {attempt}/{} 次", params.max_attempts),
         );
         let tx = self.event_tx.clone();
         tokio::spawn(async move {
@@ -7117,7 +7122,7 @@ impl App {
             // 就会被当成"这根条坏了"。除此之外不打扰 —— 断开有自己的状态行。
             if self.slots[idx].metrics.just_capped() {
                 self.slots[idx].status = Some(
-                    "这台主机的指标通道连续采集失败，已放慢到 60 秒一轮 · 恢复后自动回到 5 秒"
+                    t("这台主机的指标通道连续采集失败，已放慢到 60 秒一轮 · 恢复后自动回到 5 秒")
                         .to_string(),
                 );
             }
@@ -7131,7 +7136,7 @@ impl App {
         } else {
             // 一行忽然消失总得说句为什么：这一格的状态行本来就说不清是网络还是机器
             self.slots[idx].status = Some(
-                "这台主机采不到指标，已停止轮询 · 底部那一行还给终端".to_string(),
+                t("这台主机采不到指标，已停止轮询 · 底部那一行还给终端").to_string(),
             );
         }
         self.sync_footer_rows(idx);
@@ -7331,14 +7336,14 @@ impl App {
         };
         let next = self.slots[idx].reconnect_attempt.saturating_add(1);
         if next <= params.max_attempts {
-            self.arm_reconnect(idx, host, next, Some(format!("重连失败：{err}")));
+            self.arm_reconnect(idx, host, next, Some(tf!("重连失败：{err}")));
             return;
         }
         self.stop_reconnect(idx);
         if idx == self.active {
             self.offer_reconnect(
                 host,
-                Some(format!(
+                Some(tf!(
                     "已自动重连 {} 次都没接上，先停下来问一下。",
                     params.max_attempts
                 )),
@@ -7369,11 +7374,11 @@ impl App {
                     .host
                     .as_ref()
                     .map(|h| format!("{} · {}", h.alias, h.target()))
-                    .unwrap_or_else(|| "会话".to_string());
+                    .unwrap_or_else(|| t("会话").to_string());
                 // 会话落盘：连着就开一个文件，用户关了就收；写不进去只少一份记录
                 slot.log = if self.settings.session_log {
                     sessionlog::Recorder::start(&alias).map(|mut lg| {
-                        lg.note(&format!("会话已建立 · {label}"));
+                        lg.note(&tf!("会话已建立 · {label}"));
                         lg
                     })
                 } else {
@@ -7407,7 +7412,7 @@ impl App {
                 connected = true;
             }
             Err(err) => {
-                let msg = format!("连接失败: {err}");
+                let msg = tf!("连接失败: {err}");
                 let _ = audit::record(AuditKind::ConnectFailed, &alias, &err);
                 let slot = &mut self.slots[idx];
                 slot.connecting = false;
@@ -7427,7 +7432,7 @@ impl App {
                 h.last_connected = now;
             }
             self.save_vault();
-            let _ = audit::record(AuditKind::Connect, &alias, "会话已建立");
+            let _ = audit::record(AuditKind::Connect, &alias, t("会话已建立"));
             // 底部那排指标：连上立刻探一次（内存/负载/磁盘当场有数），差出基线后两秒
             // 补上 CPU，之后 5 秒一轮（磁盘那条腿 60 秒一次）
             self.arm_metrics(idx, METRICS_FIRST_DELAY);
@@ -7451,13 +7456,13 @@ impl App {
     fn ask_host_key(&mut self, prompt: HostKeyPrompt) {
         let changed = prompt.trust == KeyTrust::Changed;
         let lines = vec![
-            format!("主机：{}:{}", prompt.host, prompt.port),
-            format!("算法：{}", prompt.algorithm),
-            format!("指纹：{}", prompt.fingerprint),
+            tf!("主机：{}:{}", prompt.host, prompt.port),
+            tf!("算法：{}", prompt.algorithm),
+            tf!("指纹：{}", prompt.fingerprint),
             if changed {
-                "与已记录的密钥不一致：可能是服务器重装，也可能是中间人攻击。请先在服务器侧核对指纹。"
+                t("与已记录的密钥不一致：可能是服务器重装，也可能是中间人攻击。请先在服务器侧核对指纹。")
             } else {
-                "首次连接该主机。请与云控制台或管理员核对指纹后再接受。"
+                t("首次连接该主机。请与云控制台或管理员核对指纹后再接受。")
             }
             .to_string(),
         ];
@@ -7470,12 +7475,12 @@ impl App {
         );
         let audit_changed = changed;
         self.choice = Some(Choice {
-            title: if changed { "主机密钥已变更" } else { "确认主机密钥" }.to_string(),
+            title: if changed { t("主机密钥已变更") } else { t("确认主机密钥") }.to_string(),
             lines,
             options: if changed {
-                vec!["拒 绝".to_string(), "我已核对，更新记录".to_string()]
+                vec![t("拒 绝").to_string(), t("我已核对，更新记录").to_string()]
             } else {
-                vec!["拒 绝".to_string(), "接受并记录".to_string()]
+                vec![t("拒 绝").to_string(), t("接受并记录").to_string()]
             },
             // 密钥变更时默认停在"拒绝"；首次连接按 TOFU 默认"接受"
             selected: if changed { 0 } else { 1 },
@@ -7493,8 +7498,8 @@ impl App {
                     &audit_host,
                     &format!(
                         "{} {audit_algo} {}{audit_fp}",
-                        if accept { "接受" } else { "拒绝" },
-                        if audit_changed && !accept { "（拒绝更新）" } else { "" }
+                        if accept { t("接受") } else { t("拒绝") },
+                        if audit_changed && !accept { t("（拒绝更新）") } else { "" }
                     ),
                 );
             }),
@@ -7504,28 +7509,28 @@ impl App {
     /// 目标已存在：取消 / 改名保留双方 / 覆盖。默认落在"改名"，不预设丢数据。
     fn ask_conflict(&mut self, prompt: ConflictPrompt) {
         let mut lines = vec![
-            format!("文件：{}", prompt.name),
-            format!("目标：{}", prompt.target),
+            tf!("文件：{}", prompt.name),
+            tf!("目标：{}", prompt.target),
         ];
         // 冲突也可能来自后台标签：不说清楚用户会以为弹窗是凭空出现的
         if self.work != self.active {
-            lines.insert(0, format!("标签：{}", self.slots[self.work].title()));
+            lines.insert(0, tf!("标签：{}", self.slots[self.work].title()));
         }
         if let Some(size) = prompt.size {
-            lines.push(format!("已存在：{}", ui::human_size(size)));
+            lines.push(tf!("已存在：{}", ui::human_size(size)));
         }
-        lines.push(format!(
+        lines.push(tf!(
             "覆盖会丢掉原有内容，改名会把两份都留下（{}）。",
-            if prompt.location == "远端" { "远端" } else { "本地" }
+            if prompt.location == "远端" { t("远端") } else { t("本地") }
         ));
         let responder = prompt.responder;
         self.choice = Some(Choice {
-            title: format!("{}已存在同名文件", prompt.location),
+            title: tf!("{}已存在同名文件", prompt.location),
             lines,
             options: vec![
-                "取 消".to_string(),
-                "改名保留双方".to_string(),
-                "覆盖原文件".to_string(),
+                t("取 消").to_string(),
+                t("改名保留双方").to_string(),
+                t("覆盖原文件").to_string(),
             ],
             selected: 1,
             shortcuts: &[('n', 0), ('r', 1), ('o', 2)],
@@ -7592,7 +7597,7 @@ impl App {
                 let allow_empty = self.prompt.as_ref().is_some_and(|p| p.allow_empty);
                 if value.is_empty() && !allow_empty {
                     if let Some(p) = self.prompt.as_mut() {
-                        p.error = Some("内容不能为空".to_string());
+                        p.error = Some(t("内容不能为空").to_string());
                     }
                     return;
                 }
@@ -7862,7 +7867,7 @@ impl App {
 
     fn open_jump_picker(&mut self) {
         let current = self.form.editing_alias.clone();
-        let mut items: Vec<(String, String)> = vec![("".into(), "（无跳板机 · 直连）".into())];
+        let mut items: Vec<(String, String)> = vec![("".into(), t("（无跳板机 · 直连）").into())];
         items.extend(self.vault.hosts.iter().filter_map(|h| {
             if current.as_deref() == Some(h.alias.as_str()) {
                 return None; // cannot jump through itself
@@ -7886,7 +7891,7 @@ impl App {
             .map(|f| f.role != FieldRole::KeyPath)
             .unwrap_or(true)
         {
-            self.form.error = Some("只有\"私钥路径\"可以用文件选择框".to_string());
+            self.form.error = Some(t("只有\"私钥路径\"可以用文件选择框").to_string());
             return;
         }
         let current = self
@@ -7914,14 +7919,14 @@ impl App {
             };
             let path = tokio::task::spawn_blocking(move || {
                 crate::dialog::pick_file(
-                    "选择私钥文件",
+                    t("选择私钥文件"),
                     start,
                     vec![
                         (
-                            "私钥文件 (*.pem *.key *.ppk)".to_string(),
+                            t("私钥文件 (*.pem *.key *.ppk)").to_string(),
                             vec!["pem".to_string(), "key".to_string(), "ppk".to_string()],
                         ),
-                        ("所有文件".to_string(), vec!["*".to_string()]),
+                        (t("所有文件").to_string(), vec!["*".to_string()]),
                     ],
                 )
             })
@@ -7940,16 +7945,16 @@ impl App {
         };
         let src = PathBuf::from(path);
         let keys_dir = dirs::home_dir()
-            .ok_or("无法定位用户主目录")?
+            .ok_or(t("无法定位用户主目录"))?
             .join(".ells")
             .join("keys");
         if src.starts_with(&keys_dir) {
             return Ok(false); // already backed up
         }
-        std::fs::create_dir_all(&keys_dir).map_err(|e| format!("创建密钥目录失败: {e}"))?;
+        std::fs::create_dir_all(&keys_dir).map_err(|e| tf!("创建密钥目录失败: {e}"))?;
         let fname = src
             .file_name()
-            .ok_or("私钥路径无效")?
+            .ok_or(t("私钥路径无效"))?
             .to_string_lossy()
             .into_owned();
         let alias_safe: String = host
@@ -7964,7 +7969,7 @@ impl App {
             })
             .collect();
         let dest = keys_dir.join(format!("{alias_safe}_{fname}"));
-        std::fs::copy(&src, &dest).map_err(|e| format!("备份私钥失败: {e}"))?;
+        std::fs::copy(&src, &dest).map_err(|e| tf!("备份私钥失败: {e}"))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -7997,13 +8002,13 @@ impl App {
                         let _ = audit::record(
                             AuditKind::VaultSaved,
                             &alias,
-                            if prior.is_some() { "主机已更新" } else { "主机已新增" },
+                            if prior.is_some() { t("主机已更新") } else { t("主机已新增") },
                         );
                         self.focus_host(&alias);
                         self.status = Some(if copied {
-                            format!("已保存 {alias}（私钥已备份到 ~/.ells/keys）")
+                            tf!("已保存 {alias}（私钥已备份到 ~/.ells/keys）")
                         } else {
-                            format!("已保存 {alias}")
+                            tf!("已保存 {alias}")
                         });
                         self.screen = ScreenKind::List;
                     }
@@ -8066,20 +8071,20 @@ impl FormState {
         };
         Self {
             fields: vec![
-                field(FieldRole::Alias, "别名", FieldKind::Text, host.map(|h| h.alias.clone()).unwrap_or_default()),
-                field(FieldRole::Hostname, "主机", FieldKind::Text, host.map(|h| h.hostname.clone()).unwrap_or_default()),
-                field(FieldRole::Port, "端口", FieldKind::Number, host.map(|h| h.port.to_string()).unwrap_or_else(|| "22".into())),
-                field(FieldRole::User, "用户", FieldKind::Text, host.map(|h| h.user.clone()).unwrap_or_default()),
-                field(FieldRole::Auth, "认证方式 ←/→", FieldKind::AuthChoice, auth_value.to_string()),
-                field(FieldRole::Password, "密码", FieldKind::Secret, host.and_then(|h| h.password.clone()).unwrap_or_default()),
-                field(FieldRole::KeyPath, "私钥路径 ctrl-f", FieldKind::Text, key_path),
-                field(FieldRole::KeyPass, "私钥口令(可选)", FieldKind::Secret, key_pass),
-                field(FieldRole::Jump, "跳板机(可选) ctrl-j", FieldKind::Text, host.and_then(|h| h.jump.clone()).unwrap_or_default()),
-                field(FieldRole::Group, "分组(可选)", FieldKind::Text, host.and_then(|h| h.group.clone()).unwrap_or_default()),
-                field(FieldRole::Tags, "标签(逗号分隔)", FieldKind::Text, host.map(|h| h.tags.join(", ")).unwrap_or_default()),
+                field(FieldRole::Alias, t("别名"), FieldKind::Text, host.map(|h| h.alias.clone()).unwrap_or_default()),
+                field(FieldRole::Hostname, t("主机"), FieldKind::Text, host.map(|h| h.hostname.clone()).unwrap_or_default()),
+                field(FieldRole::Port, t("端口"), FieldKind::Number, host.map(|h| h.port.to_string()).unwrap_or_else(|| "22".into())),
+                field(FieldRole::User, t("用户"), FieldKind::Text, host.map(|h| h.user.clone()).unwrap_or_default()),
+                field(FieldRole::Auth, t("认证方式 ←/→"), FieldKind::AuthChoice, auth_value.to_string()),
+                field(FieldRole::Password, t("密码"), FieldKind::Secret, host.and_then(|h| h.password.clone()).unwrap_or_default()),
+                field(FieldRole::KeyPath, t("私钥路径 ctrl-f"), FieldKind::Text, key_path),
+                field(FieldRole::KeyPass, t("私钥口令(可选)"), FieldKind::Secret, key_pass),
+                field(FieldRole::Jump, t("跳板机(可选) ctrl-j"), FieldKind::Text, host.and_then(|h| h.jump.clone()).unwrap_or_default()),
+                field(FieldRole::Group, t("分组(可选)"), FieldKind::Text, host.and_then(|h| h.group.clone()).unwrap_or_default()),
+                field(FieldRole::Tags, t("标签(逗号分隔)"), FieldKind::Text, host.map(|h| h.tags.join(", ")).unwrap_or_default()),
                 field(
                     FieldRole::Forwards,
-                    "转发 -L 8080:127.0.0.1:5432 -D 1080",
+                    t("转发 -L 8080:127.0.0.1:5432 -D 1080"),
                     FieldKind::Text,
                     host.map(|h| {
                         h.forwards
@@ -8196,33 +8201,33 @@ impl FormState {
             .value_of(FieldRole::Port)
             .trim()
             .parse()
-            .map_err(|_| "端口必须是 1-65535 的数字".to_string())?;
+            .map_err(|_| t("端口必须是 1-65535 的数字").to_string())?;
         let user = self.value_of(FieldRole::User).trim().to_string();
         // 只点名缺的那几项：三个都填了只差用户时，报"别名、主机、用户是必填项"
         // 等于让用户把已经填对的重新看一遍。
         let mut missing: Vec<&str> = Vec::new();
         if alias.is_empty() {
-            missing.push("别名");
+            missing.push(t("别名"));
         }
         if hostname.is_empty() {
-            missing.push("主机");
+            missing.push(t("主机"));
         }
         if user.is_empty() {
-            missing.push("用户");
+            missing.push(t("用户"));
         }
         if !missing.is_empty() {
-            return Err(format!("{}是必填项", missing.join("、")));
+            return Err(tf!("{}是必填项", missing.join(t("、"))));
         }
         let auth = match self.auth_value() {
             "password" => {
                 if self.value_of(FieldRole::Password).is_empty() {
-                    return Err("密码认证需要填写密码".to_string());
+                    return Err(t("密码认证需要填写密码").to_string());
                 }
                 Auth::Password
             }
             "key" => {
                 if self.value_of(FieldRole::KeyPath).trim().is_empty() {
-                    return Err("密钥认证需要填写私钥路径".to_string());
+                    return Err(t("密钥认证需要填写私钥路径").to_string());
                 }
                 let pass = self.value_of(FieldRole::KeyPass);
                 Auth::PrimaryKey {
@@ -8235,15 +8240,15 @@ impl FormState {
                 }
             }
             "agent" => Auth::Agent,
-            _ => return Err("认证方式为空，请用 ←/→ 重新选择".to_string()),
+            _ => return Err(t("认证方式为空，请用 ←/→ 重新选择").to_string()),
         };
         let jump = self.value_of(FieldRole::Jump).trim().to_string();
         if !jump.is_empty() && jump == alias {
-            return Err("跳板机不能是该主机自身".to_string());
+            return Err(t("跳板机不能是该主机自身").to_string());
         }
         let (forwards, bad) = Forward::parse_specs(self.value_of(FieldRole::Forwards));
         if !bad.is_empty() {
-            return Err(format!("转发规则看不懂：{}", bad.join("、")));
+            return Err(tf!("转发规则看不懂：{}", bad.join(t("、"))));
         }
         let group = self.value_of(FieldRole::Group).trim().to_string();
         let tags: Vec<String> = self
@@ -8383,39 +8388,39 @@ async fn prepare_local_edit(
         .map_err(|e| format!("{e:#}"))?;
     if let Some(meta) = &meta {
         if meta.is_dir {
-            return Err("目录不能直接编辑".to_string());
+            return Err(t("目录不能直接编辑").to_string());
         }
         if meta.size > EDIT_MAX_BYTES {
-            return Err(format!(
+            return Err(tf!(
                 "文件太大（{} MB），不适合用本地编辑器打开",
                 meta.size / 1024 / 1024
             ));
         }
     } else if !allow_new {
-        return Err(format!("远端文件不存在：{remote}"));
+        return Err(tf!("远端文件不存在：{remote}"));
     }
     let dir = std::env::temp_dir().join("ells-edit");
     tokio::fs::create_dir_all(&dir)
         .await
-        .map_err(|e| format!("无法创建临时目录 {}：{e}", dir.display()))?;
+        .map_err(|e| tf!("无法创建临时目录 {}：{e}", dir.display()))?;
     let temp = temp_edit_name(name);
     let local = if meta.is_some() {
         let (ptx, _prx) = mpsc::unbounded_channel::<Progress>();
         let cancel = Cancel::default();
         ells_transfer::download(sftp, remote.to_string(), &dir, ptx, &temp, &cancel)
             .await
-            .map_err(|e| format!("取回失败：{e:#}"))?
+            .map_err(|e| tf!("取回失败：{e:#}"))?
     } else {
         let local = dir.join(&temp);
         tokio::fs::write(&local, b"")
             .await
-            .map_err(|e| format!("无法创建临时文件 {}：{e}", local.display()))?;
+            .map_err(|e| tf!("无法创建临时文件 {}：{e}", local.display()))?;
         local
     };
     // 打开前先挡掉二进制：文本编辑器会把它们搅成乱码，保存回传就等于毁掉远端文件。
     if meta.is_some() && is_binary_file(&local).await {
         let _ = tokio::fs::remove_file(&local).await;
-        return Err(format!("{name} 看起来是二进制文件，已取消编辑"));
+        return Err(tf!("{name} 看起来是二进制文件，已取消编辑"));
     }
     Ok(EditPrep {
         local,
@@ -8432,7 +8437,7 @@ async fn resolve_vi_completion(
     cwd: &str,
 ) -> std::result::Result<String, String> {
     let (dir, prefix) = crate::vi_edit::completion_request(raw)
-        .ok_or_else(|| "这行不需要补全".to_string())?;
+        .ok_or_else(|| t("这行不需要补全").to_string())?;
     let base = if dir.is_empty() {
         if cwd.starts_with('/') {
             cwd.to_string()
@@ -8463,8 +8468,8 @@ async fn resolve_vi_completion(
             append.push(if one.is_dir { '/' } else { ' ' });
             Ok(append)
         }
-        [] => Err(format!("没有匹配 {prefix} 的文件")),
-        many => Err(format!("有 {} 个候选", many.len())),
+        [] => Err(tf!("没有匹配 {prefix} 的文件")),
+        many => Err(tf!("有 {} 个候选", many.len())),
     }
 }
 
@@ -8497,11 +8502,11 @@ async fn resolve_vi_target(
         Ok(path) => (path, false),
         Err(_) => {
             let (parent, base) = split_remote_parent(&joined)
-                .ok_or_else(|| format!("远端路径不可用：{joined}"))?;
+                .ok_or_else(|| tf!("远端路径不可用：{joined}"))?;
             let parent = sftp
                 .canonicalize(parent)
                 .await
-                .map_err(|e| format!("远端目录不可用：{e}"))?;
+                .map_err(|e| tf!("远端目录不可用：{e}"))?;
             (ells_transfer::remote_join(&parent, base), true)
         }
     };
@@ -8510,10 +8515,10 @@ async fn resolve_vi_target(
         .map_err(|e| format!("{e:#}"))?;
     if let Some(meta) = &meta {
         if meta.is_dir {
-            return Err("目录不能直接编辑".to_string());
+            return Err(t("目录不能直接编辑").to_string());
         }
         if meta.size > EDIT_MAX_BYTES {
-            return Err("文件太大".to_string());
+            return Err(t("文件太大").to_string());
         }
     }
     let name = remote
@@ -8623,7 +8628,7 @@ fn launch_editor(path: &Path) -> std::result::Result<(), String> {
     cmd.args(&args).arg(path);
     let mut child = cmd
         .spawn()
-        .map_err(|e| format!("无法启动编辑器 {prog}：{e}"))?;
+        .map_err(|e| tf!("无法启动编辑器 {prog}：{e}"))?;
     // 编辑器活多久都行；单独等它只为回收进程（unix 上避免僵尸）。
     tokio::task::spawn_blocking(move || {
         let _ = child.wait();
@@ -8707,7 +8712,7 @@ async fn run_edit_upload(
                     slot,
                     remote,
                     local,
-                    res: Err(format!("写回前检查远端失败：{err:#}")),
+                    res: Err(tf!("写回前检查远端失败：{err:#}")),
                 });
                 return;
             }
@@ -8779,16 +8784,16 @@ async fn run_upload(
     let is_dir = match std::fs::metadata(&local) {
         Ok(md) => md.is_dir(),
         Err(err) => {
-            return Err((name, format!("无法读取本地路径 {}：{err}", local.display())));
+            return Err((name, tf!("无法读取本地路径 {}：{err}", local.display())));
         }
     };
     // 目标目录不存在时 SFTP 只会回一个 "No such file"，看不出是哪一层目录记错了。
     // 先查一次，把实际用于上传的远端目录写进错误里。
     match ells_transfer::remote_meta(&sftp, &dest).await {
         Ok(Some(meta)) if meta.is_dir => {}
-        Ok(Some(_)) => return Err((name, format!("上传失败：远端路径不是目录：{dest}"))),
-        Ok(None) => return Err((name, format!("上传失败：远端目录不存在：{dest}"))),
-        Err(err) => return Err((name, format!("上传失败：无法检查远端目录 {dest}：{err:#}"))),
+        Ok(Some(_)) => return Err((name, tf!("上传失败：远端路径不是目录：{dest}"))),
+        Ok(None) => return Err((name, tf!("上传失败：远端目录不存在：{dest}"))),
+        Err(err) => return Err((name, tf!("上传失败：无法检查远端目录 {dest}：{err:#}"))),
     }
     let target = ells_transfer::remote_join(&dest, &name);
     let mut final_name = name.clone();
@@ -8796,14 +8801,14 @@ async fn run_upload(
         Ok(Some(meta)) => {
             let taken = remote_taken(&sftp, &dest, &name).await;
             let chosen =
-                ask_overwrite(tx, slot, "远端", &name, &target, Some(meta.size), |c| {
+                ask_overwrite(tx, slot, t("远端"), &name, &target, Some(meta.size), |c| {
                     taken.contains(c)
                 })
                 .await;
             match chosen {
                 Some(n) => final_name = n,
                 None => {
-                    let msg = format!("已取消上传：{name}");
+                    let msg = tf!("已取消上传：{name}");
                     return Err((name, msg));
                 }
             }
@@ -8814,7 +8819,7 @@ async fn run_upload(
     let _ = tx.send(AppEvent::SftpStarted {
         slot,
         label: final_name.clone(),
-        direction: "上传",
+        direction: t("上传"),
     });
     let res = if is_dir {
         ells_transfer::upload_tree(&sftp, &local, &dest, &final_name, ptx, cancel)
@@ -8859,11 +8864,11 @@ async fn run_download(
         let shown = target.display().to_string();
         let taken = local_taken(&dest_dir, &name);
         let chosen =
-            ask_overwrite(tx, slot, "本地", &name, &shown, size, |c| taken.contains(c)).await;
+            ask_overwrite(tx, slot, t("本地"), &name, &shown, size, |c| taken.contains(c)).await;
         match chosen {
             Some(n) => final_name = n,
             None => {
-                let msg = format!("已取消下载：{label}");
+                let msg = tf!("已取消下载：{label}");
                 return Err((label, msg));
             }
         }
@@ -8871,7 +8876,7 @@ async fn run_download(
     let _ = tx.send(AppEvent::SftpStarted {
         slot,
         label: final_name.clone(),
-        direction: "下载",
+        direction: t("下载"),
     });
     let res = if is_dir {
         ells_transfer::download_tree(&sftp, &entry.path, &dest_dir, &final_name, ptx, cancel)

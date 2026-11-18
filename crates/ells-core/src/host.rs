@@ -1,3 +1,5 @@
+use ells_lang::t;
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -449,8 +451,8 @@ impl Host {
 
     pub fn auth_label(&self) -> &'static str {
         match &self.auth {
-            Auth::Password => "密码",
-            Auth::PrimaryKey { .. } => "密钥",
+            Auth::Password => t("密码"),
+            Auth::PrimaryKey { .. } => t("密钥"),
             Auth::Agent => "agent",
         }
     }

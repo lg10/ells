@@ -15,8 +15,9 @@ mod update;
 mod vi_edit;
 mod zmodem;
 
+use ells_lang::{t, tf, tr};
 use anyhow::Result;
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches, Parser};
 
 use crate::term::restore_terminal;
 
@@ -53,7 +54,57 @@ struct Cli {
     check_update: bool,
 }
 
+/// 帮助文本是派生宏里写死的中文字面量，这里在运行期整棵树过一遍 tr()。
+/// 只翻译"已经有的文本"：目录里没有的句子原样留着（中文），不会出现空帮助。
+fn parse_cli() -> Cli {
+    let command = localize_command(Cli::command());
+    let matches = command.get_matches();
+    Cli::from_arg_matches(&matches).unwrap_or_else(|err| err.exit())
+}
+
+fn localize_command(mut cmd: clap::Command) -> clap::Command {
+    if let Some(text) = cmd.get_about() {
+        let text = text.to_string();
+        cmd = cmd.about(tr(&text).into_owned());
+    }
+    if let Some(text) = cmd.get_long_about() {
+        let text = text.to_string();
+        cmd = cmd.long_about(tr(&text).into_owned());
+    }
+    if let Some(text) = cmd.get_before_help() {
+        let text = text.to_string();
+        cmd = cmd.before_help(tr(&text).into_owned());
+    }
+    if let Some(text) = cmd.get_after_help() {
+        let text = text.to_string();
+        cmd = cmd.after_help(tr(&text).into_owned());
+    }
+    cmd.mut_args(localize_arg).mut_subcommands(localize_command)
+}
+
+fn localize_arg(mut arg: clap::Arg) -> clap::Arg {
+    if let Some(text) = arg.get_help() {
+        let text = text.to_string();
+        arg = arg.help(tr(&text).into_owned());
+    }
+    if let Some(text) = arg.get_long_help() {
+        let text = text.to_string();
+        arg = arg.long_help(tr(&text).into_owned());
+    }
+    if let Some(names) = arg.get_value_names() {
+        if let [name] = names {
+            let text = name.to_string();
+            // clap 的 value_name 只收 &'static str；启动时漏这一小块可以接受
+            let text: &'static str = Box::leak(tr(&text).into_owned().into_boxed_str());
+            arg = arg.value_name(text);
+        }
+    }
+    arg
+}
+
 fn main() -> Result<()> {
+    // 语言要先定下来：clap 的帮助文本、panic 钩子和所有 t() 都看它
+    ells_lang::init();
     install_panic_hook();
     if std::env::var("ELLS_LOG").is_ok() {
         tracing_subscriber::fmt()
@@ -68,7 +119,7 @@ fn main() -> Result<()> {
         dev,
         yes,
         check_update,
-    } = Cli::parse();
+    } = parse_cli();
     // 帮助里承诺的是 `ELLS_YES=1`，所以 1/true/yes/on 都算数（clap 的 env 只认真写字面量）
     let yes = yes || env_yes();
     if check_update {
@@ -95,8 +146,8 @@ fn main() -> Result<()> {
             // 上次换上这一版之后一帧都没画出来、这次已经退回上一版：
             // 直接拉起退回后的那份，用户不用重敲命令（unix 走 exec，永不返回）
             eprintln!(
-                "\x1b[31mells {tag} 起不来，已自动退回上一版，正在用退回后的版本打开。\x1b[0m"
-            );
+                "{}", tf!("\x1b[31mells {tag} 起不来，已自动退回上一版，正在用退回后的版本打开。\x1b[0m"
+            ));
             update::restart().map_err(anyhow::Error::msg)?;
             return Ok(());
         }
@@ -133,8 +184,8 @@ fn main() -> Result<()> {
     let restart = match app_thread.join() {
         Ok(result) => result,
         Err(_) => Err(anyhow::anyhow!(
-            "ells 主循环异常退出，屏幕已恢复；详情见上方错误信息"
-        )),
+            "{}", tf!("ells 主循环异常退出，屏幕已恢复；详情见上方错误信息"
+        ))),
     };
     let restart = match restart {
         Ok(restart) => restart,
@@ -142,7 +193,7 @@ fn main() -> Result<()> {
             // 刚换上、还没画出过一帧的版本把程序打死了：当场退回上一版再拉起来，
             // 不能让用户此后每次启动都只看到一行 Error
             if let Some(tag) = update::roll_back_after_failed_start() {
-                eprintln!("\x1b[31mells {tag} 启动失败，已自动退回上一版。\x1b[0m");
+                eprintln!("{}", tf!("\x1b[31mells {tag} 启动失败，已自动退回上一版。\x1b[0m"));
                 update::restart().map_err(anyhow::Error::msg)?;
             }
             return Err(err);
@@ -175,9 +226,9 @@ fn check_update_only() -> Result<()> {
         eprintln!("[ells] {note}");
     }
     match update::check() {
-        Ok(Some(tag)) => println!("发现新版本 {tag}（当前 v{}），运行 ells 后点顶部徽标即可更新", update::current_version()),
-        Ok(None) => println!("已是最新版本 v{}", update::current_version()),
-        Err(msg) => anyhow::bail!("检查更新失败：{msg}"),
+        Ok(Some(tag)) => println!("{}", tf!("发现新版本 {tag}（当前 v{}），运行 ells 后点顶部徽标即可更新", update::current_version())),
+        Ok(None) => println!("{}", tf!("已是最新版本 v{}", update::current_version())),
+        Err(msg) => anyhow::bail!("{}", tf!("检查更新失败：{msg}")),
     }
     Ok(())
 }
@@ -190,8 +241,8 @@ fn install_panic_hook() {
     std::panic::set_hook(Box::new(move |info| {
         restore_terminal();
         let detail = panic_detail(info);
-        eprintln!("\x1b[31mells 遇到未预期的错误：{detail}\x1b[0m");
-        eprintln!("终端已恢复。若认为这是 ells 的问题，请到 https://github.com/lg10/ells/issues 附上以上信息。");
+        eprintln!("{}", tf!("\x1b[31mells 遇到未预期的错误：{detail}\x1b[0m"));
+        eprintln!("{}", tf!("终端已恢复。若认为这是 ells 的问题，请到 https://github.com/lg10/ells/issues 附上以上信息。"));
         if verbose {
             tracing::error!(%detail, "panic");
         }
@@ -204,10 +255,63 @@ fn panic_detail(info: &std::panic::PanicHookInfo<'_>) -> String {
     } else if let Some(s) = info.payload().downcast_ref::<String>() {
         s.clone()
     } else {
-        "未知错误".to_string()
+        t("未知错误").to_string()
     };
     match info.location() {
-        Some(loc) => format!("{payload}（{}:{}）", loc.file(), loc.line()),
+        Some(loc) => tf!("{payload}（{}:{}）", loc.file(), loc.line()),
         None => payload,
+    }
+}
+
+#[cfg(test)]
+mod cli_help {
+    use super::*;
+    use ells_lang::{Lang, tr, with_lang};
+
+    fn collect(cmd: &clap::Command, out: &mut Vec<String>) {
+        if let Some(text) = cmd.get_about() {
+            out.push(text.to_string());
+        }
+        if let Some(text) = cmd.get_long_about() {
+            out.push(text.to_string());
+        }
+        if let Some(text) = cmd.get_before_help() {
+            out.push(text.to_string());
+        }
+        if let Some(text) = cmd.get_after_help() {
+            out.push(text.to_string());
+        }
+        for arg in cmd.get_arguments() {
+            if let Some(text) = arg.get_help() {
+                out.push(text.to_string());
+            }
+            if let Some(text) = arg.get_long_help() {
+                out.push(text.to_string());
+            }
+            if let Some(names) = arg.get_value_names() {
+                out.extend(names.iter().map(|n| n.to_string()));
+            }
+        }
+        for sc in cmd.get_subcommands() {
+            collect(sc, out);
+        }
+    }
+
+    /// 英文模式下帮助里不该再留中文；失败时把漏掉的原句打出来补目录。
+    #[test]
+    fn help_is_fully_translated() {
+        let mut texts = Vec::new();
+        collect(&Cli::command(), &mut texts);
+        let untranslated: Vec<&String> = with_lang(Lang::En, || {
+            texts
+                .iter()
+                .filter(|text| text.chars().any(|c| !c.is_ascii()))
+                .filter(|text| tr(text) == text.as_str())
+                .collect()
+        });
+        for text in &untranslated {
+            println!("未翻译：{text:?}");
+        }
+        assert!(untranslated.is_empty(), "{} 条帮助文本缺英文", untranslated.len());
     }
 }

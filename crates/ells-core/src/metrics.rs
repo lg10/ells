@@ -12,6 +12,8 @@
 /// `timeout`（很多机器没有）。`2>/dev/null` 保证没有 /proc 的机器照样把后面的
 /// `df` 跑完。第一行的 `ellsm1` 是心跳标记：它在，说明命令真的执行了、只是这台
 /// 机器没给这些数据；它不在，说明连 exec 通道都不通（比如服务器只允许 forced-command）。
+use ells_lang::t;
+
 pub const PROBE_COMMAND: &str = "echo ellsm1; sed -n '1p' /proc/stat 2>/dev/null; \
 grep -E '^Mem(Total|Available|Free|Buffers|Cached|SReclaimable):' /proc/meminfo 2>/dev/null; \
 cat /proc/loadavg 2>/dev/null; df -Pk 2>/dev/null";
@@ -583,7 +585,7 @@ pub fn plan_disks(
     if want_survey || follow.is_none() {
         return DiskPlan::Survey;
     }
-    DiskPlan::Follow(follow.expect("上面已经挡掉 None").to_string())
+    DiskPlan::Follow(follow.expect(t("上面已经挡掉 None")).to_string())
 }
 
 /// `/proc/mounts` 把挂载点名里的空格、制表、换行和反斜杠写成三位八进制转义。

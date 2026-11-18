@@ -11,6 +11,7 @@
 //! - **导出绝不写密码**：密码只存在于加密保险库里，导出的 ssh_config 里
 //!   用注释标出"该主机由 ells 托管凭据"，避免一次导出把凭据泄成明文文件。
 
+use ells_lang::t;
 use crate::host::{Auth, EndpointKind, Forward, Host};
 
 #[derive(Debug, Default, Clone)]
@@ -131,7 +132,7 @@ pub fn parse(text: &str) -> Vec<Host> {
                 auth,
                 password: None,
                 jump,
-                note: Some("来自 ~/.ssh/config".to_string()),
+                note: Some(t("来自 ~/.ssh/config").to_string()),
                 forwards,
                 ..Default::default()
             });
@@ -257,7 +258,7 @@ pub fn export_path() -> Option<std::path::PathBuf> {
 /// 只写 ells 能负责的部分：认证走密钥就写 IdentityFile，走密码就留一行注释说明
 /// 凭据在保险库里 —— 密码本身永不进这份文本。
 pub fn to_config_text(hosts: &[Host]) -> String {
-    let mut out = String::from("# 由 ells 导出。密码类主机的凭据留在 ~/.ells/vault.bin 中。\n");
+    let mut out = String::from(t("# 由 ells 导出。密码类主机的凭据留在 ~/.ells/vault.bin 中。\n"));
     for host in hosts {
         out.push_str(&format!("Host {}\n", host.alias));
         if host.hostname != host.alias {
@@ -274,10 +275,10 @@ pub fn to_config_text(hosts: &[Host]) -> String {
                 out.push_str(&format!("    IdentityFile {path}\n"));
             }
             Auth::Password => {
-                out.push_str("    # ells 托管密码（此文件不含凭据）\n");
+                out.push_str(t("    # ells 托管密码（此文件不含凭据）\n"));
             }
             Auth::Agent => {
-                out.push_str("    # ells 通过 ssh-agent 认证\n");
+                out.push_str(t("    # ells 通过 ssh-agent 认证\n"));
             }
         }
         if let Some(jump) = &host.jump {

@@ -8,6 +8,7 @@
 //! 0x1C–0x1F，crossterm 解出来是 Ctrl-4…Ctrl-7，而 Windows 直接给 Ctrl-]。两者是同一个
 //! 字节，无法区分，统一按 punct 写法记，绑定与匹配全平台一致。
 
+use ells_lang::t;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 /// 键位本身：功能键或字符键（字符一律以小写存储，比较时忽略大小写）。
@@ -127,31 +128,31 @@ impl Chord {
         match self.key {
             ChordKey::Function(n) => match n {
                 // 会话页的帮助只有 F1（`?` 要留给远端），占用后就再也打不开帮助页
-                1 => Some("F1 是帮助键，占用后会无法查看键位说明"),
+                1 => Some(t("F1 是帮助键，占用后会无法查看键位说明")),
                 2..=9 => None,
                 // 这三枚在别的软件里从来不属于程序本身：Linux 终端 F10 开菜单、F11 全屏，
                 // macOS F11/F12 是 Mission Control（要按 fn），Windows Terminal F11 全屏。
-                10..=12 => Some("F10–F12 常被终端或系统吃掉（菜单/全屏/媒体键），三平台不可靠"),
-                _ => Some("功能键只支持 F2–F9"),
+                10..=12 => Some(t("F10–F12 常被终端或系统吃掉（菜单/全屏/媒体键），三平台不可靠")),
+                _ => Some(t("功能键只支持 F2–F9")),
             },
             ChordKey::Char(c) => {
                 if !self.ctrl && !self.alt {
-                    return Some("必须带 Ctrl 或 Alt 修饰，否则会吞掉普通输入");
+                    return Some(t("必须带 Ctrl 或 Alt 修饰，否则会吞掉普通输入"));
                 }
                 if self.ctrl {
                     // 这些组合在终端里与结构性按键同码，绑定后会随机失灵
                     match c.to_ascii_lowercase() {
-                        'c' => return Some("Ctrl-C 要留给远端中断信号"),
-                        'h' => return Some("Ctrl-H 与 Backspace 同码"),
-                        'i' => return Some("Ctrl-I 与 Tab 同码"),
-                        'm' => return Some("Ctrl-M 与 Enter 同码"),
-                        '[' => return Some("Ctrl-[ 与 Esc 同码"),
+                        'c' => return Some(t("Ctrl-C 要留给远端中断信号")),
+                        'h' => return Some(t("Ctrl-H 与 Backspace 同码")),
+                        'i' => return Some(t("Ctrl-I 与 Tab 同码")),
+                        'm' => return Some(t("Ctrl-M 与 Enter 同码")),
+                        '[' => return Some(t("Ctrl-[ 与 Esc 同码")),
                         // 数字已经被 shared_byte 归一成 punct，这里只拦手工写进 ini 的数字
                         '0'..='9' => {
-                            return Some("Ctrl+数字被 Windows Terminal 用来切标签，mac/Linux 又与其它组合同码");
+                            return Some(t("Ctrl+数字被 Windows Terminal 用来切标签，mac/Linux 又与其它组合同码"));
                         }
-                        ' ' => return Some("Ctrl+空格与 Ctrl-2 同码，三平台送达不一致"),
-                        '/' => return Some("Ctrl-/ 与 Ctrl-_ 同码，mac/Linux 会当成后者"),
+                        ' ' => return Some(t("Ctrl+空格与 Ctrl-2 同码，三平台送达不一致")),
+                        '/' => return Some(t("Ctrl-/ 与 Ctrl-_ 同码，mac/Linux 会当成后者")),
                         _ => {}
                     }
                 }
@@ -198,16 +199,16 @@ impl Action {
 
     pub fn label(self) -> &'static str {
         match self {
-            Action::NewTab => "新建标签页",
-            Action::NextTab => "下一个标签",
-            Action::PrevTab => "上一个标签",
-            Action::CloseTab => "关闭标签 / 断开",
-            Action::HostList => "返回主机列表",
-            Action::Browser => "文件浏览器",
-            Action::Passthrough => "内嵌 / 直通切换",
-            Action::Redraw => "整屏重绘",
-            Action::Search => "搜索历史输出",
-            Action::Containers => "容器视图",
+            Action::NewTab => t("新建标签页"),
+            Action::NextTab => t("下一个标签"),
+            Action::PrevTab => t("上一个标签"),
+            Action::CloseTab => t("关闭标签 / 断开"),
+            Action::HostList => t("返回主机列表"),
+            Action::Browser => t("文件浏览器"),
+            Action::Passthrough => t("内嵌 / 直通切换"),
+            Action::Redraw => t("整屏重绘"),
+            Action::Search => t("搜索历史输出"),
+            Action::Containers => t("容器视图"),
         }
     }
 
@@ -302,11 +303,11 @@ impl KeyBinds {
 /// 本机改键前该知道的一件事（终端/系统会自己吃掉哪些键）。
 pub fn platform_note() -> &'static str {
     if cfg!(target_os = "macos") {
-        "本机：Mac 键盘的 F 键默认是媒体键，F2/F3/F5/F6 要先按 fn（系统设置→键盘→把 F1、F2 等作为标准功能键）；Alt 组合要终端把 Option 设为 Esc+/Meta（iTerm2 默认如此，Terminal.app 需自行打开）"
+        t("本机：Mac 键盘的 F 键默认是媒体键，F2/F3/F5/F6 要先按 fn（系统设置→键盘→把 F1、F2 等作为标准功能键）；Alt 组合要终端把 Option 设为 Esc+/Meta（iTerm2 默认如此，Terminal.app 需自行打开）")
     } else if cfg!(windows) {
-        "本机：Windows Terminal 自己占用了 Ctrl+1–8（切标签）与 F11（全屏），传统控制台里 Alt+字母会唤起窗口菜单——推荐 F2–F9 与 Ctrl+字母"
+        t("本机：Windows Terminal 自己占用了 Ctrl+1–8（切标签）与 F11（全屏），传统控制台里 Alt+字母会唤起窗口菜单——推荐 F2–F9 与 Ctrl+字母")
     } else {
-        "本机：GNOME/KDE 等终端把 F10 用作菜单、F11 用作全屏，部分窗口管理器还占用 F1/F12——推荐 F2–F9 与 Ctrl+字母"
+        t("本机：GNOME/KDE 等终端把 F10 用作菜单、F11 用作全屏，部分窗口管理器还占用 F1/F12——推荐 F2–F9 与 Ctrl+字母")
     }
 }
 

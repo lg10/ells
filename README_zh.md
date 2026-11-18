@@ -152,14 +152,15 @@ ells <子命令> …            无界面，脚本 / CI 用：list · exec · sf
   ells completions bash|zsh|fish
 
   退出码是对外契约：0 成功 · 1 失败（连不上 / 认证被拒 / 主机密钥被拒 / 远端命令非 0）
-  · 2 用法或安全闸门（差一个 --yes 之类，原因用中文打在 stderr）· 124 --timeout 到点。
+  · 2 用法或安全闸门（差一个 --yes 之类，原因打在 stderr）· 124 --timeout 到点。
   `ells exec` 里远端命令的退出码原样透传。红线只有一条：任何密码、私钥内容、主密码
   都不会被打印，`--format json` 里能出现的只有可公开的元数据。
 
 环境变量：ELLS_LOG=1 把内部日志写到 stderr；ELLS_ZMODEM_LOG=1 额外把 sz/rz
 拦截诊断写入 ~/.ells/zmodem.log；ELLS_YES=1 等价于 -y；ELLS_MASTER 给无头子命令
 喂主密码（管道里也可以把主密码作为 stdin 第一行）；ELLS_UPDATE_SOURCES
-指定更新源（`github` 或镜像前缀，逗号 / 分号分隔）。
+指定更新源（`github` 或镜像前缀，逗号 / 分号分隔）；ELLS_LANG=zh|en
+覆盖界面语言（默认跟随系统：简体中文，其余英文）。
 
 配置文件都在 ~/.ells/：vault.bin（保险库）、settings.ini（设置）、
 known_hosts（主机密钥记录）、audit.log（操作记录）、logs/（会话记录）、

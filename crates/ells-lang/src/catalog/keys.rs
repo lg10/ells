@@ -1,0 +1,27 @@
+//! 由 .tmp_missing.tsv 生成：键 = 源码原句，值 = 英文。
+
+pub static ENTRIES: &[(&str, &str)] = &[
+    ("Ctrl+数字被 Windows Terminal 用来切标签，mac/Linux 又与其它组合同码", "Ctrl+digits switch tabs in Windows Terminal and share bytes with other chords on mac/Linux"),
+    ("Ctrl+空格与 Ctrl-2 同码，三平台送达不一致", "Ctrl+Space is the same byte as Ctrl-2 and arrives differently on each platform"),
+    ("Ctrl-/ 与 Ctrl-_ 同码，mac/Linux 会当成后者", "Ctrl-/ is the same byte as Ctrl-_ and arrives as the latter on mac/Linux"),
+    ("Ctrl-C 要留给远端中断信号", "Ctrl-C must stay free for the remote interrupt"),
+    ("Ctrl-H 与 Backspace 同码", "Ctrl-H is the same byte as Backspace"),
+    ("Ctrl-I 与 Tab 同码", "Ctrl-I is the same byte as Tab"),
+    ("Ctrl-M 与 Enter 同码", "Ctrl-M is the same byte as Enter"),
+    ("Ctrl-[ 与 Esc 同码", "Ctrl-[ is the same byte as Esc"),
+    ("F1 是帮助键，占用后会无法查看键位说明", "F1 is the help key; binding it hides the key reference"),
+    ("F10–F12 常被终端或系统吃掉（菜单/全屏/媒体键），三平台不可靠", "F10–F12 are often eaten by the terminal or OS (menus/fullscreen/media), so they are unreliable"),
+    ("上一个标签", "Previous tab"),
+    ("下一个标签", "Next tab"),
+    ("关闭标签 / 断开", "Close tab / disconnect"),
+    ("内嵌 / 直通切换", "Built-in / passthrough"),
+    ("功能键只支持 F2–F9", "Only F2–F9 are supported"),
+    ("容器视图", "Containers"),
+    ("必须带 Ctrl 或 Alt 修饰，否则会吞掉普通输入", "Must be a Ctrl or Alt chord, or it swallows normal input"),
+    ("整屏重绘", "Full redraw"),
+    ("新建标签页", "New tab"),
+    ("本机：GNOME/KDE 等终端把 F10 用作菜单、F11 用作全屏，部分窗口管理器还占用 F1/F12——推荐 F2–F9 与 Ctrl+字母", "Here: GNOME/KDE terminals use F10 for menus and F11 for fullscreen, and some window managers grab F1/F12 — F2–F9 and Ctrl+letters are the safe picks"),
+    ("本机：Mac 键盘的 F 键默认是媒体键，F2/F3/F5/F6 要先按 fn（系统设置→键盘→把 F1、F2 等作为标准功能键）；Alt 组合要终端把 Option 设为 Esc+/Meta（iTerm2 默认如此，Terminal.app 需自行打开）", "Here: Mac F-keys are media keys by default, so F2/F3/F5/F6 need fn (System Settings → Keyboard → use F1, F2, etc. as standard function keys); Alt chords need the terminal to send Option as Esc+/Meta (iTerm2 does by default, Terminal.app must be configured)"),
+    ("本机：Windows Terminal 自己占用了 Ctrl+1–8（切标签）与 F11（全屏），传统控制台里 Alt+字母会唤起窗口菜单——推荐 F2–F9 与 Ctrl+字母", "Here: Windows Terminal takes Ctrl+1–8 (tabs) and F11 (fullscreen) for itself, and Alt+letters open the window menu in the legacy console — F2–F9 and Ctrl+letters are the safe picks"),
+    ("返回主机列表", "Back to host list"),
+];

@@ -5,6 +5,7 @@
 //! 2. 任何一次读写之间都检查取消位，Ctrl-C 能在一个块内停下；
 //! 3. 递归传输对外只报一条累计进度，用户看到的是一根条而不是刷屏的条。
 
+use ells_lang::{t, tf};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -72,7 +73,7 @@ pub struct Cancelled;
 
 impl std::fmt::Display for Cancelled {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("传输已取消")
+        f.write_str(t("传输已取消"))
     }
 }
 
@@ -161,7 +162,7 @@ pub async fn remote_meta(sftp: &SftpSession, path: &str) -> Result<Option<Meta>>
         {
             Ok(None)
         }
-        Err(err) => Err(anyhow!("无法读取远端路径 {path}: {err}")),
+        Err(err) => Err(anyhow!("{}", tf!("无法读取远端路径 {path}: {err}"))),
     }
 }
 
@@ -198,7 +199,7 @@ pub fn parse_mode(text: &str) -> Option<u32> {
 /// 一次 chmod 不该顺手把文件改成别人的或把 mtime 抹平。
 pub async fn chmod(sftp: &SftpSession, path: &str, mode: u32) -> Result<()> {
     if mode > 0o7777 {
-        bail!("权限超出 07777：{mode:o}");
+        bail!("{}", tf!("权限超出 07777：{mode:o}"));
     }
     let attrs = russh_sftp::protocol::FileAttributes {
         permissions: Some(mode),
@@ -233,7 +234,7 @@ pub async fn remove_one(sftp: &SftpSession, path: &str, is_dir: bool) -> Result<
 /// 因此不存在环路风险。
 pub async fn remove_tree(sftp: &SftpSession, path: &str, cancel: &Cancel) -> Result<usize> {
     let Some(meta) = remote_meta(sftp, path).await? else {
-        bail!("{path} 不存在");
+        bail!("{}", tf!("{path} 不存在"));
     };
     if !meta.is_dir {
         remove_one(sftp, path, false).await?;
@@ -517,11 +518,11 @@ where
         if cancel.is_cancelled() {
             return Err(Cancelled.into());
         }
-        let n = read.read(&mut buf).await.context("读取数据失败")?;
+        let n = read.read(&mut buf).await.context(t("读取数据失败"))?;
         if n == 0 {
             break;
         }
-        write.write_all(&buf[..n]).await.context("写入数据失败")?;
+        write.write_all(&buf[..n]).await.context(t("写入数据失败"))?;
         done += n as u64;
         if last_emit.elapsed() >= EMIT_INTERVAL {
             let _ = tx.send(Progress {

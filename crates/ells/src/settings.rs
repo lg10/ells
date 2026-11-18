@@ -1,5 +1,6 @@
 //! 全局设置：`~/.ells/settings.ini`（key=value 行，无需序列化依赖）。
 
+use ells_lang::t;
 use std::path::PathBuf;
 
 use crate::keybinds::{Action, Chord, KeyBinds};
@@ -40,9 +41,9 @@ impl EditOpen {
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Builtin => "内置编辑器",
-            Self::Local => "本地程序",
-            Self::Native => "原生（远端 vi）",
+            Self::Builtin => t("内置编辑器"),
+            Self::Local => t("本地程序"),
+            Self::Native => t("原生（远端 vi）"),
         }
     }
 
@@ -134,7 +135,7 @@ pub fn read_master_backup() -> Option<String> {
 
 pub fn write_master_backup(master: &str) -> std::io::Result<()> {
     let path = master_backup_path().ok_or_else(|| {
-        std::io::Error::other("无法定位用户主目录")
+        std::io::Error::other(t("无法定位用户主目录"))
     })?;
     // 原子写：这个文件是明文主密码副本，半截文件等于保险库彻底打不开
     ells_core::write_atomic(&path, master.as_bytes())
