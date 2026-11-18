@@ -1,10 +1,86 @@
 //! 全局设置：`~/.ells/settings.ini`（key=value 行，无需序列化依赖）。
 
-use ells_lang::t;
+use ells_lang::{t, Lang};
 use std::path::PathBuf;
 
 use crate::keybinds::{Action, Chord, KeyBinds};
 use crate::theme;
+
+/// 界面语言：默认跟随系统（`ELLS_LANG` > 系统语言 > 英文），也可以在这里钉死。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LangSetting {
+    /// 启动时按环境变量 / 系统语言探测（现状行为）
+    Auto,
+    Zh,
+    En,
+}
+
+impl LangSetting {
+    pub const ALL: [LangSetting; 3] = [Self::Auto, Self::Zh, Self::En];
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim() {
+            "auto" => Some(Self::Auto),
+            "zh" => Some(Self::Zh),
+            "en" => Some(Self::En),
+            _ => None,
+        }
+    }
+
+    pub fn ini_value(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Zh => "zh",
+            Self::En => "en",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => t("跟随系统"),
+            Self::Zh => t("简体中文"),
+            Self::En => "English",
+        }
+    }
+
+    /// 设置面板里按 ←（backwards）或 →/Enter 循环。
+    pub fn shift(self, backwards: bool) -> Self {
+        let at = Self::ALL.iter().position(|m| *m == self).unwrap_or(0);
+        let len = Self::ALL.len();
+        let next = if backwards { at + len - 1 } else { at + 1 };
+        Self::ALL[next % len]
+    }
+
+    pub fn explicit(self) -> Option<Lang> {
+        match self {
+            Self::Auto => None,
+            Self::Zh => Some(Lang::Zh),
+            Self::En => Some(Lang::En),
+        }
+    }
+
+    /// 让全局语言立刻对齐到这一项；`Auto` 重新走一次探测，
+    /// 这样从"英文"切回"跟随系统"不用重启。
+    pub fn apply(self) {
+        ells_lang::set_lang(self.explicit().unwrap_or_else(ells_lang::detect));
+    }
+}
+
+/// 解析参数之前先认盘上的 `lang=`：clap 的 `--help` 也得跟着设置走。
+/// 只读这一行，不碰主题、不改任何东西。
+pub fn apply_saved_language() {
+    let Some(path) = settings_path() else { return };
+    let Ok(text) = std::fs::read_to_string(&path) else { return };
+    for line in text.lines() {
+        let Some((k, v)) = line.split_once('=') else { continue };
+        if k.trim() == "lang"
+            && let Some(setting) = LangSetting::parse(v)
+        {
+            setting.apply();
+            return;
+        }
+    }
+}
 
 /// 会话里手敲 `vi 文件` / 文件浏览器按 `e` 时怎么打开。默认用内置编辑器——
 /// 文件取回到临时文件后直接在 ells 自己的终端面板里改（行号 + 语法高亮），
@@ -63,6 +139,8 @@ impl EditOpen {
 
 #[derive(Debug, Clone)]
 pub struct Settings {
+    /// 界面语言：默认跟随系统，可在设置里钉死中文 / 英文
+    pub lang: LangSetting,
     /// 终端输出高亮（docker ps / 日志级别）
     pub highlight: bool,
     /// SSH 空闲保活间隔（秒），作用于新建连接
@@ -94,6 +172,8 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            // 默认跟随系统：以前怎么判断现在还怎么判断
+            lang: LangSetting::Auto,
             highlight: true,
             keepalive_secs: 30,
             master_password_enabled: true,
@@ -153,6 +233,8 @@ impl Settings {
     pub fn load() -> Self {
         let s = Self::read_from_disk();
         theme::apply(s.theme);
+        // 语言不在这里落地：update.rs 的源列表解析也会调 load()，从盘上回写
+        // 会把设置面板里刚切换的预览语言打回去。启动与「取消」两处显式 apply。
         s
     }
 
@@ -164,6 +246,12 @@ impl Settings {
             let Some((k, v)) = line.split_once('=') else { continue };
             let k = k.trim();
             match k {
+                "lang" => {
+                    // 写错的值忽略，保留「跟随系统」
+                    if let Some(m) = LangSetting::parse(v) {
+                        s.lang = m;
+                    }
+                }
                 "highlight" => s.highlight = v.trim() == "true",
                 "keepalive_secs" => {
                     if let Ok(n) = v.trim().parse::<u64>() {
@@ -241,7 +329,8 @@ impl Settings {
             let _ = std::fs::create_dir_all(dir);
         }
         let mut text = format!(
-            "highlight={}\nkeepalive_secs={}\nmaster_password_enabled={}\ntheme={}\nauto_update={}\nsession_log={}\nmetrics={}\nupdate_sources={}\nedit_open={}\nlist_sort={}\nreconnect_attempts={}\nreconnect_initial_ms={}\nreconnect_max_ms={}\nreconnect_stable_secs={}\nreconnect_jitter={}\n",
+            "lang={}\nhighlight={}\nkeepalive_secs={}\nmaster_password_enabled={}\ntheme={}\nauto_update={}\nsession_log={}\nmetrics={}\nupdate_sources={}\nedit_open={}\nlist_sort={}\nreconnect_attempts={}\nreconnect_initial_ms={}\nreconnect_max_ms={}\nreconnect_stable_secs={}\nreconnect_jitter={}\n",
+            self.lang.ini_value(),
             self.highlight,
             self.keepalive_secs,
             self.master_password_enabled,
@@ -268,7 +357,34 @@ impl Settings {
 
 #[cfg(test)]
 mod tests {
-    use super::EditOpen;
+    use super::{EditOpen, LangSetting};
+
+    #[test]
+    fn lang_setting_parses_only_known_values() {
+        assert_eq!(LangSetting::parse("auto"), Some(LangSetting::Auto));
+        assert_eq!(LangSetting::parse(" zh \n"), Some(LangSetting::Zh));
+        assert_eq!(LangSetting::parse("en"), Some(LangSetting::En));
+        assert_eq!(LangSetting::parse("fr"), None);
+        assert_eq!(LangSetting::Auto.ini_value(), "auto");
+        assert_eq!(LangSetting::Zh.ini_value(), "zh");
+        assert_eq!(LangSetting::En.ini_value(), "en");
+    }
+
+    #[test]
+    fn lang_setting_cycles_both_ways() {
+        assert_eq!(LangSetting::Auto.shift(false), LangSetting::Zh);
+        assert_eq!(LangSetting::Zh.shift(false), LangSetting::En);
+        assert_eq!(LangSetting::En.shift(false), LangSetting::Auto);
+        assert_eq!(LangSetting::Auto.shift(true), LangSetting::En);
+        assert_eq!(LangSetting::En.shift(true), LangSetting::Zh);
+    }
+
+    #[test]
+    fn only_auto_follows_the_system() {
+        assert_eq!(LangSetting::Auto.explicit(), None);
+        assert_eq!(LangSetting::Zh.explicit(), Some(ells_lang::Lang::Zh));
+        assert_eq!(LangSetting::En.explicit(), Some(ells_lang::Lang::En));
+    }
 
     #[test]
     fn edit_open_parses_only_known_values() {

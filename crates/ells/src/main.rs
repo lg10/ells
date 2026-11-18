@@ -105,6 +105,8 @@ fn localize_arg(mut arg: clap::Arg) -> clap::Arg {
 fn main() -> Result<()> {
     // 语言要先定下来：clap 的帮助文本、panic 钩子和所有 t() 都看它
     ells_lang::init();
+    // 设置里钉死的语言优先于系统探测（默认 auto 时什么都不改）
+    settings::apply_saved_language();
     install_panic_hook();
     if std::env::var("ELLS_LOG").is_ok() {
         tracing_subscriber::fmt()

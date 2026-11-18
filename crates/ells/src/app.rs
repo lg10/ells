@@ -1191,6 +1191,8 @@ pub struct App {
     pub tunnel_ports: HashMap<String, Vec<PortMap>>,
     /// 点底栏磁盘格弹出的挂载点小面板（会话页，只读）。
     pub disk_popup: bool,
+    /// 点底栏行尾「负载 …」弹出的说明面板（会话页，只读）。
+    pub load_popup: bool,
     /// 点 CPU / 内存格弹出的进程排行（会话页，只读，2 秒自动刷新）。
     pub proc_popup: Option<ProcPopup>,
     /// 进程排行的代号：每次开窗/刷新都往上走，旧回包和旧定时器对不上就作废。
@@ -1451,6 +1453,8 @@ impl App {
         tunnels: TunnelManager,
     ) -> Self {
         let settings = Settings::load();
+        // 盘上钉死的语言要在第一帧之前生效（main 里只为 --help 提前认过一次）
+        settings.lang.apply();
         ells_core::ssh::set_keepalive_interval(settings.keepalive_secs);
         // 保险库、known_hosts、自动解锁凭据都在 ~/.ells。首启先把目录收紧再让用户建库；
         // 之后目录已被收紧过（新文件跟着继承），这一遍挪到后台，别让 Windows 上
@@ -1518,6 +1522,7 @@ impl App {
             ports_open: false,
             tunnel_ports: HashMap::new(),
             disk_popup: false,
+            load_popup: false,
             proc_popup: None,
             proc_seq: 0,
             known_open: false,
@@ -1611,6 +1616,7 @@ impl App {
             || self.rules_open
             || self.ports_open
             || self.disk_popup
+            || self.load_popup
             || self.proc_popup.is_some()
             || self.slots[self.work].docker.open
             || self.known_open
@@ -2585,6 +2591,13 @@ impl App {
             self.handle_disk_popup_key(&key);
             return;
         }
+        if self.load_popup {
+            // 只读说明：退出键关掉，其余键吞掉，别漏到终端里。
+            if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')) {
+                self.load_popup = false;
+            }
+            return;
+        }
         if self.ports_open {
             self.handle_ports_key(&key);
             return;
@@ -3398,6 +3411,7 @@ impl App {
                 mt_r,
                 rc_r,
                 vi_r,
+                lang_r,
                 save_r,
                 cancel_r,
             ] = ui::settings_hit_rects(self.last_area);
@@ -3432,6 +3446,9 @@ impl App {
             } else if hit(vi_r, column, row) {
                 self.settings_focus = 10;
                 self.shift_edit_open(false);
+            } else if hit(lang_r, column, row) {
+                self.settings_focus = 11;
+                self.step_lang(false);
             } else if hit(save_r, column, row) {
                 self.save_settings();
             } else if hit(cancel_r, column, row) {
@@ -3558,6 +3575,13 @@ impl App {
             }
             return;
         }
+        // 负载说明小面板：同样点外面就关。
+        if self.load_popup {
+            if !hit(ui::load_popup_rect(self.last_area), column, row) {
+                self.load_popup = false;
+            }
+            return;
+        }
         // 端口映射弹窗：点外面就关，表本身只读不必选。
         if self.ports_open {
             if !hit(ui::ports_rect(self.last_area), column, row) {
@@ -3662,6 +3686,17 @@ impl App {
                         .is_some_and(|r| hit(r, column, row))
                 } {
                     self.disk_popup = true;
+                } else if {
+                    // 底栏行尾的「负载 1/5/15」：点开解释这三个数是什么意思。
+                    let footer = self.footer_rows(self.work);
+                    footer > 0
+                        && ui::load_cell_rect(
+                            &self.slots[self.work].metrics,
+                            ui::session_footer_rect(self.last_area, footer),
+                        )
+                        .is_some_and(|r| hit(r, column, row))
+                } {
+                    self.load_popup = true;
                 } else if hit(
                     ui::session_emu_rect(self.last_area, self.footer_rows(self.work)),
                     column,
@@ -4050,7 +4085,7 @@ impl App {
                 self.settings_focus = self.settings_focus.saturating_sub(1);
             }
             KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
-                self.settings_focus = (self.settings_focus + 1).min(12);
+                self.settings_focus = (self.settings_focus + 1).min(13);
             }
             KeyCode::Enter | KeyCode::Char(' ') => self.apply_settings_focus(),
             KeyCode::Left => match self.settings_focus {
@@ -4071,6 +4106,7 @@ impl App {
                         step_reconnect_attempts(self.settings.reconnect.max_attempts, false);
                 }
                 10 => self.shift_edit_open(true),
+                11 => self.step_lang(true),
                 _ => {}
             },
             KeyCode::Right => match self.settings_focus {
@@ -4091,6 +4127,7 @@ impl App {
                         step_reconnect_attempts(self.settings.reconnect.max_attempts, true);
                 }
                 10 => self.shift_edit_open(false),
+                11 => self.step_lang(false),
                 _ => {}
             },
             KeyCode::Char('h') => self.settings.highlight = !self.settings.highlight,
@@ -4185,7 +4222,8 @@ impl App {
 
     /// Enter/空格/点击 对当前聚焦项生效：0 切换高亮、1 循环保活档位、
     /// 2 主密码保护开关、3 进入修改主密码输入、4 打开快捷键面板、5 下一套主题、
-    /// 6 检查/开始更新、7 保存、其余取消
+    /// 6 检查/开始更新、7 会话记录、8 主机指标、9 重连次数、10 vi 打开方式、
+    /// 11 界面语言、12 保存、其余取消
     fn apply_settings_focus(&mut self) {
         match self.settings_focus {
             0 => self.settings.highlight = !self.settings.highlight,
@@ -4206,7 +4244,8 @@ impl App {
                     cycle_reconnect_attempts(self.settings.reconnect.max_attempts);
             }
             10 => self.shift_edit_open(false),
-            11 => self.save_settings(),
+            11 => self.step_lang(false),
+            12 => self.save_settings(),
             _ => self.cancel_settings(),
         }
     }
@@ -4226,6 +4265,13 @@ impl App {
     fn step_theme(&mut self, backwards: bool) {
         self.settings.theme = self.settings.theme.shift(backwards);
         theme::apply(self.settings.theme);
+    }
+
+    /// 换语言：和主题一样先改草稿再立刻生效（整屏下一帧就是新语言），
+    /// 保存才落盘；取消时由 `cancel_settings` 按盘上的值回滚。
+    fn step_lang(&mut self, backwards: bool) {
+        self.settings.lang = self.settings.lang.shift(backwards);
+        self.settings.lang.apply();
     }
 
     /// 后台查一次新版本。启动时问一次、设置页按行时再问一次，都不占事件环。
@@ -4485,6 +4531,7 @@ impl App {
 
     fn save_settings(&mut self) {
         self.settings.save();
+        self.settings.lang.apply();
         let _ = audit::record(
             AuditKind::Settings,
             "settings",
@@ -4527,6 +4574,8 @@ impl App {
     fn cancel_settings(&mut self) {
         // 丢弃未保存的改动，回到磁盘上的当前值
         self.settings = Settings::load();
+        // 语言是即时预览的，取消要跟着盘上的值回滚
+        self.settings.lang.apply();
         ells_core::ssh::set_keepalive_interval(self.settings.keepalive_secs);
         // 指标开关立刻生效：关掉就收回那一行、停掉所有采集通道；
         // 打开就给已经连上的标签补上，不必重连

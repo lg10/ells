@@ -2670,6 +2670,9 @@ fn draw_session(f: &mut Frame, app: &mut App) {
     if app.disk_popup {
         draw_disk_popup(f, app);
     }
+    if app.load_popup {
+        draw_load_popup(f, app);
+    }
     if let Some(popup) = &app.proc_popup
         && popup.slot == app.slots[idx].id
     {
@@ -2766,6 +2769,20 @@ pub fn disk_cell_rect(m: &crate::app::Metrics, area: Rect) -> Option<Rect> {
     })
 }
 
+/// 行尾「负载 1/5/15」的鼠标命中矩形。那句说明装不下时整句不画，也就没有可点的地方。
+pub fn load_cell_rect(m: &crate::app::Metrics, area: Rect) -> Option<Rect> {
+    let (x, w) = metric_render(m, area.width).load_span?;
+    if w == 0 {
+        return None;
+    }
+    Some(Rect {
+        x: area.x.saturating_add(x as u16),
+        y: area.y,
+        width: w as u16,
+        height: 1,
+    })
+}
+
 /// CPU / 内存格的鼠标命中矩形；那一格没有数（`—`）时也照收 —— 用户点它是想看
 /// 进程列表，而不是点一个百分比数字。
 pub fn proc_cell_rect(
@@ -2811,6 +2828,11 @@ pub fn proc_popup_rect(area: Rect, rows: usize) -> Rect {
     centered(64, h, area)
 }
 
+/// 负载说明弹窗：固定几行，宽一点才好读整句。
+pub fn load_popup_rect(area: Rect) -> Rect {
+    centered(64, 9, area)
+}
+
 /// 一根条的填充格数：向上取整，1% 也要看得见一格。
 fn bar_filled(percent: Option<u8>, width: usize) -> usize {
     match percent {
@@ -2840,6 +2862,8 @@ struct MetricRender {
     cpu_span: Option<(usize, usize)>,
     mem_span: Option<(usize, usize)>,
     disk_span: Option<(usize, usize)>,
+    /// 行尾「负载 …」那句的列偏移
+    load_span: Option<(usize, usize)>,
 }
 
 fn metric_render(m: &crate::app::Metrics, width: u16) -> MetricRender {
@@ -2850,6 +2874,7 @@ fn metric_render(m: &crate::app::Metrics, width: u16) -> MetricRender {
             cpu_span: None,
             mem_span: None,
             disk_span: None,
+            load_span: None,
         };
     }
     if m.disks.len() > 1 && let Some(render) = multi_disk_render(m, width) {
@@ -2926,6 +2951,7 @@ fn multi_disk_render(m: &crate::app::Metrics, width: u16) -> Option<MetricRender
             };
             let mut cpu_span = None;
             let mut mem_span = None;
+            let mut load_span = None;
             for (i, cell) in cells.iter().take(2).enumerate() {
                 if i > 0 {
                     push(sep.to_string(), MetricTone::Dim, &mut col);
@@ -2986,7 +3012,9 @@ fn multi_disk_render(m: &crate::app::Metrics, width: u16) -> Option<MetricRender
             let load = &cells[0].detail;
             let w = display_width(load);
             if w > 0 && w + 2 <= avail.saturating_sub(col) {
+                let start = col + 2;
                 push(format!("  {load}"), MetricTone::Dim, &mut col);
+                load_span = Some((start, w));
             }
             drop(push);
             // 兜底：真的画出来比算出来宽一格时别交出去，退回更省的那套。
@@ -2998,6 +3026,7 @@ fn multi_disk_render(m: &crate::app::Metrics, width: u16) -> Option<MetricRender
                 mem_span,
                 parts,
                 disk_span: Some((disk_start, disk_w)),
+                load_span,
             });
         }
     }
@@ -3050,6 +3079,7 @@ fn single_disk_render(m: &crate::app::Metrics, width: u16) -> MetricRender {
     let mut cpu_span = None;
     let mut mem_span = None;
     let mut disk_span = None;
+    let mut load_span = None;
     let mut push = |text: String, tone: MetricTone, col: &mut usize| {
         *col += display_width(&text);
         parts.push((text, tone));
@@ -3087,10 +3117,16 @@ fn single_disk_render(m: &crate::app::Metrics, width: u16) -> MetricRender {
     // 整行的装饰都在这之后：三根条已经摆完，等宽的那部分是用户读的数，剩下的才是话。
     for (n, cell) in tail.iter().enumerate() {
         let gap = if n == 0 { "  " } else { " · " };
-        parts.push((format!("{gap}{}", cell.detail), MetricTone::Dim));
+        let start = col + display_width(gap);
+        push(format!("{gap}{}", cell.detail), MetricTone::Dim, &mut col);
+        // CPU 那句就是 1/5/15 负载：行尾单击它打开说明
+        if cell.label == "CPU" {
+            load_span = Some((start, display_width(&cell.detail)));
+        }
     }
-    // 命中范围只到百分比为止：行尾说明不属于那一格。
-    MetricRender { cpu_span, mem_span, disk_span, parts }
+    drop(push);
+    // 命中范围只到百分比为止：行尾说明不属于那一格（负载那句另有一个）
+    MetricRender { cpu_span, mem_span, disk_span, load_span, parts }
 }
 
 /// 一格的配色：<70 正常、70~89 提醒、≥90 危险；没有数就是灰。
@@ -3258,6 +3294,63 @@ fn draw_disk_popup(f: &mut Frame, app: &App) {
             height: 1,
         },
     );
+}
+
+/// 点底栏行尾「负载 …」弹出的说明（只读）：这三个数是什么、怎么读。
+fn draw_load_popup(f: &mut Frame, app: &App) {
+    let load = app.slots[app.active].metrics.load;
+    let area = load_popup_rect(app.last_area);
+    f.buffer_mut().set_style(area, Style::default().bg(theme::bg()));
+    f.render_widget(Clear, area);
+    let block = Block::bordered()
+        .title(t(" 负载（load average） "))
+        .title_style(Style::default().fg(theme::accent()).add_modifier(Modifier::BOLD));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    f.render_widget(Paragraph::new(load_popup_lines(load)), inner);
+    f.render_widget(
+        Paragraph::new(t(" Esc/点击外部 关闭 · 读自 /proc/loadavg · 跟底栏每 5 秒刷新 "))
+            .style(Style::default().fg(theme::dim())),
+        Rect {
+            x: area.x,
+            y: area.y.saturating_add(area.height),
+            width: area.width,
+            height: 1,
+        },
+    );
+}
+
+/// 负载说明的正文：当前值 + 三句解释，抽出来是为了让行宽和措辞能被单测钉住。
+fn load_popup_lines(load: Option<ells_core::LoadSample>) -> Vec<Line<'static>> {
+    let current = match load {
+        Some(l) => tf!(" 这台机器现在：{}（1 / 5 / 15 分钟）", l.display()),
+        None => t(" 这台机器还没采到负载").to_string(),
+    };
+    let muted = Style::default().fg(theme::muted());
+    vec![
+        Line::from(Span::styled(
+            current,
+            Style::default().fg(theme::text()).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            t(" 负载 = 同一时刻平均有多少个任务在排队。"),
+            Style::default().fg(theme::text()),
+        )),
+        Line::from(Span::styled(
+            t(" 等 CPU 的、卡在磁盘读写上的都算，不等于 CPU 占用率。"),
+            muted,
+        )),
+        Line::from(Span::styled(
+            t(" 要除以 CPU 核数看：4 核上 4.00 约等于满载，0.42 还很空。"),
+            muted,
+        )),
+        Line::from(Span::styled(
+            t(" 长期高于核数，说明有任务一直在等，机器会显得卡。"),
+            muted,
+        )),
+    ]
 }
 
 /// 点底栏 CPU / 内存格弹出的进程排行（只读，每 2 秒换一版）。
@@ -4166,13 +4259,13 @@ fn clip_display(s: &str, width: usize) -> String {
 
 /// 设置弹窗面板。命中测试与绘制必须同源，加一行只改这一处。
 fn settings_panel(area: Rect) -> Rect {
-    centered(56, 15, area)
+    centered(56, 16, area)
 }
 
-/// 设置弹窗的 13 个可点击行：高亮 / 保活 / 主密码开关 / 修改主密码 / 快捷键 / 主题 /
-/// 检查更新 / 会话记录 / 主机指标 / 自动重连 / vi 打开方式 / 保存 / 取消。
+/// 设置弹窗的 14 个可点击行：高亮 / 保活 / 主密码开关 / 修改主密码 / 快捷键 / 主题 /
+/// 检查更新 / 会话记录 / 主机指标 / 自动重连 / vi 打开方式 / 界面语言 / 保存 / 取消。
 /// 必须与 draw_settings_overlay 的几何完全一致。
-pub fn settings_hit_rects(area: Rect) -> [Rect; 13] {
+pub fn settings_hit_rects(area: Rect) -> [Rect; 14] {
     let p = settings_panel(area);
     let ix = p.x + 1;
     let iy = p.y + 1;
@@ -4189,8 +4282,9 @@ pub fn settings_hit_rects(area: Rect) -> [Rect; 13] {
         Rect { x: ix, y: iy + 8, width: iw, height: 1 },
         Rect { x: ix, y: iy + 9, width: iw, height: 1 },
         Rect { x: ix, y: iy + 10, width: iw, height: 1 },
-        Rect { x: ix.saturating_add(iw / 2).saturating_sub(16), y: iy + 12, width: 14, height: 1 },
-        Rect { x: ix.saturating_add(iw / 2).saturating_add(2), y: iy + 12, width: 14, height: 1 },
+        Rect { x: ix, y: iy + 11, width: iw, height: 1 },
+        Rect { x: ix.saturating_add(iw / 2).saturating_sub(16), y: iy + 13, width: 14, height: 1 },
+        Rect { x: ix.saturating_add(iw / 2).saturating_add(2), y: iy + 13, width: 14, height: 1 },
     ]
 }
 
@@ -4436,7 +4530,22 @@ fn draw_settings_overlay(f: &mut Frame, app: &App) {
         ])),
         rects[10],
     );
-    // 行 11：操作提示（更新检查失败时这行让给它，长文案才放得下）
+    // 行 11：界面语言（默认跟随系统；钉死后 --help 与整个界面一起换）
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(t(" 界面语言："), row_base(focus == 11)),
+            Span::styled(
+                format!(" {} ", st.lang.label()),
+                row_base(focus == 11).fg(theme::accent()).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                t("←→/Enter 切换 · 立即生效"),
+                row_base(focus == 11).fg(theme::dim()),
+            ),
+        ])),
+        rects[11],
+    );
+    // 行 12：操作提示（更新检查失败时这行让给它，长文案才放得下）
     let hint = match &app.update.error {
         Some(err) => tf!(" 检查更新失败：{err}"),
         None => t(" ↑↓ 选择 · Enter/点击 修改 · ←→ 微调 · Esc 取消").to_string(),
@@ -4448,19 +4557,19 @@ fn draw_settings_overlay(f: &mut Frame, app: &App) {
                 .fg(if app.update.error.is_some() { theme::warn() } else { theme::dim() })
                 .bg(theme::bg()),
         ))),
-        Rect { x: rects[0].x, y: rects[0].y + 11, width: rects[0].width, height: 1 },
+        Rect { x: rects[0].x, y: rects[0].y + 12, width: rects[0].width, height: 1 },
     );
-    // 行 12：保存 / 取消按钮
+    // 行 13：保存 / 取消按钮
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             t("【 保 存 】"),
             Style::default()
                 .fg(theme::on_accent())
                 .bg(theme::accent_bg())
-                .add_modifier(if focus == 11 { Modifier::BOLD } else { Modifier::empty() })
-                .add_modifier(if focus == 11 { Modifier::UNDERLINED } else { Modifier::empty() }),
+                .add_modifier(if focus == 12 { Modifier::BOLD } else { Modifier::empty() })
+                .add_modifier(if focus == 12 { Modifier::UNDERLINED } else { Modifier::empty() }),
         ))),
-        rects[11],
+        rects[12],
     );
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -4468,10 +4577,10 @@ fn draw_settings_overlay(f: &mut Frame, app: &App) {
             Style::default()
                 .fg(theme::text())
                 .bg(theme::band())
-                .add_modifier(if focus == 12 { Modifier::BOLD } else { Modifier::empty() })
-                .add_modifier(if focus == 12 { Modifier::UNDERLINED } else { Modifier::empty() }),
+                .add_modifier(if focus == 13 { Modifier::BOLD } else { Modifier::empty() })
+                .add_modifier(if focus == 13 { Modifier::UNDERLINED } else { Modifier::empty() }),
         ))),
-        rects[12],
+        rects[13],
     );
 }
 
@@ -4843,15 +4952,15 @@ mod tests {
         let area = Rect::new(0, 0, 80, 24);
         let panel = settings_panel(area);
         let r = settings_hit_rects(area);
-        // 11 个可编辑项必须是连续的 11 行（… 主机指标 / 自动重连 / vi 打开方式）：
+        // 12 个可编辑项必须是连续的 12 行（… vi 打开方式 / 界面语言）：
         // 加一行时鼠标命中不能错位，画的那一行也不能点到别的行为
-        for i in 1..11 {
+        for i in 1..12 {
             assert_eq!(r[i].y, r[i - 1].y + 1, "第 {i} 行和上一行不挨着");
         }
-        assert_eq!(r[10].y, panel.y + 11);
+        assert_eq!(r[11].y, panel.y + 12);
         // 下一行是操作提示（不可点），按钮在它下面同一行
-        assert_eq!(r[11].y, r[12].y);
-        assert_eq!(r[11].y, panel.y + 13);
+        assert_eq!(r[12].y, r[13].y);
+        assert_eq!(r[12].y, panel.y + 14);
         for (i, rect) in r.iter().enumerate() {
             assert!(rect.right() <= panel.right(), "第 {i} 行超出面板右边界");
             assert!(rect.bottom() <= panel.bottom(), "第 {i} 行超出面板下边界");
@@ -5122,6 +5231,31 @@ mod tests {
         }
     }
 
+    /// 行尾负载说明的命中矩形必须真的盖在「负载 …」上；摆不下时不给空点击区。
+    #[test]
+    fn the_load_cell_rect_covers_the_load_text() {
+        let m = filled_metrics();
+        for width in [120u16, 80] {
+            let area = Rect::new(3, 7, width, 1);
+            let line = metric_line(&m, width);
+            match load_cell_rect(&m, area) {
+                Some(rect) => {
+                    let span = columns(&line, (rect.x - area.x) as usize, rect.width as usize);
+                    assert!(span.starts_with("负载"), "命中范围落在「{span}」（宽 {width}）");
+                    assert_eq!(rect.y, area.y);
+                }
+                None => assert!(
+                    !line.contains("负载"),
+                    "宽 {width} 画出了负载却没有命中格：「{line}」"
+                ),
+            }
+        }
+        // 宽屏上负载那句一定在，点击区必须落下
+        assert!(load_cell_rect(&m, Rect::new(3, 7, 120, 1)).is_some());
+        // 24 列连三格数字都摆不下，行尾说明整句被丢掉，就不该还能点
+        assert!(load_cell_rect(&m, Rect::new(0, 0, 24, 1)).is_none());
+    }
+
     /// CPU / 内存格的命中范围只覆盖自己那一格：点 CPU 不能误开内存排行，
     /// 也不能把行尾的负载说明算进去。单盘与多盘两种布局都要对。
     #[test]
@@ -5148,6 +5282,28 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// 负载说明弹窗：每行都得塞进 62 列内框，并且真的解释清楚这三个数、带上当前值。
+    #[test]
+    fn the_load_popup_lines_fit_and_explain_the_numbers() {
+        let m = filled_metrics();
+        let lines = load_popup_lines(m.load);
+        assert!(lines.iter().all(|l| l.width() <= 62), "最宽一行 {} 列", lines.iter().map(|l| l.width()).max().unwrap());
+        let text: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("0.42/0.31/0.19"), "没有当前值：{text}");
+        for word in ["排队", "核数", "CPU"] {
+            assert!(text.contains(word), "说明里缺少「{word}」：{text}");
+        }
+        // 还没采到负载时也要说人话，不能拿空值拼出「现在：」半句
+        let empty = load_popup_lines(None);
+        let text: String = empty.iter().flat_map(|l| l.spans.iter()).map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("还没采到"));
     }
 
     /// 进程排行弹窗的三种形态都要画得下：表头与每一行的总宽不能超过内框 62 列，

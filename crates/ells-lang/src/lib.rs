@@ -16,6 +16,7 @@
 use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{OnceLock, RwLock};
 
 pub mod catalog;
@@ -26,23 +27,40 @@ pub enum Lang {
     En,
 }
 
-static GLOBAL: OnceLock<Lang> = OnceLock::new();
+/// 0 = 还没定；设置页选完语言后可以直接改，不必重启。
+static GLOBAL: AtomicU8 = AtomicU8::new(0);
+const ZH_CODE: u8 = 1;
+const EN_CODE: u8 = 2;
+
+fn code(lang: Lang) -> u8 {
+    match lang {
+        Lang::Zh => ZH_CODE,
+        Lang::En => EN_CODE,
+    }
+}
 
 thread_local! {
     /// 测试与临时切换用：只影响当前线程，不碰全局。
     static OVERRIDE: Cell<Option<Lang>> = const { Cell::new(None) };
 }
 
-/// 由 `main` 在解析参数之前调一次；之后 [`lang`] 不再探测系统。
+/// 由 `main` 在解析参数之前调一次：只在全局还没定时探测一次；
+/// 之后设置页可以用 [`set_lang`] 覆盖。
 pub fn init() {
-    GLOBAL.get_or_init(detect);
+    let _ = GLOBAL.compare_exchange(0, code(detect()), Ordering::Relaxed, Ordering::Relaxed);
+}
+
+/// 设置页改了语言：全局立刻生效（`init` 之后再调用会覆盖启动时的探测结果）。
+pub fn set_lang(lang: Lang) {
+    GLOBAL.store(code(lang), Ordering::Relaxed);
 }
 
 pub fn lang() -> Lang {
-    OVERRIDE
-        .with(Cell::get)
-        .or_else(|| GLOBAL.get().copied())
-        .unwrap_or(Lang::Zh)
+    OVERRIDE.with(Cell::get).unwrap_or_else(|| match GLOBAL.load(Ordering::Relaxed) {
+        ZH_CODE => Lang::Zh,
+        EN_CODE => Lang::En,
+        _ => Lang::Zh,
+    })
 }
 
 /// 在 `f` 执行期间把当前线程的语言固定为 `lang`（嵌套调用会逐层还原）。
