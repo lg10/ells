@@ -9,8 +9,8 @@ use ratatui::widgets::{
 use ratatui::Frame;
 
 use crate::app::{
-    App, Choice, FieldKind, FieldRole, ListRow, Prompt, RULE_COLS, ScreenKind, Slot, UnlockState,
-    UnlockStage,
+    App, Choice, FieldKind, FieldRole, ListRow, ProcPopup, Prompt, RULE_COLS, ScreenKind, Slot,
+    UnlockState, UnlockStage,
 };
 use crate::containers::{
     action_label, detail_lines, exposure, menu_choice_label, ContainerAction, DetailLine,
@@ -2440,6 +2440,11 @@ fn draw_session(f: &mut Frame, app: &mut App) {
     if app.disk_popup {
         draw_disk_popup(f, app);
     }
+    if let Some(popup) = &app.proc_popup
+        && popup.slot == app.slots[idx].id
+    {
+        draw_proc_popup(f, app, popup);
+    }
     if app.slots[idx].docker.open {
         draw_docker_popup(f, &app.slots[idx].docker);
     }
@@ -2531,6 +2536,29 @@ pub fn disk_cell_rect(m: &crate::app::Metrics, area: Rect) -> Option<Rect> {
     })
 }
 
+/// CPU / 内存格的鼠标命中矩形；那一格没有数（`—`）时也照收 —— 用户点它是想看
+/// 进程列表，而不是点一个百分比数字。
+pub fn proc_cell_rect(
+    m: &crate::app::Metrics,
+    area: Rect,
+    kind: ells_core::ProcSort,
+) -> Option<Rect> {
+    let render = metric_render(m, area.width);
+    let (x, w) = match kind {
+        ells_core::ProcSort::Cpu => render.cpu_span,
+        ells_core::ProcSort::Mem => render.mem_span,
+    }?;
+    if w == 0 {
+        return None;
+    }
+    Some(Rect {
+        x: area.x.saturating_add(x as u16),
+        y: area.y,
+        width: w as u16,
+        height: 1,
+    })
+}
+
 /// 会话页底部指标行所在的一格（绘制与命中测试同源）。
 pub fn session_footer_rect(area: Rect, footer_rows: u16) -> Rect {
     Rect {
@@ -2544,6 +2572,12 @@ pub fn session_footer_rect(area: Rect, footer_rows: u16) -> Rect {
 /// 磁盘挂载点小面板的矩形；高度跟着盘数走。
 pub fn disk_popup_rect(area: Rect, rows: usize) -> Rect {
     let h = (rows as u16).saturating_add(4).clamp(6, 16);
+    centered(64, h, area)
+}
+
+/// 进程排行弹窗的矩形；高度跟着行数走，最多一屏 14 行。
+pub fn proc_popup_rect(area: Rect, rows: usize) -> Rect {
+    let h = (rows as u16).saturating_add(5).clamp(7, 20);
     centered(64, h, area)
 }
 
@@ -2570,9 +2604,11 @@ pub fn metric_parts(m: &crate::app::Metrics, width: u16) -> Vec<(String, MetricT
 /// 底栏最多平铺几块盘：再多就靠点击后的小面板。
 const DISK_INLINE_MAX: usize = 3;
 
-/// 一行渲染结果：分段文本 + 磁盘格在行内的列偏移（供鼠标命中测试）。
+/// 一行渲染结果：分段文本 + 各可点击格在行内的列偏移（供鼠标命中测试）。
 struct MetricRender {
     parts: Vec<(String, MetricTone)>,
+    cpu_span: Option<(usize, usize)>,
+    mem_span: Option<(usize, usize)>,
     disk_span: Option<(usize, usize)>,
 }
 
@@ -2581,6 +2617,8 @@ fn metric_render(m: &crate::app::Metrics, width: u16) -> MetricRender {
         return MetricRender {
             // 连上到第一轮回来之间一个数都没有：明说"在采"，别摆三条空槽看着像坏了
             parts: vec![(" 远端主机指标：正在采集第一轮…".to_string(), MetricTone::Dim)],
+            cpu_span: None,
+            mem_span: None,
             disk_span: None,
         };
     }
@@ -2656,10 +2694,13 @@ fn multi_disk_render(m: &crate::app::Metrics, width: u16) -> Option<MetricRender
                 *col += display_width(&text);
                 parts.push((text, tone));
             };
+            let mut cpu_span = None;
+            let mut mem_span = None;
             for (i, cell) in cells.iter().take(2).enumerate() {
                 if i > 0 {
                     push(sep.to_string(), MetricTone::Dim, &mut col);
                 }
+                let start = col;
                 push(format!(" {} ", cell.label), MetricTone::Label, &mut col);
                 let tone = MetricTone::of(cell.percent);
                 if bar_cpu > 0 {
@@ -2676,6 +2717,12 @@ fn multi_disk_render(m: &crate::app::Metrics, width: u16) -> Option<MetricRender
                     tone,
                     &mut col,
                 );
+                let span = Some((start, col - start));
+                if i == 0 {
+                    cpu_span = span;
+                } else {
+                    mem_span = span;
+                }
             }
             push(sep.to_string(), MetricTone::Dim, &mut col);
             let disk_start = col;
@@ -2716,7 +2763,12 @@ fn multi_disk_render(m: &crate::app::Metrics, width: u16) -> Option<MetricRender
             if col > avail {
                 continue;
             }
-            return Some(MetricRender { parts, disk_span: Some((disk_start, disk_w)) });
+            return Some(MetricRender {
+                cpu_span,
+                mem_span,
+                parts,
+                disk_span: Some((disk_start, disk_w)),
+            });
         }
     }
     None
@@ -2764,11 +2816,20 @@ fn single_disk_render(m: &crate::app::Metrics, width: u16) -> MetricRender {
         }
     }
     let mut parts: Vec<(String, MetricTone)> = Vec::new();
+    let mut col = 0usize;
+    let mut cpu_span = None;
+    let mut mem_span = None;
+    let mut disk_span = None;
+    let mut push = |text: String, tone: MetricTone, col: &mut usize| {
+        *col += display_width(&text);
+        parts.push((text, tone));
+    };
     for (i, cell) in cells.iter().enumerate() {
         if i > 0 {
-            parts.push((sep.to_string(), MetricTone::Dim));
+            push(sep.to_string(), MetricTone::Dim, &mut col);
         }
-        parts.push((format!(" {} ", cell.label), MetricTone::Label));
+        let start = col;
+        push(format!(" {} ", cell.label), MetricTone::Label, &mut col);
         let tone = MetricTone::of(cell.percent);
         let pct = cell
             .percent
@@ -2776,33 +2837,29 @@ fn single_disk_render(m: &crate::app::Metrics, width: u16) -> MetricRender {
             .unwrap_or_else(|| "—".to_string());
         if bar > 0 {
             let filled = bar_filled(cell.percent, bar);
-            parts.push((
+            push(
                 format!("{}{}", "█".repeat(filled), "░".repeat(bar - filled)),
                 tone.as_bar(),
-            ));
-            parts.push((" ".to_string(), MetricTone::Dim));
+                &mut col,
+            );
+            push(" ".to_string(), MetricTone::Dim, &mut col);
         }
-        parts.push((pct, tone));
+        push(pct, tone, &mut col);
+        let span = Some((start, col - start));
+        match cell.label {
+            "CPU" => cpu_span = span,
+            "内存" => mem_span = span,
+            "磁盘" => disk_span = span,
+            _ => {}
+        }
     }
     // 整行的装饰都在这之后：三根条已经摆完，等宽的那部分是用户读的数，剩下的才是话。
     for (n, cell) in tail.iter().enumerate() {
         let gap = if n == 0 { "  " } else { " · " };
         parts.push((format!("{gap}{}", cell.detail), MetricTone::Dim));
     }
-    // 磁盘格的命中范围只到百分比为止：行尾说明不属于那一格。
-    let disk_span = parts
-        .iter()
-        .position(|(text, _)| text == " 磁盘 ")
-        .map(|start| {
-            let x = parts[..start].iter().map(|(t, _)| display_width(t)).sum::<usize>();
-            let w = parts[start..]
-                .iter()
-                .take_while(|(t, _)| !t.starts_with("  ") && t != " · ")
-                .map(|(t, _)| display_width(t))
-                .sum::<usize>();
-            (x, w)
-        });
-    MetricRender { parts, disk_span }
+    // 命中范围只到百分比为止：行尾说明不属于那一格。
+    MetricRender { cpu_span, mem_span, disk_span, parts }
 }
 
 /// 一格的配色：<70 正常、70~89 提醒、≥90 危险；没有数就是灰。
@@ -2970,6 +3027,96 @@ fn draw_disk_popup(f: &mut Frame, app: &App) {
             height: 1,
         },
     );
+}
+
+/// 点底栏 CPU / 内存格弹出的进程排行（只读，每 2 秒换一版）。
+fn draw_proc_popup(f: &mut Frame, app: &App, popup: &ProcPopup) {
+    let rows = popup.procs.len().max(1);
+    let area = proc_popup_rect(app.last_area, rows);
+    f.buffer_mut().set_style(area, Style::default().bg(theme::bg()));
+    f.render_widget(Clear, area);
+    let block = Block::bordered()
+        .title(popup.title())
+        .title_style(Style::default().fg(theme::accent()).add_modifier(Modifier::BOLD));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    f.render_widget(Paragraph::new(proc_popup_lines(popup)), inner);
+    f.render_widget(
+        Paragraph::new(" Esc/点击外部 关闭 · 每 2 秒刷新 · ps 数值为进程生命周期平均 ")
+            .style(Style::default().fg(theme::dim())),
+        Rect {
+            x: area.x,
+            y: area.y.saturating_add(area.height),
+            width: area.width,
+            height: 1,
+        },
+    );
+}
+
+/// 弹窗内容行：查询中 / 失败 / 排行三种形态。抽出来是为了让列宽和配色能被单测钉住。
+fn proc_popup_lines(popup: &ProcPopup) -> Vec<Line<'static>> {
+    if let Some(err) = &popup.error {
+        return vec![
+            Line::from(Span::styled(
+                format!(" 查询失败：{}", inline(&clip_display(err, 50))),
+                Style::default().fg(theme::err()),
+            )),
+            Line::from(Span::styled(
+                " 服务器不允许 exec、或者 ps 不在 PATH 里时会是这样",
+                Style::default().fg(theme::muted()),
+            )),
+        ];
+    }
+    if popup.procs.is_empty() {
+        let text = if popup.loading {
+            " 正在通过已认证的连接查询进程列表…"
+        } else {
+            " 这台机器没有返回进程列表（ps 可能被限制）"
+        };
+        return vec![Line::from(Span::styled(text, Style::default().fg(theme::dim())))];
+    }
+    let mut out = vec![Line::from(vec![
+        Span::styled(
+            format!("{} {}", pad_display("#", 4), pad_display("PID", 8)),
+            Style::default().fg(theme::dim()).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            pad_display("进程", 30),
+            Style::default().fg(theme::dim()).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("{} {}", pad_display("CPU", 8), "内存"),
+            Style::default().fg(theme::dim()).add_modifier(Modifier::BOLD),
+        ),
+    ])];
+    for (i, p) in popup.procs.iter().enumerate() {
+        let cpu_tone = MetricTone::of(ells_core::metrics::round_percent(Some(p.cpu as f64)));
+        let mem_tone = MetricTone::of(ells_core::metrics::round_percent(Some(p.mem as f64)));
+        out.push(Line::from(vec![
+            Span::styled(
+                format!(
+                    "{} {}",
+                    pad_display(&(i + 1).to_string(), 4),
+                    pad_display(&p.pid.to_string(), 8)
+                ),
+                Style::default().fg(theme::muted()),
+            ),
+            Span::styled(
+                pad_display(&clip_display(&inline(&p.name), 28), 30),
+                Style::default().fg(theme::text()),
+            ),
+            Span::styled(
+                format!("{} ", pad_display(&format!("{:.1}%", p.cpu), 8)),
+                Style::default().fg(cpu_tone.color()),
+            ),
+            Span::styled(
+                format!("{:.1}%", p.mem),
+                Style::default().fg(mem_tone.color()),
+            ),
+        ]));
+    }
+    out
 }
 
 /// 容器视图面板的几何。`lines` 是这一屏真正要画的行数（含展开的端口）。
@@ -4742,6 +4889,70 @@ mod tests {
             );
             assert_eq!(rect.y, area.y);
         }
+    }
+
+    /// CPU / 内存格的命中范围只覆盖自己那一格：点 CPU 不能误开内存排行，
+    /// 也不能把行尾的负载说明算进去。单盘与多盘两种布局都要对。
+    #[test]
+    fn the_proc_cell_rects_cover_only_their_own_cells() {
+        for m in [filled_metrics(), multi_metrics()] {
+            for width in [120u16, 60, 40] {
+                let area = Rect::new(3, 7, width, 1);
+                let line = metric_line(&m, width);
+                for (kind, label, next) in [
+                    (ells_core::ProcSort::Cpu, "CPU", "内存"),
+                    (ells_core::ProcSort::Mem, "内存", "磁盘"),
+                ] {
+                    let rect = proc_cell_rect(&m, area, kind).expect("这一格该有命中范围");
+                    let span = columns(&line, (rect.x - area.x) as usize, rect.width as usize);
+                    assert!(
+                        span.starts_with(label) || span.starts_with(&format!(" {label}")),
+                        "命中范围落在「{span}」（宽 {width}）"
+                    );
+                    assert!(
+                        !span.contains(next),
+                        "「{label}」的命中范围吞到了下一个标签（宽 {width}）：{span}"
+                    );
+                    assert_eq!(rect.y, area.y);
+                }
+            }
+        }
+    }
+
+    /// 进程排行弹窗的三种形态都要画得下：表头与每一行的总宽不能超过内框 62 列，
+    /// 排行、查询中、失败三种状态各说各的话。
+    #[test]
+    fn the_proc_popup_lines_fit_and_say_what_is_happening() {
+        let procs = vec![
+            ells_core::ProcSample { pid: 77, name: "ffmpeg -i 很长的输入文件名.mp4".into(), cpu: 88.0, mem: 9.5 },
+            ells_core::ProcSample { pid: 42, name: "postgres: writer".into(), cpu: 12.5, mem: 3.4 },
+        ];
+        let popup = crate::app::ProcPopup {
+            kind: ells_core::ProcSort::Cpu,
+            slot: 1,
+            procs,
+            loading: false,
+            error: None,
+            seq: 0,
+        };
+        let lines = proc_popup_lines(&popup);
+        assert_eq!(lines.len(), 3, "表头 + 两行进程");
+        assert!(lines.iter().all(|l| l.width() <= 62), "最宽一行 {} 列", lines.iter().map(|l| l.width()).max().unwrap());
+        let head: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        for word in ["#", "PID", "进程", "CPU", "内存"] {
+            assert!(head.contains(word), "表头缺少 {word}：{head}");
+        }
+        let first: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(first.contains("77") && first.contains("88.0%") && first.contains("9.5%"));
+
+        let loading = crate::app::ProcPopup { procs: Vec::new(), loading: true, ..popup.clone() };
+        assert!(proc_popup_lines(&loading)[0].spans.iter().any(|s| s.content.contains("正在")));
+        let failed = crate::app::ProcPopup {
+            error: Some("exec 通道被拒绝".into()),
+            ..popup.clone()
+        };
+        let lines = proc_popup_lines(&failed);
+        assert!(lines[0].spans.iter().any(|s| s.content.contains("查询失败")));
     }
 
     /// 把整行切成"三格 + 行尾装饰"。用来钉死一件事：格子里只允许有标签、条和百分比，

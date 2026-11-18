@@ -16,6 +16,35 @@ pub const PROBE_COMMAND: &str = "echo ellsm1; sed -n '1p' /proc/stat 2>/dev/null
 grep -E '^Mem(Total|Available|Free|Buffers|Cached|SReclaimable):' /proc/meminfo 2>/dev/null; \
 cat /proc/loadavg 2>/dev/null; df -Pk 2>/dev/null";
 
+/// 进程排行要靠一次 exec 跑 `ps`：这不是主机概况，只在用户点开弹窗时才问。
+///
+/// 三档命令覆盖 GNU（`-eo`）、BSD/macOS 与 BusyBox（`-axo`），最后才退到人人
+/// 都有的 `ps aux`。`pid=` 这种空表头写法让解析不用跟着列宽变。
+pub const PROCESS_COMMAND: &str = "ps -eo pid=,comm=,%cpu=,%mem= 2>/dev/null \
+|| ps -axo pid=,comm=,%cpu=,%mem= 2>/dev/null || ps aux 2>/dev/null";
+
+/// 进程排行弹窗最多显示几行：一屏放得下的量，再多也只是把下面的看不见。
+pub const MAX_PROCESS_ROWS: usize = 15;
+
+/// `ps` 里的一行，百分比保留远端给的两位小数。
+///
+/// CPU% 可能大于 100（多核上 `ps` 按单核口径累加），这里不夹：夹了用户会以为
+/// 自己那台 4 核机器永远只跑满一个核。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProcSample {
+    pub pid: u32,
+    pub name: String,
+    pub cpu: f32,
+    pub mem: f32,
+}
+
+/// 弹窗按哪一列排序。两个弹窗各自独立，互相不覆盖。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcSort {
+    Cpu,
+    Mem,
+}
+
 /// 一次探针回包解析出来的原始指标。
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Probe {
@@ -202,6 +231,76 @@ impl LoadSample {
     pub fn display(&self) -> String {
         format!("{:.2}/{:.2}/{:.2}", self.one, self.five, self.fifteen)
     }
+}
+
+/// `ps` 输出 → 按占用降序的进程表。
+///
+/// 认两种形状：我们自己点名的无表头格式（`PID COMM [%CPU] [%MEM]`，命令名里
+/// 允许有空格，所以百分比从右边认）和人人都会的 `ps aux`。表头、欢迎语、以及
+/// 任何数字对不上的行都丢掉 —— 排行错一位比空着更误导。
+pub fn parse_processes(text: &str, sort: ProcSort, limit: usize) -> Vec<ProcSample> {
+    let mut out: Vec<ProcSample> = Vec::new();
+    for line in text.lines() {
+        let Some(proc) = parse_process_line(line) else { continue };
+        if out.iter().any(|p| p.pid == proc.pid) {
+            continue;
+        }
+        out.push(proc);
+    }
+    out.sort_by(|a, b| {
+        let key = |p: &ProcSample| match sort {
+            ProcSort::Cpu => p.cpu,
+            ProcSort::Mem => p.mem,
+        };
+        key(b)
+            .partial_cmp(&key(a))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.pid.cmp(&b.pid))
+    });
+    out.truncate(limit);
+    out
+}
+
+/// 一行 `ps`：先按 `ps aux` 认（列数更多、有 USER），再按无表头的四列认。
+fn parse_process_line(line: &str) -> Option<ProcSample> {
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+    let cols: Vec<&str> = line.split_whitespace().collect();
+    // ps aux: USER PID %CPU %MEM VSZ RSS TTY STAT START TIME COMMAND...
+    // 表头首列是 USER，真正的进程名在最后一列之后，可以带空格。
+    if cols.len() >= 11
+        && cols[0] != "USER"
+        && let (Ok(pid), Ok(cpu), Ok(mem)) = (
+            cols[1].parse::<u32>(),
+            cols[2].parse::<f32>(),
+            cols[3].parse::<f32>(),
+        )
+        && pid > 0
+        && valid_percent(cpu)
+        && valid_percent(mem)
+    {
+        return Some(ProcSample { pid, name: cols[10..].join(" "), cpu, mem });
+    }
+    // 无表头四列：PID COMM %CPU %MEM。comm 理论上可能有空格，从右边切。
+    if cols.len() < 4 {
+        return None;
+    }
+    let pid = cols[0].parse::<u32>().ok()?;
+    if pid == 0 {
+        return None;
+    }
+    let cpu = cols[cols.len() - 2].parse::<f32>().ok()?;
+    let mem = cols[cols.len() - 1].parse::<f32>().ok()?;
+    if !valid_percent(cpu) || !valid_percent(mem) {
+        return None;
+    }
+    Some(ProcSample { pid, name: cols[1..cols.len() - 2].join(" "), cpu, mem })
+}
+
+fn valid_percent(v: f32) -> bool {
+    v.is_finite() && v >= 0.0
 }
 
 /// 两条采集路径共用的整理：丢掉常年 100% 的只读盘和伪文件系统，把同一设备的
@@ -1091,5 +1190,79 @@ mod tests {
     fn the_very_first_round_surveys() {
         assert_eq!(plan_disks(true, None, None), DiskPlan::Survey);
         assert_eq!(plan_disks(false, None, None), DiskPlan::Survey);
+    }
+
+    /// GNU/BSD 的无表头格式：PID 在左，百分比从右边认，命令名允许带空格。
+    #[test]
+    fn processes_are_ranked_from_the_headerless_format() {
+        let text = concat!(
+            "  1 systemd 0.0 0.1\n",
+            " 42 postgres: writer 12.5 3.4\n",
+            " 77 ffmpeg 88.0 9.5\n",
+            " 99 some-daemon 0.2 1.0\n",
+        );
+        let by_cpu = parse_processes(text, ProcSort::Cpu, 10);
+        assert_eq!(
+            by_cpu.iter().map(|p| p.pid).collect::<Vec<_>>(),
+            vec![77, 42, 99, 1]
+        );
+        assert_eq!(by_cpu[1].name, "postgres: writer");
+        assert!((by_cpu[0].cpu - 88.0).abs() < f32::EPSILON);
+        let by_mem = parse_processes(text, ProcSort::Mem, 10);
+        assert_eq!(by_mem[0].pid, 77);
+        assert_eq!(by_mem[1].pid, 42);
+    }
+
+    /// `ps aux` 多一列 USER，进程名在 COMMAND 那一段（可以带空格）；表头必须跳过。
+    #[test]
+    fn processes_are_claimed_from_ps_aux() {
+        let text = concat!(
+            "USER       PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND\n",
+            "root         1  0.0  0.1 167332 11208 ?        Ss   Oct01   0:03 /sbin/init\n",
+            "www-data  1201 34.5  2.8 500000 90000 ?        S    10:00   1:20 nginx: worker process\n",
+        );
+        let procs = parse_processes(text, ProcSort::Cpu, 10);
+        assert_eq!(procs.len(), 2, "表头不该被当成进程：{:?}", procs);
+        assert_eq!(procs[0].pid, 1201);
+        assert_eq!(procs[0].name, "nginx: worker process");
+        assert_eq!(procs[1].name, "/sbin/init");
+    }
+
+    /// 欢迎语、配置里的注释、数字对不上的行都不能进排行。
+    #[test]
+    fn process_noise_is_dropped() {
+        let text = concat!(
+            "Welcome to production-server!\n",
+            "# this is a comment in someone's rc file\n",
+            "abc def 1.0 2.0\n",
+            "-5 bad 1.0 2.0\n",
+            "12 broken nope 2.0\n",
+            "13 broken 1.0 nope\n",
+            "14 good 3.0 4.0\n",
+        );
+        let procs = parse_processes(text, ProcSort::Cpu, 10);
+        assert_eq!(procs.len(), 1, "实际 {:?}", procs);
+        assert_eq!((procs[0].pid, procs[0].name.as_str()), (14, "good"));
+    }
+
+    /// 同一个 PID 出现两次只留一行；上限要生效。
+    #[test]
+    fn processes_dedupe_and_truncate() {
+        let text = concat!(
+            "1 a 1.0 1.0\n",
+            "1 a 1.0 1.0\n",
+            "2 b 2.0 2.0\n",
+            "3 c 3.0 3.0\n",
+        );
+        let procs = parse_processes(text, ProcSort::Cpu, 2);
+        assert_eq!(procs.len(), 2);
+        assert_eq!(procs.iter().map(|p| p.pid).collect::<Vec<_>>(), vec![3, 2]);
+    }
+
+    /// 多核上 `ps` 的 CPU% 可以超过 100，这是真实占用，不该被夹成 100。
+    #[test]
+    fn cpu_above_one_hundred_is_kept() {
+        let procs = parse_processes("9 hog 350.0 5.0\n", ProcSort::Cpu, 5);
+        assert_eq!(procs[0].cpu, 350.0);
     }
 }

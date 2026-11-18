@@ -82,6 +82,14 @@ pub enum AppEvent {
         seq: u64,
         res: std::result::Result<Probe, String>,
     },
+    /// 进程排行弹窗：`ps` 回来了。`seq` 顶掉关窗/换标签前的旧回包。
+    ProcProbe {
+        slot: u32,
+        seq: u64,
+        res: std::result::Result<Vec<ells_core::ProcSample>, String>,
+    },
+    /// 进程排行弹窗开着时的 2 秒刷新定时器。
+    ProcTick { slot: u32, seq: u64 },
     /// 传输目标已存在，等用户选择覆盖 / 改名 / 取消。
     Conflict { slot: u32, prompt: ConflictPrompt },
     /// 用户在导入确认框里点了"导入"（空列表 = 取消）。

@@ -651,6 +651,16 @@ pub const METRICS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// 那种把登录横幅写成几 MB 的机器。
 pub const METRICS_MAX_BYTES: usize = 256 * 1024;
 
+/// 进程排行的一轮 `ps`：弹窗开着才跑，超时要比 2 秒刷新周期长一点，
+/// 但也不能让用户盯着"正在查询"超过几秒。
+const PROC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// 进程排行的自动刷新周期。
+const PROC_REFRESH: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// `ps aux` 在几百个进程的机器上也就几十 KB。
+const PROC_MAX_BYTES: usize = 512 * 1024;
+
 /// 容器列表的预算：socket 直连 + CLI 兜底共用一个截止时间，别让一次 F4 等太久。
 const DOCKER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 
@@ -739,6 +749,30 @@ impl DiskGauge {
             percent: d.used_percent,
             used_kb: d.used_kb,
             total_kb: d.total_kb,
+        }
+    }
+}
+
+/// 点 CPU / 内存格打开的进程排行。
+///
+/// 两个弹窗各自独立：`kind` 决定按哪一列排，也决定标题。数据只从当前会话那条
+/// 已认证的连接上取（`ProbeTarget::probe` 跑一次 `ps`），不开新连接。
+#[derive(Debug, Clone)]
+pub struct ProcPopup {
+    pub kind: ells_core::ProcSort,
+    /// 这份排行属于哪个标签：切走或关掉就作废，绝不把 A 机的进程画在 B 机上。
+    pub slot: u32,
+    pub procs: Vec<ells_core::ProcSample>,
+    pub loading: bool,
+    pub error: Option<String>,
+    pub(crate) seq: u64,
+}
+
+impl ProcPopup {
+    pub fn title(&self) -> &'static str {
+        match self.kind {
+            ells_core::ProcSort::Cpu => " CPU 占用排行 ",
+            ells_core::ProcSort::Mem => " 内存占用排行 ",
         }
     }
 }
@@ -1151,6 +1185,10 @@ pub struct App {
     pub tunnel_ports: HashMap<String, Vec<PortMap>>,
     /// 点底栏磁盘格弹出的挂载点小面板（会话页，只读）。
     pub disk_popup: bool,
+    /// 点 CPU / 内存格弹出的进程排行（会话页，只读，2 秒自动刷新）。
+    pub proc_popup: Option<ProcPopup>,
+    /// 进程排行的代号：每次开窗/刷新都往上走，旧回包和旧定时器对不上就作废。
+    proc_seq: u64,
     /// known_hosts 管理页（列表页按 h 打开）。
     pub known_open: bool,
     pub known_entries: Vec<hostkey::KnownEntry>,
@@ -1446,6 +1484,8 @@ impl App {
             ports_open: false,
             tunnel_ports: HashMap::new(),
             disk_popup: false,
+            proc_popup: None,
+            proc_seq: 0,
             known_open: false,
             known_entries: Vec::new(),
             known_selected: 0,
@@ -1537,6 +1577,7 @@ impl App {
             || self.rules_open
             || self.ports_open
             || self.disk_popup
+            || self.proc_popup.is_some()
             || self.slots[self.work].docker.open
             || self.known_open
             || self.audit_open
@@ -1689,6 +1730,13 @@ impl App {
                     }
                 }
                 AppEvent::RemoteClosed { graceful, .. } => {
+                    if self
+                        .proc_popup
+                        .as_ref()
+                        .is_some_and(|p| p.slot == self.slots[self.work].id)
+                    {
+                        self.close_proc_popup();
+                    }
                     let closed_alias = self.slots[self.work]
                         .host
                         .as_ref()
@@ -1785,6 +1833,10 @@ impl App {
                 AppEvent::MetricsProbe { seq, res, .. } => {
                     self.on_metrics_probe(self.work, seq, res)
                 }
+                AppEvent::ProcProbe { seq, res, .. } => {
+                    self.on_proc_probe(self.work, seq, res)
+                }
+                AppEvent::ProcTick { seq, .. } => self.on_proc_tick(self.work, seq),
                 AppEvent::DockerContainers { seq, res, .. } => {
                     self.on_docker_containers(self.work, seq, res)
                 }
@@ -2488,6 +2540,13 @@ impl App {
             self.handle_docker_key(&key);
             return;
         }
+        if self.proc_popup.is_some() {
+            // 只读排行：任意退出键关掉，其余键吞掉，别漏到终端里。
+            if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')) {
+                self.close_proc_popup();
+            }
+            return;
+        }
         if self.disk_popup {
             self.handle_disk_popup_key(&key);
             return;
@@ -2869,6 +2928,8 @@ impl App {
             | AppEvent::AutoReconnect { slot, .. }
             | AppEvent::MetricsTick { slot, .. }
             | AppEvent::MetricsProbe { slot, .. }
+            | AppEvent::ProcProbe { slot, .. }
+            | AppEvent::ProcTick { slot, .. }
             | AppEvent::DockerContainers { slot, .. }
             | AppEvent::DockerAction { slot, .. }
             | AppEvent::DockerDetail { slot, .. }
@@ -2985,6 +3046,7 @@ impl App {
         self.remote_mouse = None;
         self.settings_open = false;
         self.transfer_popup = false;
+        self.close_proc_popup();
         self.status = None;
         // 切回来就要看得见数：这一格在背景时是一分钟一轮，那 58 秒的旧数不该继续挂着
         self.revive_metrics(idx);
@@ -3079,6 +3141,7 @@ impl App {
         self.screen = ScreenKind::List;
         self.settings_open = false;
         self.transfer_popup = false;
+        self.close_proc_popup();
         self.status = None;
     }
 
@@ -3117,6 +3180,7 @@ impl App {
         self.screen = self.slot_view(self.active);
         self.settings_open = false;
         self.transfer_popup = false;
+        self.close_proc_popup();
         self.status = None;
         // 落到的那一格现在是用户在看的那一格，别让它继续按背景的分钟节奏供数
         self.revive_metrics(self.active);
@@ -3428,6 +3492,14 @@ impl App {
             }
             return;
         }
+        // 进程排行：点外面就关，表本身只读不必选。
+        if let Some(popup) = &self.proc_popup {
+            let rect = ui::proc_popup_rect(self.last_area, popup.procs.len().max(1));
+            if !hit(rect, column, row) {
+                self.close_proc_popup();
+            }
+            return;
+        }
         // 磁盘挂载点小面板：点外面就关，表本身只读不必选。
         if self.disk_popup {
             let rows = self.slots[self.work].metrics.disk_popup_lines();
@@ -3501,6 +3573,29 @@ impl App {
                     self.toggle_host_list();
                 } else if hit(progress_r, column, row) && !self.slots[self.work].browser.transfers.is_empty() {
                     self.transfer_popup = true;
+                } else if {
+                    // 底栏 CPU / 内存格：点开对应进程排行。命中矩形与绘制同一套算法。
+                    let footer = self.footer_rows(self.work);
+                    footer > 0
+                        && ui::proc_cell_rect(
+                            &self.slots[self.work].metrics,
+                            ui::session_footer_rect(self.last_area, footer),
+                            ells_core::ProcSort::Cpu,
+                        )
+                        .is_some_and(|r| hit(r, column, row))
+                } {
+                    self.open_proc_popup(ells_core::ProcSort::Cpu);
+                } else if {
+                    let footer = self.footer_rows(self.work);
+                    footer > 0
+                        && ui::proc_cell_rect(
+                            &self.slots[self.work].metrics,
+                            ui::session_footer_rect(self.last_area, footer),
+                            ells_core::ProcSort::Mem,
+                        )
+                        .is_some_and(|r| hit(r, column, row))
+                } {
+                    self.open_proc_popup(ells_core::ProcSort::Mem);
                 } else if {
                     // 底栏磁盘格：点开完整挂载点列表。命中矩形与绘制同一套算法。
                     let footer = self.footer_rows(self.work);
@@ -6995,6 +7090,104 @@ impl App {
         self.sync_footer_rows(idx);
     }
 
+    /// 点底栏 CPU / 内存格：打开对应的进程排行，并立刻查第一轮。
+    ///
+    /// 数据走会话上已有的那条 SSH 连接（`ProbeTarget::probe`），不开新连接，
+    /// 也不断开当前终端 —— `ps` 在一条独立的 exec 通道上跑。
+    fn open_proc_popup(&mut self, kind: ells_core::ProcSort) {
+        if self.slots[self.work].session.is_none() {
+            return;
+        }
+        self.proc_seq = self.proc_seq.wrapping_add(1);
+        let seq = self.proc_seq;
+        let id = self.slots[self.work].id;
+        self.proc_popup = Some(ProcPopup {
+            kind,
+            slot: id,
+            procs: Vec::new(),
+            loading: true,
+            error: None,
+            seq,
+        });
+        self.spawn_proc_probe(id, seq, kind);
+    }
+
+    /// 关掉进程排行。代号一起往前走，在途的回包和定时器因此作废。
+    fn close_proc_popup(&mut self) {
+        if self.proc_popup.take().is_some() {
+            self.proc_seq = self.proc_seq.wrapping_add(1);
+        }
+    }
+
+    fn spawn_proc_probe(&self, id: u32, seq: u64, kind: ells_core::ProcSort) {
+        let Some(target) = self
+            .slots
+            .iter()
+            .find(|s| s.id == id)
+            .and_then(|s| s.session.as_ref())
+            .and_then(|s| s.session.probe_target())
+        else {
+            // 会话已经没了：不再发查询（断开/切标签那一路已经会关窗）。
+            return;
+        };
+        let tx = self.event_tx.clone();
+        tokio::spawn(async move {
+            let res = target
+                .probe(ells_core::PROCESS_COMMAND, PROC_TIMEOUT, PROC_MAX_BYTES)
+                .await
+                .map(|text| ells_core::parse_processes(&text, kind, ells_core::MAX_PROCESS_ROWS))
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(AppEvent::ProcProbe { slot: id, seq, res });
+        });
+    }
+
+    fn arm_proc_tick(&self, id: u32, seq: u64, delay: std::time::Duration) {
+        let tx = self.event_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            let _ = tx.send(AppEvent::ProcTick { slot: id, seq });
+        });
+    }
+
+    /// 2 秒定时器到点：弹窗还开着、还是同一份排行才查下一轮。
+    fn on_proc_tick(&mut self, idx: usize, seq: u64) {
+        let Some(popup) = &self.proc_popup else { return };
+        if popup.seq != seq || popup.slot != self.slots[idx].id {
+            return;
+        }
+        let kind = popup.kind;
+        if self.slots[idx].session.is_none() {
+            self.close_proc_popup();
+            return;
+        }
+        self.spawn_proc_probe(popup.slot, seq, kind);
+    }
+
+    /// 一轮 `ps` 回来：认数后再排下一次刷新。失败也继续刷新 —— 远端 `ps` 偶尔
+    /// 超时不代表这台机器永远查不了，用户关掉弹窗就结束这条链。
+    fn on_proc_probe(
+        &mut self,
+        idx: usize,
+        seq: u64,
+        res: std::result::Result<Vec<ells_core::ProcSample>, String>,
+    ) {
+        let slot_id = self.slots[idx].id;
+        let Some(popup) = &mut self.proc_popup else { return };
+        if popup.seq != seq || popup.slot != slot_id {
+            return;
+        }
+        popup.loading = false;
+        match res {
+            Ok(procs) => {
+                popup.procs = procs;
+                popup.error = None;
+            }
+            Err(err) => popup.error = Some(err),
+        }
+        let id = popup.slot;
+        self.arm_proc_tick(id, seq, PROC_REFRESH);
+    }
+
     /// 指标开关（含"这台采不到"）变了：把每一标签的视口高度对齐到实际会画的行数，
     /// 并按需接上/停掉采集。切标签不改 —— 行数本来就是按每个标签自己的状态算的。
     ///
@@ -7002,6 +7195,10 @@ impl App {
     /// （`set_metrics_setting`）才再给那台一次机会。否则改个主题都要那台机器重采三轮、
     /// 那一行闪回来又消失。
     fn sync_metrics(&mut self) {
+        if !self.settings.metrics {
+            // 指标行都撤了，挂在它上面的排行也不该继续刷。
+            self.close_proc_popup();
+        }
         for idx in 0..self.slots.len() {
             let on = self.settings.metrics && self.slots[idx].session.is_some();
             if !on {

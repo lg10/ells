@@ -16,7 +16,10 @@ pub mod vault;
 pub use audit::AuditKind;
 pub use filter::Ranked;
 pub use host::{Auth, EndpointKind, Forward, Host};
-pub use metrics::{CpuSample, DiskSample, LoadSample, MemSample, Probe, PROBE_COMMAND};
+pub use metrics::{
+    CpuSample, DiskSample, LoadSample, MAX_PROCESS_ROWS, MemSample, PROCESS_COMMAND, Probe,
+    ProcSample, ProcSort, PROBE_COMMAND, parse_processes,
+};
 pub use hostkey::{HostKeyPolicy, HostKeyPrompt, KeyTrust, KnownEntry};
 pub use reconnect::ReconnectParams;
 pub use secure_fs::write_atomic;
