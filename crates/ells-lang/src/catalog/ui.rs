@@ -27,4 +27,6 @@ pub static ENTRIES: &[(&str, &str)] = &[
     ("这行不需要补全", "Nothing to complete on this line"),
     ("{}（{}:{}）", "{} ({}:{})"),
     ("ells 子命令", "ells subcommands"),
+    ("…全部（{}）", "…all ({})"),
+    ("本页提示", "On this page"),
 ];

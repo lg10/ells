@@ -91,6 +91,8 @@ pub struct ListState {
     pub selected: usize,
     /// 折叠起来的分组名（会话内状态，不落盘：折叠是"这会儿不想看"，不是配置）。
     pub folded: Vec<String>,
+    /// 全折叠时段头的光标：没有主机行可停，↑↓ 在段头之间走，Space 展开这一组。
+    pub header: usize,
 }
 
 /// 「折叠全部」折的是哪些段：保险库里出现过的分组名，去重后按分组视图的先后排。
@@ -1474,6 +1476,7 @@ impl App {
             list: ListState {
                 selected: 0,
                 folded: Vec::new(),
+                header: 0,
             },
             form: FormState::blank(),
             slots: vec![Slot::new(0)],
@@ -3604,6 +3607,11 @@ impl App {
                     self.open_homepage();
                     return;
                 }
+                // 顶部提示被窗口挤掉时，点「…全部」打开帮助页看逐条清单
+                if ui::session_hint_all_rect(self).is_some_and(|r| hit(r, column, row)) {
+                    self.help_open = true;
+                    return;
+                }
                 // 标签条：点标签切过去，点末尾的 + 新建一个
                 if self.hit_tab_bar(column, row) {
                     return;
@@ -3724,6 +3732,13 @@ impl App {
             }
             ScreenKind::List => {
                 if self.hit_tab_bar(column, row) {
+                    return;
+                }
+                // 底部提示收进「…全部」时，点它打开帮助页看逐条清单
+                if ui::list_hint_all_rect(self.last_area, &self.settings.keybinds)
+                    .is_some_and(|r| hit(r, column, row))
+                {
+                    self.help_open = true;
                     return;
                 }
                 // 徽标只画在第 0 行，命中范围跟着文案宽度走（同源，见 UpdateState::badge）
@@ -5772,8 +5787,8 @@ impl App {
         if self.filtering {
             return self.handle_filter_key(key);
         }
-        let rows = self.visible();
-        let len = rows.len();
+        let (list_rows, visible) = self.rows_and_visible();
+        let len = visible.len();
         if matches!(key.code, KeyCode::Esc | KeyCode::Char('q'))
             || (ctrl && matches!(key.code, KeyCode::Char('c')))
         {
@@ -5793,6 +5808,26 @@ impl App {
             return;
         }
         self.quit_confirm = false;
+        // 全折叠时没有主机行可停：↑↓ 在段头之间移动，Space 展开高亮的那一组
+        if len == 0 {
+            let headers = list_rows
+                .iter()
+                .filter(|row| matches!(row, ListRow::Header { .. }))
+                .count();
+            if headers > 0 {
+                match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        self.list.header = self.list.header.min(headers - 1).saturating_sub(1);
+                        return;
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        self.list.header = (self.list.header + 1).min(headers - 1);
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        }
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => {
                 self.list.selected = self.list.selected.saturating_sub(1);
@@ -5922,10 +5957,27 @@ impl App {
             );
             return;
         }
-        if self.visible().is_empty() && !self.list.folded.is_empty() {
-            // 全折起来的时候没有光标可用，Space 就是"把他们都放出来"
-            self.list.folded.clear();
-            self.status = Some(t("所有分组都被折叠了，已全部展开").to_string());
+        let (rows, visible) = self.rows_and_visible();
+        if visible.is_empty() {
+            // 全折叠：光标停在段头上，Space 只展开高亮的那一组，z 才是全部展开
+            let headers: Vec<(String, bool)> = rows
+                .iter()
+                .filter_map(|row| match row {
+                    ListRow::Header { group, folded, .. } => Some((group.clone(), *folded)),
+                    _ => None,
+                })
+                .collect();
+            let idx = self.list.header.min(headers.len().saturating_sub(1));
+            if let Some((g, folded)) = headers.get(idx).cloned() {
+                if folded {
+                    self.list.folded.retain(|f| f != &g);
+                    self.status = Some(tf!("已展开 {g}"));
+                } else {
+                    self.list.folded.push(g.clone());
+                    self.status = Some(tf!("已折叠 {g}（Space 展开，z 展开全部）"));
+                }
+                self.clamp_selection();
+            }
             return;
         }
         let Some(host) = self.selected_host() else { return };
@@ -5948,10 +6000,12 @@ impl App {
         }
         if !self.list.folded.is_empty() {
             self.list.folded.clear();
+            self.list.header = 0;
             self.status = Some(t("已展开全部分组").to_string());
         } else {
             self.list.folded = foldable_groups(&self.vault.hosts);
-            self.status = Some(t("已折叠全部分组（z 展开）").to_string());
+            self.list.header = 0;
+            self.status = Some(t("已折叠全部分组（↑↓ 选组，Space 展开，z 全部展开）").to_string());
         }
         self.clamp_selection();
     }
@@ -9172,6 +9226,25 @@ mod list_tests {
             })
             .collect();
         assert_eq!(headers, ["生产", "未分组"]);
+    }
+
+    /// 全部折叠时每个段头都还在：列表页照样能看出有几组、各多少台，
+    /// 再把光标停到某一组上单独展开。
+    #[test]
+    fn folding_everything_keeps_all_headers() {
+        let hosts = vec![host("web", Some("生产")), host("cache", Some("redis"))];
+        let got = rows(&hosts, "", ListSort::Grouped, &["生产", "redis"]);
+        let headers: Vec<(&str, usize, bool)> = got
+            .iter()
+            .filter_map(|r| match r {
+                ListRow::Header { group, count, folded } => {
+                    Some((group.as_str(), *count, *folded))
+                }
+                ListRow::Host(_) => None,
+            })
+            .collect();
+        assert_eq!(headers, [("redis", 1, true), ("生产", 1, true)]);
+        assert!(got.iter().all(|r| matches!(r, ListRow::Header { .. })));
     }
 
     /// 不分组排的两种模式没有段头可折：主机按那个键序一条不落铺平。

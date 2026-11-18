@@ -92,7 +92,6 @@ pub static ENTRIES: &[(&str, &str)] = &[
         " 没有匹配的主机 — Esc 清空过滤",
         " No matching hosts — Esc clears the filter",
     ),
-    (" 全部分组已折叠 — 按 z 展开", " All groups folded — press z to expand"),
     ("({} 台已折叠)", "({} folded)"),
     (" 经 {}", " via {}"),
     (" {}{}条转发", " {}{} forward(s)"),

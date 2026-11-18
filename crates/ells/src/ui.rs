@@ -647,6 +647,156 @@ pub fn list_layout(area: Rect) -> std::rc::Rc<[Rect]> {
         .split(area)
 }
 
+/// 列表页底部提示的完整文本（键位跟着用户自定义绑定走）。
+fn list_hint_text(binds: &crate::keybinds::KeyBinds) -> String {
+    tf!(
+        " ↑↓ 选择 · Enter 连接 · a 新增 · e 编辑 · d 删除 · i/x 导入导出 · p 转发 · m 映射 · / 过滤 · f 收藏 · Space/z 折叠 · o 排序 · t 隧道 · h 密钥 · l 记录 · {}/{}/{} 切标签 · ? 帮助 · q 退出 ",
+        binds.display(crate::keybinds::Action::NewTab),
+        binds.display(crate::keybinds::Action::NextTab),
+        binds.display(crate::keybinds::Action::PrevTab),
+    )
+}
+
+/// 会话页顶部提示的完整文本。
+fn session_hint_text(binds: &crate::keybinds::KeyBinds) -> String {
+    use crate::keybinds::Action;
+    tf!(
+        "{} 切模式 · {} 文件 · {} 重绘 · {} 搜索 · {} 新标签 · {}/{} 切换 · {} 关闭标签 · {} 列表",
+        binds.display(Action::Passthrough),
+        binds.display(Action::Browser),
+        binds.display(Action::Redraw),
+        binds.display(Action::Search),
+        binds.display(Action::NewTab),
+        binds.display(Action::NextTab),
+        binds.display(Action::PrevTab),
+        binds.display(Action::CloseTab),
+        binds.display(Action::HostList),
+    )
+}
+
+/// 提示文本按「 · 」切成条目：整行放不下时逐条收，末尾换成「…全部」。
+fn hint_segments(text: &str) -> Vec<String> {
+    text.split(" · ")
+        .map(str::trim)
+        .filter(|seg| !seg.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// 提示行右端留给【设置】按钮的宽度（8 列按钮 + 1 格间隔）。
+const LIST_HINT_RESERVE: u16 = 9;
+/// 会话页第 0 行右端留给官网徽章的宽度（14 列 + 1 格间隔）。
+const HEADER_HINT_RESERVE: u16 = 15;
+
+fn list_hint_area(area: Rect) -> Rect {
+    let chunk = list_layout(area)[3];
+    Rect {
+        width: chunk.width.saturating_sub(LIST_HINT_RESERVE),
+        ..chunk
+    }
+}
+
+fn session_hint_area(area: Rect, prefix: u16) -> Rect {
+    Rect {
+        x: area.x.saturating_add(prefix),
+        y: area.y,
+        width: area
+            .width
+            .saturating_sub(prefix)
+            .saturating_sub(HEADER_HINT_RESERVE),
+        height: 1,
+    }
+}
+
+/// 会话页标题行的前缀宽度（品牌 + 标签 + 模式），提示从它后面开始。
+fn session_prefix_width(label: &str, mode: TermMode) -> u16 {
+    let mode_tag = match mode {
+        TermMode::Embedded => t("内嵌"),
+        TermMode::Passthrough => t("直通"),
+    };
+    display_width(" ells ") as u16
+        + display_width(&format!("● {label} ")) as u16
+        + display_width(&format!("● {mode_tag} ")) as u16
+}
+
+/// 响应式提示行：整行放得下就原样排；放不下就一条条往左收，剩下的折进
+/// 末尾的「…全部（快捷键）」。返回要画的行和那个标记的矩形（没折叠时是 None）。
+/// 绘制与鼠标命中共用这一份，避免"看得到"和"点得到"各算一套。
+fn fit_hint_line(area: Rect, text: &str, hotkey: &str) -> (Line<'static>, Option<Rect>) {
+    let dim = Style::default().fg(theme::dim());
+    let segments = hint_segments(text);
+    let joined = segments.join(" · ");
+    let width = area.width as usize;
+    if segments.is_empty() || display_width(&joined) + 2 <= width {
+        return (
+            Line::from(vec![
+                Span::raw(" "),
+                Span::styled(joined, dim),
+                Span::raw(" "),
+            ]),
+            None,
+        );
+    }
+    let marker = tf!("…全部（{hotkey}）");
+    let marker_w = display_width(&marker);
+    let sep_w = display_width(" · ");
+    let mut used = 1usize;
+    let mut shown = 0usize;
+    for (idx, seg) in segments.iter().enumerate() {
+        let add = display_width(seg) + if idx == 0 { 0 } else { sep_w };
+        // 还要给末尾的「 · …全部」留位
+        if used + add + sep_w + marker_w + 1 > width {
+            break;
+        }
+        used += add;
+        shown += 1;
+    }
+    let mut spans = vec![Span::raw(" ")];
+    for (idx, seg) in segments.iter().take(shown).enumerate() {
+        if idx > 0 {
+            spans.push(Span::styled(" · ", dim));
+        }
+        spans.push(Span::styled(seg.clone(), dim));
+    }
+    if shown > 0 {
+        spans.push(Span::styled(" · ", dim));
+        used += sep_w;
+    }
+    spans.push(Span::styled(
+        marker.clone(),
+        Style::default()
+            .fg(theme::accent())
+            .add_modifier(Modifier::BOLD),
+    ));
+    let marker_rect = Rect {
+        x: area.x.saturating_add(used as u16),
+        y: area.y,
+        width: marker_w as u16,
+        height: 1,
+    };
+    (Line::from(spans), Some(marker_rect))
+}
+
+/// 列表页底部「…全部」标记的矩形：提示被折叠时才返回。
+pub fn list_hint_all_rect(
+    area: Rect,
+    binds: &crate::keybinds::KeyBinds,
+) -> Option<Rect> {
+    fit_hint_line(list_hint_area(area), &list_hint_text(binds), "?").1
+}
+
+/// 会话页顶部「…全部」标记的矩形。
+pub fn session_hint_all_rect(app: &App) -> Option<Rect> {
+    let s = app.slots.get(app.active)?.session.as_ref()?;
+    let prefix = session_prefix_width(&s.label, s.mode);
+    fit_hint_line(
+        session_hint_area(app.last_area, prefix),
+        &session_hint_text(&app.settings.keybinds),
+        "F1",
+    )
+    .1
+}
+
 /// 别名列：过滤时把命中的那几个字符点亮，用户才知道 `web` 凭什么排在
 /// `dev-worker` 前面。列宽照旧补到 14 列，汉字按两列算。
 const ALIAS_COL: usize = 14;
@@ -1295,6 +1445,20 @@ fn draw_list(f: &mut Frame, app: &mut App) {
         .and_then(|host| {
             rows.iter()
                 .position(|r| matches!(r, ListRow::Host(i) if *i == host))
+        })
+        .or_else(|| {
+            // 全折叠时没有主机行可停：高亮落在段头上，Space 展开的就是这一组
+            if !visible_hosts.is_empty() {
+                return None;
+            }
+            let headers: Vec<usize> = rows
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, row)| matches!(row, ListRow::Header { .. }).then_some(idx))
+                .collect();
+            headers
+                .get(app.list.header.min(headers.len().saturating_sub(1)))
+                .copied()
         });
     let total = app.vault.hosts.len();
     let live = app.slots.iter().filter(|s| s.session.is_some()).count();
@@ -1335,15 +1499,6 @@ fn draw_list(f: &mut Frame, app: &mut App) {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 hint,
-                Style::default().fg(theme::dim()),
-            ))),
-            inner,
-        );
-    } else if visible_hosts.is_empty() {
-        // 全折叠：一条主机都没剩下，但段头还在，别让界面看起来像库空了
-        f.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                t(" 全部分组已折叠 — 按 z 展开"),
                 Style::default().fg(theme::dim()),
             ))),
             inner,
@@ -1457,15 +1612,12 @@ fn draw_list(f: &mut Frame, app: &mut App) {
         );
     }
 
-    let keys = tf!(
-        " ↑↓ 选择 · Enter 连接 · a 新增 · e 编辑 · d 删除 · i/x 导入导出 · p 转发 · m 映射 · / 过滤 · f 收藏 · Space/z 折叠 · o 排序 · t 隧道 · h 密钥 · l 记录 · {}/{}/{} 切标签 · ? 帮助 · q 退出 ",
-        app.settings.keybinds.display(crate::keybinds::Action::NewTab),
-        app.settings.keybinds.display(crate::keybinds::Action::NextTab),
-        app.settings.keybinds.display(crate::keybinds::Action::PrevTab),
-    );
+    // 键位行随窗口宽度逐条收：放不下的收进「…全部」，点它或按 ? 看全部
+    let hint_area = list_hint_area(f.area());
+    let (keys, _) = fit_hint_line(hint_area, &list_hint_text(&app.settings.keybinds), "?");
     f.render_widget(
         Paragraph::new(keys).style(Style::default().fg(theme::dim())),
-        chunks[3],
+        hint_area,
     );
     // 键位行右端：【设置】按钮（实心青底，与会话页按钮同风格）
     f.render_widget(
@@ -1696,6 +1848,25 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App) {
         (t("命令行"), std::borrow::Cow::Borrowed(t("ells 打开列表；ells <别名> 直连；ells --dev 读 ~/.ells/hosts.dev.toml；ells -y 首次主机密钥自动接受（密钥变更仍然拒绝）。配置在 ~/.ells/。"))),
     ];
     let mut lines: Vec<Line> = Vec::new();
+    // 顶部/底部提示被窗口挤掉时，这里把当前页的条目逐行摆开
+    let page_hint = match app.screen {
+        ScreenKind::List => Some(list_hint_text(&app.settings.keybinds)),
+        ScreenKind::Session => Some(session_hint_text(&app.settings.keybinds)),
+        _ => None,
+    };
+    if let Some(text) = page_hint {
+        lines.push(Line::from(Span::styled(
+            tf!("【{}】", t("本页提示")),
+            Style::default().fg(theme::warn()).add_modifier(Modifier::BOLD),
+        )));
+        for seg in hint_segments(&text) {
+            lines.push(Line::from(Span::styled(
+                format!(" {seg}"),
+                Style::default().fg(theme::muted()),
+            )));
+        }
+        lines.push(Line::from(""));
+    }
     for (title, body) in sections {
         lines.push(Line::from(Span::styled(
             tf!("【{title}】"),
@@ -2297,19 +2468,15 @@ fn draw_session(f: &mut Frame, app: &mut App) {
     // 顶部按键提示跟着用户的自定义绑定走（KeyBinds 是 Copy，避开与 s 的借用冲突）
     let binds = app.settings.keybinds;
     use crate::keybinds::Action;
-    let key_hint = tf!(
-        "{} 切模式 · {} 文件 · {} 重绘 · {} 搜索 · {} 新标签 · {}/{} 切换 · {} 关闭标签 · {} 列表",
-        binds.display(Action::Passthrough),
-        binds.display(Action::Browser),
-        binds.display(Action::Redraw),
-        binds.display(Action::Search),
-        binds.display(Action::NewTab),
-        binds.display(Action::NextTab),
-        binds.display(Action::PrevTab),
-        binds.display(Action::CloseTab),
-        binds.display(Action::HostList),
+    let key_hint = session_hint_text(&binds);
+    // 顶部提示同样逐条收：窗口变窄时留一个「…全部（F1）」，点它或按 F1 看全部
+    let prefix_width = session_prefix_width(&s.label, s.mode);
+    let (hint_line, _) = fit_hint_line(
+        session_hint_area(f.area(), prefix_width),
+        &key_hint,
+        "F1",
     );
-    let header = Line::from(vec![
+    let mut header_spans = vec![
         Span::styled(" ells ", Style::default().fg(theme::accent()).add_modifier(Modifier::BOLD)),
         Span::styled(format!("● {} ", s.label), Style::default().fg(theme::warn())),
         Span::styled(
@@ -2322,8 +2489,10 @@ fn draw_session(f: &mut Frame, app: &mut App) {
                 })
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(key_hint, Style::default().fg(theme::dim())),
-    ]);
+    ];
+    // fit 自己带前导空格；前缀末尾已经有空格了，这里去掉免得挤成两格
+    header_spans.extend(hint_line.spans.into_iter().skip(1));
+    let header = Line::from(header_spans);
     let title_row = Rect {
         x: chunks[0].x,
         y: chunks[0].y,
@@ -5682,5 +5851,37 @@ mod tests {
         // 端口中心按选中行居中
         assert_eq!(docker_selection_window(5, 10, 3), 0);
         assert_eq!(docker_selection_window(100, 10, 50), 45);
+    }
+
+    /// 提示栏：宽屏整条排，窄屏逐条收，末尾出现「…全部」且不越过可用宽度。
+    #[test]
+    fn hint_bar_folds_into_an_all_marker_when_narrow() {
+        let text = " 甲 一 · 乙 二 · 丙 三 · 丁 四 ";
+        let render = |line: &Line| -> String {
+            line.spans.iter().map(|s| s.content.as_ref()).collect()
+        };
+
+        let wide = Rect::new(0, 5, 200, 1);
+        let (line, marker) = fit_hint_line(wide, text, "?");
+        assert!(marker.is_none(), "宽屏不该出现全部标记");
+        assert!(render(&line).contains("丁 四"), "宽屏要把最后一条也画出来");
+
+        let narrow = Rect::new(0, 5, 24, 1);
+        let (line, marker) = fit_hint_line(narrow, text, "?");
+        let marker = marker.expect("窄屏要出现全部标记");
+        let shown = render(&line);
+        assert!(shown.contains("…全部（?）"), "{shown}");
+        assert!(!shown.contains("丁 四"), "放不下的条目应折进全部：{shown}");
+        assert!(display_width(&shown) <= 24, "提示行超宽：{shown}");
+        assert_eq!(marker.width as usize, display_width("…全部（?）"));
+        assert!(marker.x >= narrow.x);
+        assert!(marker.x + marker.width <= narrow.x + narrow.width);
+    }
+
+    #[test]
+    fn empty_hint_text_paints_nothing() {
+        let (line, marker) = fit_hint_line(Rect::new(0, 0, 10, 1), "   ", "?");
+        assert!(marker.is_none());
+        assert!(line.spans.iter().all(|s| s.content.trim().is_empty()));
     }
 }
