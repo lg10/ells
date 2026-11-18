@@ -9,6 +9,14 @@ English summary lives in each GitHub Release note; this file is the full history
 发版流程：把下面的 `[未发布 / Unreleased]` 小节改名为 `[x.y.z] - 日期`，再打 tag。
 CI 的 release 作业会按 tag 从本文件截取对应小节，作为 GitHub Release 说明。
 
+## [0.3.2] - 2026-11-18
+
+### 修复
+- **磁盘面板里同一块盘出现两行**：Docker 的 `overlay` 挂载容量与它底下那块本地盘
+  完全相同（例如 `/` 和 `/var/lib/docker/overlay2/…`），之前按设备名去重认不出它
+  们是同一块盘。现在容量相同且路径落在该挂载点下面时并成一行，overlay 挂载点进
+  「别名」；容器里只有 overlay、没有本地盘可并时仍单独显示。
+
 ## [0.3.1] - 2026-11-18
 
 ### 修复

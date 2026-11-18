@@ -307,6 +307,10 @@ fn valid_percent(v: f32) -> bool {
 
 /// 两条采集路径共用的整理：丢掉常年 100% 的只读盘和伪文件系统，把同一设备的
 /// 多个挂载点合并成一行（其余挂载点进 `aliases`），再把最高的排前面。
+///
+/// docker 的 `overlay` 挂载是容器合并层，容量就是底下那块本地盘的容量：路径又落
+/// 在那个挂载点下面时并进那一行（否则用户会看到同一块盘出现两遍）。容器里只看得见
+/// `overlay`（没有本地盘可并）时它照样单独留着，磁盘那一格不能因此空掉。
 pub fn rank_disks(disks: Vec<DiskSample>) -> Vec<DiskSample> {
     let mut real: Vec<DiskSample> = Vec::new();
     for disk in disks.into_iter().filter(|d| !is_pseudo(d)) {
@@ -327,9 +331,63 @@ pub fn rank_disks(disks: Vec<DiskSample>) -> Vec<DiskSample> {
         }
         real.push(disk);
     }
+    let mut local: Vec<DiskSample> = Vec::new();
+    let mut overlays: Vec<DiskSample> = Vec::new();
+    for disk in real {
+        if is_overlay_device(&disk.device) {
+            overlays.push(disk);
+        } else {
+            local.push(disk);
+        }
+    }
+    for overlay in overlays {
+        // 最长前缀优先：`/var/lib/docker` 自己是一块盘时，别并到 `/` 上去。
+        let host = local
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| overlay_belongs_to(&overlay, d))
+            .max_by_key(|(_, d)| d.mount.len())
+            .map(|(idx, _)| idx);
+        if let Some(idx) = host {
+            let kept = &mut local[idx];
+            if kept.mount != overlay.mount && !kept.aliases.contains(&overlay.mount) {
+                kept.aliases.push(overlay.mount.clone());
+            }
+            for alias in overlay.aliases {
+                if alias != kept.mount && !kept.aliases.contains(&alias) {
+                    kept.aliases.push(alias);
+                }
+            }
+        } else {
+            local.push(overlay);
+        }
+    }
     // 使用率最高的排前面：那一格要回答的是"哪块盘快满了"。
-    real.sort_by_key(|d| std::cmp::Reverse(d.used_percent));
-    real
+    local.sort_by_key(|d| std::cmp::Reverse(d.used_percent));
+    local
+}
+
+/// docker 的合并层设备名：statvfs 路径读的是 `/proc/mounts`，df 兜底是 `df -Pk`，
+/// 两处的写法都得认。
+fn is_overlay_device(device: &str) -> bool {
+    device == "overlay" || device == "overlayfs"
+}
+
+/// 这条 overlay 记录是不是底下那块本地盘的另一行：容量相同（同一块盘）且挂载
+/// 路径在它的目录下面。容量对不上说明底下是另一块盘（或网络盘），不能吞掉。
+fn overlay_belongs_to(overlay: &DiskSample, host: &DiskSample) -> bool {
+    !is_overlay_device(&host.device)
+        && overlay.total_kb == host.total_kb
+        && mount_within(&overlay.mount, &host.mount)
+}
+
+/// `child` 是否等于 `parent` 或位于它下面（按路径分段，`/data` 不算 `/da` 下面）。
+fn mount_within(child: &str, parent: &str) -> bool {
+    parent == "/"
+        || child == parent
+        || child
+            .strip_prefix(parent)
+            .is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// `user nice system idle iowait irq softirq steal guest guest_nice` → 快照。
@@ -767,12 +825,15 @@ mod tests {
     }
 
     /// 那一格要回答"哪块盘快满了"：挑使用率最高的**真实**挂载点。
-    /// tmpfs、snap 的只读盘、EFI 分区都不算，docker 的 overlay 算（它吃的是宿主 /）。
+    /// tmpfs、snap 的只读盘、EFI 分区都不算；docker 的 overlay 是宿主 `/` 的
+    /// 另一行，并进 `/` 的别名，不能再单独占一行。
     #[test]
     fn disk_is_the_worst_real_filesystem() {
         let probe = Probe::parse(REAL);
         let mounts: Vec<&str> = probe.disks.iter().map(|d| d.mount.as_str()).collect();
-        assert_eq!(mounts, vec!["/data", "/", "/var/lib/docker/overlay2/x/merged"]);
+        assert_eq!(mounts, vec!["/data", "/"]);
+        let root = probe.disks.iter().find(|d| d.mount == "/").expect("有 /");
+        assert_eq!(root.aliases, vec!["/var/lib/docker/overlay2/x/merged".to_string()]);
         let worst = probe.worst_disk().expect("至少有一块盘");
         assert_eq!((worst.mount.as_str(), worst.used_percent), ("/data", 88));
         assert_eq!((worst.used_kb, worst.total_kb), (887429888, 1014094560));
@@ -882,7 +943,7 @@ mod tests {
     fn ignores_banner_noise_and_the_header_line() {
         let noisy = format!("Welcome to production-server!\n{REAL}");
         let probe = Probe::parse(&noisy);
-        assert_eq!(probe.disks.len(), 3, "噪声不该改变结果");
+        assert_eq!(probe.disks.len(), 2, "噪声不该改变结果");
         assert!(probe.alive);
         // 只有表头、一行数据都没有的 df 不该被当成一块盘
         let only_header = Probe::parse("ellsm1\nFilesystem 1024-blocks Used Available Capacity Mounted on\n");
@@ -1051,6 +1112,60 @@ mod tests {
         assert_eq!(disks[0].mount, "/");
         assert_eq!(disks[0].aliases, vec!["/srv/data".to_string()]);
         assert_eq!(disks[1].mount, "/logs");
+        assert!(disks[1].aliases.is_empty());
+    }
+
+    /// docker 的 overlay 是宿主盘的另一行：容量一致、路径又在宿主挂载点下面时
+    /// 并成一行，其余 overlay 挂载点跟着进别名 —— 面板里不该一块盘出现两次。
+    #[test]
+    fn overlay_rows_fold_into_the_local_disk_they_live_on() {
+        let text = concat!(
+            "Filesystem 1024-blocks Used Available Capacity Mounted on\n",
+            "/dev/sda1 1000 880 120 88% /\n",
+            "overlay 1000 880 120 88% /var/lib/docker/overlay2/a/merged\n",
+            "overlay 1000 880 120 88% /var/lib/docker/overlay2/b/merged\n",
+        );
+        let disks = disks_from_df(text);
+        assert_eq!(disks.len(), 1, "{disks:?}");
+        assert_eq!(disks[0].mount, "/");
+        assert_eq!(
+            disks[0].aliases,
+            vec![
+                "/var/lib/docker/overlay2/a/merged".to_string(),
+                "/var/lib/docker/overlay2/b/merged".to_string(),
+            ]
+        );
+    }
+
+    /// 容器里 `/proc/mounts` 只有 overlay、没有本地盘：这一行必须留着，
+    /// 否则磁盘那一格会从有数变成空的。
+    #[test]
+    fn overlay_stays_when_it_is_the_only_disk() {
+        let text = concat!(
+            "Filesystem 1024-blocks Used Available Capacity Mounted on\n",
+            "overlay 1000 880 120 88% /\n",
+        );
+        let disks = disks_from_df(text);
+        assert_eq!(disks.len(), 1);
+        assert_eq!((disks[0].mount.as_str(), disks[0].used_percent), ("/", 88));
+    }
+
+    /// overlay 底下若是单独一块盘（`/var/lib/docker` 自己挂了块盘），并到那块盘上，
+    /// 不能按"最长前缀"以外的理由算到 `/` 头上。
+    #[test]
+    fn overlay_joins_the_innermost_mount_with_the_same_capacity() {
+        let text = concat!(
+            "Filesystem 1024-blocks Used Available Capacity Mounted on\n",
+            "/dev/sda1 1000 100 900 10% /\n",
+            "/dev/sdb1 2000 1800 200 90% /var/lib/docker\n",
+            "overlay 2000 1800 200 90% /var/lib/docker/overlay2/x/merged\n",
+        );
+        let disks = disks_from_df(text);
+        assert_eq!(
+            disks.iter().map(|d| d.mount.as_str()).collect::<Vec<_>>(),
+            vec!["/var/lib/docker", "/"]
+        );
+        assert_eq!(disks[0].aliases, vec!["/var/lib/docker/overlay2/x/merged".to_string()]);
         assert!(disks[1].aliases.is_empty());
     }
 
