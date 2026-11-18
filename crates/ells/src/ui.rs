@@ -34,6 +34,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     match app.screen {
         ScreenKind::Unlock => draw_unlock(f, &app.unlock, app.unlock_estimate),
         ScreenKind::List => draw_list(f, app),
+        ScreenKind::Connecting => draw_connecting(f, app),
         ScreenKind::Form => draw_form(f, app),
         ScreenKind::Session => draw_session(f, app),
         ScreenKind::Browser => draw_browser(f, app),
@@ -433,6 +434,65 @@ fn draw_unlock_status(
         ))
     };
     f.render_widget(Paragraph::new(line).alignment(Alignment::Center), area);
+}
+
+/// 快捷直连的首屏：一张小面板说明连的是谁、正卡在哪一步。
+///
+/// 主机密钥确认之类的模态层照旧盖在它上面；连上后直接换会话页，失败才落回列表。
+fn draw_connecting(f: &mut Frame, app: &App) {
+    let area = f.area();
+    f.buffer_mut().set_style(area, Style::default().bg(theme::bg()));
+    let host = app.slots[app.active].host.as_ref();
+    let alias = host.map(|h| h.alias.as_str()).unwrap_or("会话");
+    let target = host.map(|h| h.target()).unwrap_or_default();
+    let lines = connecting_lines(alias, &target);
+    let panel = centered(64, lines.len() as u16 + 2, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(
+            Line::from(" 正在连接 ")
+                .centered()
+                .style(Style::default().fg(theme::accent()).add_modifier(Modifier::BOLD)),
+        )
+        .title_bottom(
+            Line::from(format!(" {} ", version_tag()))
+                .right_aligned()
+                .style(Style::default().fg(theme::dim())),
+        )
+        .border_style(Style::default().fg(theme::accent()))
+        .style(Style::default().fg(theme::text()));
+    let inner = block.inner(panel);
+    f.render_widget(block, panel);
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// 连接页正文：别名 · 目标 · 空行 · 正在做什么 · 能按什么。
+/// 面板内宽 62（外宽 64），最长一行也必须放得下。
+fn connecting_lines(alias: &str, target: &str) -> Vec<Line<'static>> {
+    vec![
+        Line::from(Span::styled(
+            alias.to_string(),
+            Style::default().fg(theme::text()).add_modifier(Modifier::BOLD),
+        ))
+        .alignment(Alignment::Center),
+        Line::from(Span::styled(
+            target.to_string(),
+            Style::default().fg(theme::dim()),
+        ))
+        .alignment(Alignment::Center),
+        Line::from(""),
+        Line::from(Span::styled(
+            "正在建立 SSH 会话…",
+            Style::default().fg(theme::accent()),
+        ))
+        .alignment(Alignment::Center),
+        Line::from(Span::styled(
+            "首次连接会先弹主机密钥确认 · Esc 查看主机列表 · q 退出",
+            Style::default().fg(theme::dim()),
+        ))
+        .alignment(Alignment::Center),
+    ]
 }
 
 /// 忙时那一行：文案 + 进度条 + 已用时间。
@@ -4953,6 +5013,27 @@ mod tests {
         };
         let lines = proc_popup_lines(&failed);
         assert!(lines[0].spans.iter().any(|s| s.content.contains("查询失败")));
+    }
+
+    /// 直连首屏要说清三件事：连谁、在做什么、能按什么；五行都不能顶出 62 列内框。
+    #[test]
+    fn the_connecting_screen_fits_and_names_the_host() {
+        let lines = connecting_lines("prod-web-01", "root@203.0.113.7:22");
+        assert_eq!(lines.len(), 5);
+        let text: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert!(text[0].contains("prod-web-01"), "首行该是别名：{}", text[0]);
+        assert!(text[1].contains("root@203.0.113.7:22"), "第二行该是目标：{}", text[1]);
+        assert!(text[3].contains("正在建立"), "第三行该说正在做什么：{}", text[3]);
+        assert!(
+            text[4].contains("Esc") && text[4].contains("q"),
+            "最后一行该写能按什么：{}",
+            text[4]
+        );
+        let widest = lines.iter().map(|l| l.width()).max().unwrap_or(0);
+        assert!(widest <= 62, "最宽一行 {widest} 列，会顶出面板");
     }
 
     /// 把整行切成"三格 + 行尾装饰"。用来钉死一件事：格子里只允许有标签、条和百分比，

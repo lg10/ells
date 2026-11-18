@@ -43,6 +43,9 @@ pub enum ScreenKind {
     Unlock,
     #[default]
     List,
+    /// 快捷直连（`ells <别名>` / `s <别名>`）的首屏：解锁后直接停在这里拨号，
+    /// 不先铺主机列表。
+    Connecting,
     Form,
     Session,
     Browser,
@@ -1410,6 +1413,27 @@ fn edit_key_hint(letter: char) -> String {
     }
 }
 
+/// 启动杂务：目录权限再收紧一遍、清更新残留、按天轮转会话记录。
+///
+/// 这些事都不参与画第一帧、更不参与拨号，却会读目录、起 `whoami`/`icacls`
+/// 子进程，放在 `App::startup` 的同步路径上等于让用户盯着空屏等它们跑完。
+fn spawn_startup_chores(harden: bool) {
+    let spawned = std::thread::Builder::new()
+        .name("ells-chores".into())
+        .spawn(move || {
+            if harden {
+                ells_core::harden_config_dir();
+            }
+            // 上一次更新留下的备份件与陈旧临时件：Windows 上运行中的 exe 删不掉，只能等这次
+            update::cleanup_leftovers();
+            // 会话记录按天轮转：不主动清，一个月就是几百个文件，列表页翻不到重点
+            sessionlog::prune();
+        });
+    if let Err(err) = spawned {
+        tracing::warn!(%err, "启动杂务线程起不来，本轮跳过");
+    }
+}
+
 impl App {
     fn startup(
         tx: mpsc::UnboundedSender<AppEvent>,
@@ -1420,13 +1444,15 @@ impl App {
         tunnels: TunnelManager,
     ) -> Self {
         let settings = Settings::load();
-        // 保险库、known_hosts、自动解锁凭据都在 ~/.ells：先把它收紧到仅当前用户可读
-        ells_core::harden_config_dir();
         ells_core::ssh::set_keepalive_interval(settings.keepalive_secs);
-        // 上一次更新留下的备份件与陈旧临时件：Windows 上运行中的 exe 删不掉，只能等这次
-        update::cleanup_leftovers();
-        // 会话记录按天轮转：不主动清，一个月就是几百个文件，列表页翻不到重点
-        sessionlog::prune();
+        // 保险库、known_hosts、自动解锁凭据都在 ~/.ells。首启先把目录收紧再让用户建库；
+        // 之后目录已被收紧过（新文件跟着继承），这一遍挪到后台，别让 Windows 上
+        // whoami + icacls 两个进程挡在第一帧前面。
+        let vault_ready = vault::vault_exists();
+        if !vault_ready {
+            ells_core::harden_config_dir();
+        }
+        spawn_startup_chores(vault_ready);
         let mut base = Self {
             screen: ScreenKind::List,
             unlock: UnlockState {
@@ -2615,6 +2641,7 @@ impl App {
             return;
         }
         match self.screen {
+            ScreenKind::Connecting => self.handle_connecting_key(&key, ctrl),
             ScreenKind::Session => self.handle_session_key(&key).await,
             ScreenKind::Unlock => self.handle_unlock_key(&key, ctrl),
             ScreenKind::List => self.handle_list_key(&key, ctrl),
@@ -2622,6 +2649,20 @@ impl App {
                 self.handle_form_key(&key, ctrl);
             }
             ScreenKind::Browser => self.handle_browser_key(&key, ctrl),
+        }
+    }
+
+    /// 直连首屏：拨号在后台进行，这里只认"退回列表"和"退出"，其余键不落到下面去。
+    fn handle_connecting_key(&mut self, key: &KeyEvent, ctrl: bool) {
+        if matches!(key.code, KeyCode::Esc) {
+            self.screen = ScreenKind::List;
+            return;
+        }
+        if matches!(key.code, KeyCode::Char('q'))
+            || (ctrl && matches!(key.code, KeyCode::Char('c')))
+        {
+            // Esc 只是换页，连接任务照旧；q 是真退出（和在列表页按 q 同义）
+            self.done = true;
         }
     }
 
@@ -2985,6 +3026,7 @@ impl App {
     fn tabs_locked(&self) -> bool {
         self.screen == ScreenKind::Form
             || self.screen == ScreenKind::Unlock
+            || self.screen == ScreenKind::Connecting
             || self.choice.is_some()
             || self.prompt.is_some()
             || self.dialog_open
@@ -6769,6 +6811,7 @@ impl App {
         let title = match self.screen {
             ScreenKind::Unlock => "ells-解锁保险库".to_string(),
             ScreenKind::List => "ells-主机列表".to_string(),
+            ScreenKind::Connecting => "ells-正在连接".to_string(),
             ScreenKind::Form => {
                 if self.form.editing_alias.is_some() {
                     "ells-编辑主机".to_string()
@@ -6850,7 +6893,11 @@ impl App {
             .find(|h| h.alias == alias || h.alias.to_lowercase() == lower)
             .cloned();
         match host {
-            Some(host) => self.start_connect(host, None),
+            Some(host) => {
+                self.start_connect(host, None);
+                // 直连的首屏就是这张连接页：主机列表只在连接失败后才需要出现
+                self.screen = ScreenKind::Connecting;
+            }
             None => self.status = Some(format!("找不到别名为 `{alias}` 的主机")),
         }
     }
@@ -7391,6 +7438,10 @@ impl App {
             self.transfer_popup = false;
         }
         if let Some(err) = failed {
+            // 直连首屏后面没有列表：失败就落到列表，原因写在状态行上
+            if foreground && self.screen == ScreenKind::Connecting {
+                self.screen = ScreenKind::List;
+            }
             self.on_connect_failed(idx, &err);
         }
         self.refresh_remote_cwd();

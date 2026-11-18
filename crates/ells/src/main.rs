@@ -101,8 +101,15 @@ fn main() -> Result<()> {
             return Ok(());
         }
     }
-    // 同目录里另一个启动名（`s`）可能停在旧版本、或者在替换中变成了断链
-    update::heal_launchers();
+    // 同目录里另一个启动名（`s`）可能停在旧版本、或者在替换中变成了断链。
+    // 自愈要整份哈希两个几十 MB 的镜像（真不一致时还要再拷一遍），挪到后台跑：
+    // 它修的是"下次敲另一个名字"，不是这次启动能不能用。
+    if let Err(err) = std::thread::Builder::new()
+        .name("ells-heal".into())
+        .spawn(update::heal_launchers)
+    {
+        tracing::warn!(%err, "启动名自愈线程起不来，本次跳过");
+    }
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
