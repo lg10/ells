@@ -68,6 +68,9 @@ pub struct LoadSample {
 pub struct DiskSample {
     pub device: String,
     pub mount: String,
+    /// 同一设备还挂在这些位置（bind mount、btrfs 子卷等）：只展示一行，
+    /// 但用户点开面板时要知道 `/` 和 `/srv/data` 其实是同一块盘。
+    pub aliases: Vec<String>,
     pub used_percent: u8,
     pub used_kb: u64,
     pub total_kb: u64,
@@ -201,11 +204,29 @@ impl LoadSample {
     }
 }
 
-/// 两条采集路径共用的整理：丢掉常年 100% 的只读盘和伪文件系统，再把最高的排前面。
+/// 两条采集路径共用的整理：丢掉常年 100% 的只读盘和伪文件系统，把同一设备的
+/// 多个挂载点合并成一行（其余挂载点进 `aliases`），再把最高的排前面。
 pub fn rank_disks(disks: Vec<DiskSample>) -> Vec<DiskSample> {
-    let mut real: Vec<DiskSample> = disks.into_iter().filter(|d| !is_pseudo(d)).collect();
-    // 使用率最高的排前面：那一格要回答的是"哪块盘快满了"。同一设备被 bind
-    // 到两处也只会被挑一次。
+    let mut real: Vec<DiskSample> = Vec::new();
+    for disk in disks.into_iter().filter(|d| !is_pseudo(d)) {
+        // 空设备名只出现在跟单轮（那一轮只有一块盘），不能拿它当合并键，
+        // 否则多块盘的设备名恰好都没读到时会互相吞掉。
+        if !disk.device.is_empty()
+            && let Some(kept) = real.iter_mut().find(|d| d.device == disk.device)
+        {
+            if kept.mount != disk.mount && !kept.aliases.contains(&disk.mount) {
+                kept.aliases.push(disk.mount.clone());
+            }
+            for alias in disk.aliases {
+                if alias != kept.mount && !kept.aliases.contains(&alias) {
+                    kept.aliases.push(alias);
+                }
+            }
+            continue;
+        }
+        real.push(disk);
+    }
+    // 使用率最高的排前面：那一格要回答的是"哪块盘快满了"。
     real.sort_by_key(|d| std::cmp::Reverse(d.used_percent));
     real
 }
@@ -251,6 +272,7 @@ fn parse_df_line(line: &str) -> Option<DiskSample> {
     Some(DiskSample {
         device: cols[0].to_string(),
         mount: cols[5..].join(" "),
+        aliases: Vec::new(),
         used_percent: percent,
         used_kb,
         total_kb,
@@ -297,6 +319,7 @@ pub fn disk_from_fs_stats(device: String, mount: String, stats: &FsStats) -> Opt
     Some(DiskSample {
         device,
         mount,
+        aliases: Vec::new(),
         used_percent: percent,
         used_kb: to_kib(used, unit),
         total_kb: to_kib(stats.blocks, unit),
@@ -314,6 +337,9 @@ fn to_kib(blocks: u64, unit_bytes: u64) -> u64 {
 pub struct MountCandidate {
     pub device: String,
     pub mount: String,
+    /// 同一设备的其余挂载点（bind mount / btrfs 子卷）：只问一次 statvfs，
+    /// 但这些名字要跟着结果走，界面才说得清它们是同一块盘。
+    pub aliases: Vec<String>,
 }
 
 /// 每轮最多问几块盘：每次 `fs_info` 是一个往返，第 20 块盘不会让那一格更有用，
@@ -350,11 +376,15 @@ pub fn mount_candidates(text: &str) -> Vec<MountCandidate> {
         if PSEUDO_DEVICES.iter().any(|p| device == *p || device.starts_with(p)) {
             continue;
         }
-        // 同一设备 bind 到多处（或 overlay 套同一块宿主盘）只问一次。
-        if out.iter().any(|c| c.device == device) {
+        // 同一设备 bind 到多处（或 overlay 套同一块宿主盘）只问一次，
+        // 后来遇到的挂载点记成别名。
+        if let Some(kept) = out.iter_mut().find(|c| c.device == device) {
+            if kept.mount != mount && !kept.aliases.contains(&mount) {
+                kept.aliases.push(mount);
+            }
             continue;
         }
-        out.push(MountCandidate { device: device.to_string(), mount });
+        out.push(MountCandidate { device: device.to_string(), mount, aliases: Vec::new() });
         if out.len() >= MAX_MOUNT_CANDIDATES {
             break;
         }
@@ -899,11 +929,28 @@ mod tests {
             "/dev/sdd1 relative/mnt ext4 rw 0 0\n",
             "/dev/sdc1 /logs ext4 rw 0 0\n",
         );
-        let mounts: Vec<String> = mount_candidates(text)
-            .into_iter()
-            .map(|c| c.mount)
-            .collect();
+        let candidates = mount_candidates(text);
+        let mounts: Vec<String> = candidates.iter().map(|c| c.mount.clone()).collect();
         assert_eq!(mounts, vec!["/", "/logs"]);
+        assert_eq!(candidates[0].aliases, vec!["/srv/data".to_string()]);
+    }
+
+    /// `df` 会把同一设备的每个挂载点各写一行：原来底栏会出现两个 `/`-同一块盘的
+    /// 条目。现在只留一行，其余挂载点进别名。
+    #[test]
+    fn df_rows_on_the_same_device_collapse_into_one_with_aliases() {
+        let text = concat!(
+            "Filesystem 1024-blocks Used Available Capacity Mounted on\n",
+            "/dev/sda1 1000 880 120 88% /\n",
+            "/dev/sda1 1000 880 120 88% /srv/data\n",
+            "/dev/sdb1 2000 100 1900 5% /logs\n",
+        );
+        let disks = disks_from_df(text);
+        assert_eq!(disks.len(), 2);
+        assert_eq!(disks[0].mount, "/");
+        assert_eq!(disks[0].aliases, vec!["/srv/data".to_string()]);
+        assert_eq!(disks[1].mount, "/logs");
+        assert!(disks[1].aliases.is_empty());
     }
 
     /// 一次 statvfs 是一个往返，第 20 块盘不会让那一格更有用。

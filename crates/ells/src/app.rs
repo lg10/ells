@@ -724,6 +724,8 @@ pub fn metrics_next(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiskGauge {
     pub mount: String,
+    /// 同一设备还挂在这些位置：展示上合并成一行，点开磁盘面板时再列出来。
+    pub aliases: Vec<String>,
     pub percent: u8,
     pub used_kb: u64,
     pub total_kb: u64,
@@ -733,6 +735,7 @@ impl DiskGauge {
     fn from_sample(d: &ells_core::DiskSample) -> Self {
         Self {
             mount: d.mount.clone(),
+            aliases: d.aliases.clone(),
             percent: d.used_percent,
             used_kb: d.used_kb,
             total_kb: d.total_kb,
@@ -816,6 +819,11 @@ impl Metrics {
     /// 四项里有没有任何一项可用（决定那一行有没有内容可画）。
     pub fn has_data(&self) -> bool {
         self.cpu.is_some() || self.mem.is_some() || self.load.is_some() || self.disk.is_some()
+    }
+
+    /// 磁盘面板要画几行：每块盘一行，带别名的盘再占一行。绘制与命中测试共用。
+    pub fn disk_popup_lines(&self) -> usize {
+        self.disks.len() + self.disks.iter().filter(|d| !d.aliases.is_empty()).count()
     }
 
     /// 采纳一次解析结果，返回是否继续轮询。
@@ -3422,7 +3430,7 @@ impl App {
         }
         // 磁盘挂载点小面板：点外面就关，表本身只读不必选。
         if self.disk_popup {
-            let rows = self.slots[self.work].metrics.disks.len();
+            let rows = self.slots[self.work].metrics.disk_popup_lines();
             if !hit(ui::disk_popup_rect(self.last_area, rows), column, row) {
                 self.disk_popup = false;
             }

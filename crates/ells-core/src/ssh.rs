@@ -695,13 +695,13 @@ async fn gather_over_sftp(
             let mut unsupported = false;
             if let Some(mounts) = read_proc(sftp, "/proc/mounts", deadline, max_bytes).await {
                 for candidate in metrics::mount_candidates(&mounts) {
-                    match fs_info_of(sftp, &candidate.mount, deadline).await {
+                    let metrics::MountCandidate { device, mount, aliases } = candidate;
+                    match fs_info_of(sftp, &mount, deadline).await {
                         FsInfo::Stats(stats) => {
-                            if let Some(disk) = metrics::disk_from_fs_stats(
-                                candidate.device,
-                                candidate.mount,
-                                &stats,
-                            ) {
+                            if let Some(mut disk) =
+                                metrics::disk_from_fs_stats(device, mount, &stats)
+                            {
+                                disk.aliases = aliases;
                                 disks.push(disk);
                             }
                         }

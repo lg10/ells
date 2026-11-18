@@ -2890,12 +2890,19 @@ fn draw_metrics_bar(f: &mut Frame, app: &App, area: Rect) {
 
 /// 点底栏磁盘格弹出的全部挂载点小面板（只读）。
 fn draw_disk_popup(f: &mut Frame, app: &App) {
-    let disks = &app.slots[app.active].metrics.disks;
-    let area = disk_popup_rect(app.last_area, disks.len());
+    let metrics = &app.slots[app.active].metrics;
+    let disks = &metrics.disks;
+    let aliases: usize = disks.iter().map(|d| d.aliases.len()).sum();
+    let area = disk_popup_rect(app.last_area, metrics.disk_popup_lines());
     f.buffer_mut().set_style(area, Style::default().bg(theme::bg()));
     f.render_widget(Clear, area);
+    let title = if aliases > 0 {
+        format!(" 磁盘（{} 块 / {} 个挂载点） ", disks.len(), disks.len() + aliases)
+    } else {
+        format!(" 磁盘挂载点（{} 块） ", disks.len())
+    };
     let block = Block::bordered()
-        .title(format!(" 磁盘挂载点（{} 块） ", disks.len()))
+        .title(title)
         .title_style(Style::default().fg(theme::accent()).add_modifier(Modifier::BOLD));
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -2943,6 +2950,12 @@ fn draw_disk_popup(f: &mut Frame, app: &App) {
                     Style::default().fg(theme::muted()),
                 ),
             ]));
+            if !d.aliases.is_empty() {
+                out.push(Line::from(Span::styled(
+                    format!("  别名 {}", inline(&clip_display(&d.aliases.join(", "), 54))),
+                    Style::default().fg(theme::dim()),
+                )));
+            }
         }
         out
     };
@@ -4867,6 +4880,7 @@ mod tests {
         m.adopt(&ells_core::Probe::parse(M_ROUND1));
         m.disk = Some(crate::app::DiskGauge {
             mount: "/data\tnightly\nbuild".into(),
+            aliases: Vec::new(),
             percent: 88,
             used_kb: 1760,
             total_kb: 2000,
